@@ -4,7 +4,7 @@
 
 This repository contains the client brief and reusable document templates for Task Force 2, "FinOps Watch". Future agents must use this file when creating the CDO documentation pack for the task force.
 
-The goal is to produce an English-only CDO documentation pack under `docs/tf2-finops/` that explains how the CDO platform operates the FinOps data/control plane, integrates with the AIOps-owned AI Engine, routes alerts, enforces safe containment, and maintains finance-readable evidence.
+The goal is to produce a bilingual CDO documentation pack under `docs/tf2-finops/` (English and Vietnamese) that explains how the CDO platform operates the FinOps data/control plane, integrates with the AIOps-owned AI Engine, routes alerts, enforces safe containment, and maintains finance-readable evidence.
 
 ## Source Priority
 
@@ -47,7 +47,7 @@ Out of scope unless the user explicitly expands scope:
 
 Use these defaults unless the user provides different decisions:
 
-- Language: English only.
+- Languages: English (primary) and Vietnamese (translation). Each document has two versions.
 - Output folder: `docs/tf2-finops/`.
 - Architecture angle: lakehouse-centric FinOps control plane with serverless orchestration and AIOps-owned AI Engine integration.
 - AWS Region: `ap-southeast-1` for examples.
@@ -107,7 +107,14 @@ For every containment action, document:
 
 ## Required Output Catalog
 
-Create or update these files under `docs/tf2-finops/`:
+Create or update these files under `docs/tf2-finops/`. Every document must be produced in two versions:
+
+- **English version**: uses the base filename (e.g., `02_infra_design.md`).
+- **Vietnamese version**: appends `_vi` before the extension (e.g., `02_infra_design_vi.md`).
+
+The Vietnamese version is a full translation of the English version, not a summary or subset. Both versions must contain identical structure, sections, diagrams, tables, and technical detail. See the **Bilingual Translation Rules** section for translation standards.
+
+English files:
 
 1. `01_requirements_analysis.md`
    - Summarize the client problem from the CFO perspective.
@@ -177,11 +184,25 @@ Create or update these files under `docs/tf2-finops/`:
    - Include individual pitch points for CDO responsibilities.
    - Include curveball responses for data lag, false positives, accidental prod containment, Cost Explorer throttling, dashboard stale data, and audit rollback.
 
+Vietnamese files (one-to-one translations of the English files above):
+
+1. `01_requirements_analysis_vi.md`
+2. `02_infra_design_vi.md`
+3. `03_security_design_vi.md`
+4. `04_deployment_design_vi.md`
+5. `05_cost_analysis_vi.md`
+6. `06_dashboard_alerting_design_vi.md`
+7. `07_test_eval_report_vi.md`
+8. `08_adrs_vi.md`
+9. `09_demo_and_presentation_pack_vi.md`
+
+The content requirements for each Vietnamese file are identical to those listed for the corresponding English file above.
+
 ## Document Standards
 
 Use these rules for all generated docs:
 
-- English only.
+- Produce every document in both English and Vietnamese.
 - Use Markdown.
 - Prefer concrete architecture and data-flow descriptions over generic cloud language.
 - Do not claim real measurements unless evidence exists in the repo or conversation.
@@ -191,6 +212,22 @@ Use these rules for all generated docs:
 - Use Mermaid diagrams where they clarify architecture, sequence, or controls.
 - Preserve client boundaries even if a template suggests a broader platform feature.
 - Avoid placeholders such as `TBD`, `TODO`, `<fill>`, `<N>`, or `<M>` in final docs.
+
+## Bilingual Translation Rules
+
+Apply these rules when producing the Vietnamese (`_vi`) version of each document:
+
+- The Vietnamese file must be a complete, faithful translation of the English file, preserving all sections, headings, tables, diagrams, code blocks, and technical detail.
+- Keep AWS service names, technical terms, and proper nouns in English (e.g., "Lambda", "Step Functions", "EventBridge Scheduler", "CUR", "Athena", "DynamoDB", "QuickSight", "dry-run", "lakehouse-centric").
+- Keep acronyms in English (e.g., CDO, AIOps, IAM, CI/CD, IaC, SLO, ADR, OIDC).
+- Keep code snippets, CLI commands, file paths, and Mermaid diagram syntax in English.
+- Translate all prose, explanations, section headings, bullet-point descriptions, table headers, and table cell descriptions into natural Vietnamese.
+- Use Vietnamese technical vocabulary where widely accepted (e.g., "kiến trúc" for architecture, "triển khai" for deployment, "bảo mật" for security, "chi phí" for cost, "cảnh báo" for alert, "bảng điều khiển" for dashboard).
+- Currency references remain in USD; add "(đô la Mỹ)" on first occurrence if helpful.
+- Maintain the same heading hierarchy and numbering as the English version.
+- The Vietnamese title of each document should include the Vietnamese translation followed by the English title in parentheses for cross-reference. Example: `# Thiết kế Hạ tầng (Infrastructure Design)`.
+- Do not add, remove, or reorder content compared to the English version.
+- `Evidence needed: ...` markers should be translated as `Cần bằng chứng: ...`.
 
 ## Suggested Data Contracts To Reference
 
@@ -217,15 +254,18 @@ The client brief requires three contracts signed with the CDO group. For CDO doc
 
 Before considering the document pack complete, verify:
 
-- All required files exist under `docs/tf2-finops/`.
+- All required English files exist under `docs/tf2-finops/`.
+- All required Vietnamese (`_vi`) files exist under `docs/tf2-finops/`.
+- Every Vietnamese file is a complete translation of its English counterpart (same sections, same structure).
 - `template-docs/` was not overwritten.
-- The docs mention `lakehouse-centric`.
-- The docs mention `AIOps-owned AI Engine`.
-- The docs mention `EventBridge Scheduler`.
-- The docs mention `CUR` and `Athena`.
-- The docs mention `dry-run`.
-- The docs mention `90 days` or `>=90 days` audit retention.
-- The docs include the exact hard boundary: `NEVER terminate prod, delete data, or modify IAM`.
+- The English docs mention `lakehouse-centric`.
+- The English docs mention `AIOps-owned AI Engine`.
+- The English docs mention `EventBridge Scheduler`.
+- The English docs mention `CUR` and `Athena`.
+- The English docs mention `dry-run`.
+- The English docs mention `90 days` or `>=90 days` audit retention.
+- The English docs include the exact hard boundary: `NEVER terminate prod, delete data, or modify IAM`.
+- The Vietnamese docs preserve these same terms in English where required by translation rules.
 - The docs define 12h, 24h, or 48h cadence and defend the chosen value.
 - The docs include finance-readable dashboard requirements.
 - The docs include separate Finance and Engineering alert routing.
@@ -236,6 +276,19 @@ Before considering the document pack complete, verify:
 
 ```powershell
 rg -n "TBD|TODO|<N>|<M>|<fill>|placeholder" docs/tf2-finops
+```
+
+Verify both English and Vietnamese files exist:
+
+```powershell
+# Check English files
+Get-ChildItem docs/tf2-finops/*.md | Where-Object { $_.Name -notmatch '_vi\.md$' } | Select-Object Name
+
+# Check Vietnamese files
+Get-ChildItem docs/tf2-finops/*_vi.md | Select-Object Name
+
+# Ensure counts match (9 English + 9 Vietnamese = 18 total)
+(Get-ChildItem docs/tf2-finops/*.md).Count
 ```
 
 Run this targeted constraint check:
