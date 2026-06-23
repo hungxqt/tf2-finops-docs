@@ -6,227 +6,256 @@
 
 ## 1. Architecture diagram
 
-The CDO platform uses a lakehouse-centric control plane combined with serverless orchestration workflows and a managed EKS cluster to host the AI Engine runtime. The data processing and anomaly detection flow operates on a scheduled 24h cadence.
+The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with an AIOps-owned AI Engine hosted on a managed EKS cluster. The EKS compute tier uses a hybrid configuration of on-demand and spot node groups to optimize execution costs.
 
 ```mermaid
-flowchart TB
-    subgraph "AWS Multi-Account Environment"
-        subgraph "CDO Management Account (ap-southeast-1)"
-            subgraph "VPC (Private Subnets Only)"
-                subgraph "EKS Cluster (AI Engine Hosting)"
-                    direction TB
-                    subgraph "On-Demand Node Group"
-                        API[ai-engine-api Pods]
-                        EXP[ai-engine-explainer Pods]
-                        MON[kube-prometheus-stack Pods]
-                    end
-                    subgraph "Spot Node Group"
-                        WRK[ai-engine-worker Pods]
-                        JOB[Batch Scoring / Training Jobs]
-                    end
-                    API --- WRK
-                end
-                ALB[Internal Application Load Balancer]
-                VPCE[VPC Endpoints: S3, DynamoDB, Secrets Manager]
-            end
+graph TB
+    subgraph "AWS Member Accounts"
+        MemberS3[CUR S3 Export Buckets]
+        MemberCE[Cost Explorer API Endpoints]
+    end
 
-            subgraph "Data Lakehouse & Storage"
-                S3Raw[(S3 Raw Zone)]
-                S3Cur[(S3 Curated Zone)]
-                Glue[(Glue Data Catalog)]
-                Athena[Athena Query Engine]
-                DDB[(DynamoDB Run State & Idempotency)]
-            end
-
-            subgraph "Orchestration & Serverless Workflows"
-                EB[EventBridge Scheduler]
-                SF[Step Functions Orchestrator]
-                L_Pull[Lambda CUR/CE Ingestion Adapter]
-                L_Call[Lambda AI Engine Client]
-                L_Route[Lambda Alert Routing Engine]
-                L_Cont[Lambda Containment Worker]
-            end
-
-            subgraph "User Presentation & Alerting"
-                QS[QuickSight Dashboard]
-                SNS[SNS Alert Topic]
-            end
+    subgraph "CDO Management Account VPC (ap-southeast-1)"
+        subgraph "Ingestion & Orchestration"
+            EB[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+            SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
+            SF -->|Evaluate Run| LambdaState[State Lambda]
+            SF -->|Trigger Containment| LambdaCont[Containment Lambda]
+            SF -->|Route Alerts| LambdaAlert[Alert Routing Lambda]
         end
 
-        subgraph "Target Member Accounts (Multi-Account)"
-            CUR_S3[(CUR Export S3 Buckets)]
-            CE_API[Cost Explorer API Endpoint]
-            Prod_Res[Production Resources]
-            Dev_Res[Dev/Sandbox Resources]
+        subgraph "Data Lakehouse Tier"
+            S3Raw[(S3 Raw Zone)]
+            S3Cur[(S3 Curated Zone)]
+            GlueCat[Glue Data Catalog]
+            Athena[Athena Query Engine]
+        end
+
+        subgraph "Private Subnets (EKS Cluster)"
+            subgraph "EKS Control Plane"
+                ControlPlane[Kubernetes Control Plane]
+            end
+            
+            subgraph "On-Demand Node Group"
+                API_P[ai-engine-api Pods]
+                EXP_P[ai-engine-explainer Pods]
+                ESO_P[External Secrets Pods]
+                Core_P[Core CDO Platform Pods]
+            end
+
+            subgraph "Spot Node Group"
+                WRK_P[ai-engine-worker Pods]
+                Batch_J[Batch Scoring Jobs]
+                Train_J[Model Retraining Jobs]
+            end
+
+            InternalALB[Internal ALB]
+        end
+
+        subgraph "Database Store"
+            DDB[(DynamoDB Run State & Audit)]
         end
     end
 
-    %% Ingestion Flow
-    EB -->|Trigger 24h| SF
-    SF -->|1. Ingest| L_Pull
-    L_Pull -->|Pull CUR parquet / API data| CUR_S3
-    L_Pull -->|Call API| CE_API
-    L_Pull -->|2. Write Raw| S3Raw
-    S3Raw -->|Partition Trigger| S3Cur
-    S3Cur -->|Register Schema| Glue
+    subgraph "Alerting & Presentation"
+        Slack[Slack Notification Engine]
+        Email[SES Email Target]
+        QuickSight[QuickSight Finance Dashboard]
+    end
+
+    %% Ingestion flows
+    LambdaPull -->|Fetch Cost Data| MemberCE
+    LambdaPull -->|Pull CUR Files| MemberS3
+    LambdaPull -->|Write raw cost| S3Raw
+
+    %% Transformation flows
+    S3Raw -->|Partition/Schema Validation| S3Cur
+    GlueCat -->|Catalog schemas| S3Cur
+    Athena -->|Query data| S3Cur
+
+    %% Orchestration & Database interactions
+    LambdaState -->|Idempotency key check & write state| DDB
+    LambdaCont -->|Write immutable audit trail| DDB
+    LambdaCont -->|Assume role & tag/suggest/shutdown| MemberAccounts[Member Accounts Resources]
+    LambdaAlert -->|Route alert payload| Slack
+    LambdaAlert -->|Route alert payload| Email
+
+    %% AI Engine Integration
+    SF -->|Detect Request via Internal ALB| InternalALB
+    InternalALB -->|Route Ingress| API_P
+    API_P -->|Coordinate batch scoring| WRK_P
+    WRK_P -->|Process logs| Batch_J
+    Batch_J -->|Read/Write features| S3Cur
     
-    %% AI Inference Flow
-    SF -->|3. Query Aggregated Cost| Athena
-    Athena -->|Return Cost Matrix| SF
-    SF -->|4. Invoke Anomaly Detection| L_Call
-    L_Call -->|Internal ALB HTTPS request| ALB
-    ALB -->|Route traffic| API
-    API -->|Deploy batch worker pod| WRK
-    API -->|Write operational log| VPCE
-    
-    %% Alert & Action Flow
-    SF -->|5. Retrieve Decision Schema| L_Call
-    SF -->|6. Process Alerts| L_Route
-    L_Route -->|Publish Anomaly Alert| SNS
-    SNS -->|Finance Email/Slack| QS
-    SNS -->|Engineering Alert| Dev_Res
-    SF -->|7. Enforce Safety Policy| L_Cont
-    L_Cont -->|Dry-run or Safe tag action| Dev_Res
-    L_Cont -->|Audit evidence log| DDB
-    L_Cont -->|Write JSON audit file| S3Cur
+    %% Dashboard presentation
+    QuickSight -->|Direct query without SQL| Athena
+    QuickSight -->|Read materialized runs| DDB
 ```
 
-*Caption: The CDO management VPC contains private subnets with no public route tables. External cost data is pulled from member accounts via OIDC trust roles. The AI Engine endpoints are exposed internally via an AWS ALB routing to EKS services, segregating stable APIs on on-demand nodes and batch workers on spot nodes. Workflows are scheduled and monitored by Step Functions.*
+*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR and Cost Explorer data to S3, and catalogs it. The workflow requests anomaly detection from the AIOps-owned AI Engine via the EKS internal ALB. The EKS cluster isolates stable APIs on an on-demand node group and batch-scoring/training tasks on a cost-optimized spot node group. Dashboard views and containment workflows pull clean state from Athena and DynamoDB.*
+
+---
 
 ## 2. Component table
 
-The following infrastructure components are deployed for the CDO platform and hosted workloads:
+The following infrastructure components are deployed in `ap-southeast-1` to operate the FinOps Watch platform:
 
 | Component | AWS Service | Reason | Cost note |
 |---|---|---|---|
-| Ingestion & Storage | S3 Standard + Glacier | Host raw cost data, normalized parquet files, model artifacts, and audit logs. | Low storage cost ($0.023/GB/month). Lifecycled. |
-| Schema Registry | Glue Data Catalog | Governs schema definitions for raw and curated datasets. | Serverless, first 1M objects free. |
-| Serverless Query | Athena | Allows ad-hoc SQL aggregation of CUR cost data without dedicated instances. | Pay-per-query ($5.00/TB scanned). Materialized. |
-| Ingestion & Logic | Lambda | Short-running serverless adapters for data ingestion, endpoint invocation, routing, and containment. | Pay-per-execution. High concurrency limit. |
-| Orchestration | Step Functions | Standard workflows provide persistent state, error retries, and conditional logic. | $0.000025 per state transition. |
-| Hosting Cluster | AWS EKS | Hosts the versioned AI Engine runtime and batch jobs with enterprise container isolation. | $0.10/hour cluster fee. |
-| Stable Compute | EC2 On-Demand Nodes | Managed Node Group (e.g., `m5.large`) for stable pods (`ai-engine-api`, monitoring). | ~2 nodes active. Stable runtime. |
-| Batch Compute | EC2 Spot Nodes | Managed Node Group (e.g., `c5.large`) for batch scoring, feature engineering, and retraining. | Up to 60-90% savings compared to on-demand. |
-| Container Registry | ECR | Securely stores Docker images generated by AIOps for EKS deployments. | $0.10/GB storage fee, free data transfer to EKS. |
-| Ingress / Service | internal ALB / NLB | Routes Step Functions traffic securely to the AI API endpoint within the VPC. | ~1 active load balancer (~$20/month base). |
-| Configuration Store | Secrets Manager | Stores API keys, OIDC credentials, and DB strings securely. | $0.40/secret/month + API call volume. |
-| Operational State | DynamoDB | Stores scheduled run state, idempotency keys, anomaly indexes, and audit logs. | On-demand capacity mode, low storage footprint. |
-| Presentation | QuickSight | Finance-friendly BI dashboards showing cost trends and anomaly metrics. | User-based licensing ($18-$24/user/month). |
-| Alerting Engine | SNS | Fan-out notification engine routing alerts to email, Slack webhooks, and HTTP targets. | First 1M notifications free. |
-| Observability | CloudWatch / Container Insights | Aggregates VPC flow logs, Lambda traces, EKS metrics, and cluster application logs. | Charged per GB ingested ($0.50/GB). Retained 14 days. |
-| Private Transport | VPC NAT Gateway / Endpoints | Interface endpoints allow Lambda and EKS to call AWS APIs privately without traversing the internet. | Hourly fee + processing charges per GB. |
+| Ingestion Trigger | EventBridge Scheduler | Triggers the ingestion pipeline daily on a serverless, managed cron schedule. | Free tier covers 14M invocations/month, then $1.00 per million. |
+| Orchestration Layer | Step Functions | Serverless state machine executing workflow logic, conditional branches, wait states, and error retries. | $0.025 per 1,000 state transitions. |
+| Compute (Adapters) | Lambda | Runs lightweight, serverless adapter code to pull Cost Explorer API data, copy CUR 2.0 exports, and handle alerts/containment. | Pay-per-use, ~$0.00001667 per GB-second. |
+| Data Lake (Raw) | Amazon S3 | Stores immutable daily CUR 2.0 files and Cost Explorer JSON dumps. | $0.023 per GB/month + request fees. |
+| Data Lake (Curated) | Amazon S3 | Stores partitioned, schema-validated cost files in Parquet format, optimized for querying. | $0.0125 per GB/month (Infrequent Access) + transition fees. |
+| Metadata Catalog | Glue Data Catalog | Automatically registers table partitions and maintains the schema definitions for Athena. | First 1M cataloged objects are free; crawler runs cost $0.44 per DPU-hour. |
+| Query Engine | Amazon Athena | Allows serverless SQL queries on S3 files to build materialized views and drive dashboards. | $5.00 per TB of data scanned. |
+| State & Audit Database | Amazon DynamoDB | Stores run state, idempotency keys, containment audit logs, and dashboard materialized views. | On-demand capacity: $1.25 per million write units, $0.25 per million read units. |
+| AI Engine Hosting | Amazon EKS | Hosts the AIOps-provided AI Engine (API + worker workloads) with managed node groups. | $0.10 per hour for EKS cluster control plane. |
+| Stable Workload Nodes | Managed Node Group (On-Demand EC2) | Runs stable, always-on pods (`ai-engine-api`, `ai-engine-explainer`, monitoring, ingress controllers) on `m5.xlarge` instances across multiple AZs. | EC2 On-Demand rate (~$0.192/hour per instance in `ap-southeast-1`). |
+| Batch Workload Nodes | Managed Node Group (Spot EC2) | Runs batch detection jobs, heavy feature engineering, and model training/retraining (`ai-engine-worker`) on `m5.xlarge` or `g5.xlarge` instances. | Spot rate with up to 60-70% savings compared to on-demand. |
+| Container Registry | Amazon ECR | Hosts versioned Docker container images for AIOps models. | $0.10 per GB/month (first 500 MB free). |
+| Secrets Provider | Secrets Manager | Securely manages API keys, DB credentials, and Slack webhooks with automated rotation. | $0.40 per secret/month + $0.05 per 10,000 requests. |
+| Load Balancer | Application Load Balancer (Internal) | Exposes EKS AI Engine API service internally to Step Functions/Lambda functions over private subnets. | ~$0.0225 per LCU-hour. |
+| Finance Dashboard | Amazon QuickSight | Provides a finance-readable, serverless dashboard built on Athena views with zero SQL queries required. | $18-$24/user/month (Reader sessions capped at $5/reader/month). |
+| Alert Channels | Amazon SNS / Slack API | Delivers separate routing paths for alerts (Finance alerts via Slack/Email, Eng alerts via Slack/Jira). | SNS is free up to 100k email notifications/month; Slack API is free. |
+| Containment Worker | AWS Lambda | Assumes roles in member accounts to apply tags or shut down dev/sandbox resources, strictly executing in `dry-run` or `apply` modes. | Pay-per-use. |
+
+> [!NOTE]
+> Actual run costs for the CDO pipeline during the build period are tracked with: `Evidence needed: CDO pipeline actual operational costs`.
+
+---
 
 ## 3. Differentiation angle deep-dive
 
 ### 3.1 Why this angle?
 
-The lakehouse-centric scheduled FinOps control plane combined with EKS AI hosting matches production-grade requirements. Production billing data (CUR) changes on a daily batch frequency, making real-time streaming detection redundant. Organizing data into raw and curated S3 zones cataloged by Glue allows us to perform fast, scalable queries via Athena. 
-
-By hosting the AIOps AI Engine on EKS rather than serverless containers (like Fargate), the CDO platform achieves full infrastructure efficiency. EKS managed node groups split workloads cleanly: always-on, low-latency services (such as model APIs and monitoring tools) run on stable on-demand nodes. Compute-heavy, interruptible workloads (like model retraining, feature extraction, and batch cost scoring) are deployed as Kubernetes Jobs on cheap spot nodes. This ensures we scale dynamically without paying premium rates for idle GPU or high-CPU servers.
+The CDO platform implements a **lakehouse-centric FinOps control plane with serverless orchestration and EKS hybrid hosting for the AI Engine**.
+1. **Lakehouse Fit**: Production FinOps operates on a natural 24h cadence dictated by AWS CUR export frequencies. A lakehouse pattern (S3 + Glue + Athena) avoids the high fixed costs of an always-on data warehouse (like Redshift) or relational databases, while keeping historical cost data fully structured, audit-ready, and partition-queried.
+2. **Serverless Orchestration**: EventBridge and Step Functions manage the flow serverless-first, keeping the operational overhead of the pipeline orchestrator near zero.
+3. **EKS Hybrid Compute for AI**: The AIOps-provided AI Engine contains two distinct workloads:
+   - Stable inference endpoints (`ai-engine-api`, `ai-engine-explainer`) that must remain highly available and low-latency.
+   - Heavy batch jobs (`ai-engine-worker` for feature engineering, batch scoring, and model retraining) that are computationally intensive but interruptible.
+   Hosting the AI Engine on EKS enables the CDO to place stable APIs on **on-demand managed node groups** to guarantee SLOs, and batch workers on **spot node groups** with automatic node selectors and tolerations. This achieves a 60-70% reduction in AI compute cost. Fargate does not support this level of granular node-affinity control, while a pure serverless container model would lead to idle compute wastes during non-run hours.
 
 ### 3.2 Strengths (with metrics)
 
-The chosen EKS + Lakehouse architecture is compared below against alternative designs:
+The metrics below highlight the trade-offs of the lakehouse-centric + EKS hybrid architecture compared to alternative CDO approaches:
 
-| Metric | Lakehouse + EKS (CDO) | Pure Serverless (Lambda) | Serverless Container (Fargate) |
+| Axis | Chosen Angle (Lakehouse + EKS Hybrid) | Alternative A (ECS Fargate + RDS Aurora) | Alternative B (Third-Party SaaS Platform) |
 |---|---|---|---|
-| **Fixed Platform Cost** | Medium (~$150/month base cluster) | Ultra-low (pay-per-use, ~$0) | Low-Medium (~$60/month base ALB) |
-| **Variable Cost / Batch Run** | Low (90% spot savings for worker jobs) | Medium (high compute overhead for ML) | Medium (standard compute rates) |
-| **Max Job Duration** | Unlimited (Supports hours-long ML jobs) | 15-minute limit (Fails for retraining) | Unlimited (No spot placement controls) |
-| **Workload Isolation** | Pod-level (EKS Network Policies + namespaces) | IAM function-level (Basic) | Task-level (Security groups only) |
-| **Model Scaling Latency** | <5s (HPA local replica scaling on nodes) | 10-30s (Cold starts on large ZIPs) | 30-90s (Provisioning container task) |
-| **Ops Overhead (hr/week)** | ~4 hours (Managed nodes update) | ~1 hour (Zero infra ops) | ~2 hours (Task configuration management) |
-| **Time to Onboard Tenant** | <5 minutes (Namespace + SQS routing setup) | <2 minutes (Deploy dynamic config) | <10 minutes (Task configuration update) |
+| **Cost per daily run (Ingest + Query)** | ~$0.15 (S3 + Athena pay-per-query) | ~$5.00 (Fixed daily rate of RDS instance) | N/A (Included in subscription fees) |
+| **AI compute cost (Hosting/Month)** | ~$120 (EKS control plane + Spot node scaling) | ~$320 (Fargate always-on equivalent) | N/A |
+| **Operational overhead (Hours/Week)** | ~4 hours (Managing EKS config, Helm updates) | ~2 hours (ECS managed task groups) | ~1 hour (SaaS connection updates) |
+| **Account onboarding time** | < 10 mins (Terraform IAM cross-account stack) | ~25 mins (Manual DB schema setup + VPC peering) | > 60 mins (Manual setup + IAM configs) |
+| **Scalability for model retraining** | Excellent (Spot node pools scaled via Karpenter) | Limited (Fargate max memory/CPU constraints) | Poor (AIOps model cannot run locally) |
 
 ### 3.3 Accepted weaknesses
 
-- **Operational complexity**: Requires managing Helm charts, GitOps sync loops (ArgoCD/Flux), and Kubernetes RBAC.
-- **Bootstrapping latency**: Initial cluster provisioning and Kubernetes configuration takes ~15 minutes, making rapid sandbox setups slower.
-- **Spot Interruption Risk**: Spot workers running batch scoring or retraining can be reclaimed by AWS with a 2-minute warning. The system must implement application checkpointing and automatic job retry mechanisms.
+- **EKS Control Plane Overhead**: Running EKS incurs a fixed control plane charge of $0.10/hour (~$73/month). This overhead is accepted because the same cluster hosts the stable API pods and scales the batch workers, which saves significant computing budget through Spot execution.
+- **VPC Endpoints Cost**: Routing all traffic privately within the VPC requires interface endpoints (Secrets Manager, ECR, CloudWatch), adding fixed charges (~$7.20/endpoint/month). This is accepted to meet the strict security requirement of zero public transit of cost/audit data.
+- **CUR Ingestion Latency**: AWS CUR exports lag by 8 to 24 hours. This lag is accepted since the platform runs on a 24-hour cadence, meaning real-time streaming is not required for daily anomaly detection.
+
+---
 
 ## 4. Multi-account approach
 
 ### 4.1 Account model
 
-The CDO platform is centralized in a designated **FinOps Management Account**. Cross-account data gathering uses standard read-only IAM roles in target member accounts.
-- **FinOps Management Account**: Hosts the Step Functions orchestrator, S3 Data Lake, Glue Data Catalog, EKS cluster, QuickSight dashboard, and DynamoDB.
-- **Target Member Accounts**: Maintain a read-only role (`FinOpsCostReaderRole`) allowing S3 access to CUR exports and query permissions for the local Cost Explorer API. It also hosts the execution role (`FinOpsContainmentWorkerRole`) allowing resource tagging, schedule registration, and quota enforcement.
+The CDO platform is deployed in a central **CDO Management Account**. It ingests cost data from and triggers containment actions in multiple **Member Accounts** within the AWS Organization.
+- **Cross-Account Cost Ingestion**: The central `LambdaCURPuller` assumes the read-only role `FinOpsCURPullerRole` in each target member account. This role grants access to retrieve local Cost Explorer API data and copy CUR files from the member account's S3 export bucket.
+- **Cross-Account Containment**: The central `LambdaContainment` assumes `FinOpsContainmentWorkerRole` in the target member account. The assumed role contains tightly scoped permissions to tag resources or adjust Auto Scaling Groups (ASGs) in that specific member account.
 
 ### 4.2 Isolation pattern
 
-- **S3 Data Lake**: Prefixes partition historical cost datasets by account ID (e.g., `s3://cdo-curated-zone/account_id=123456789012/year=2026/`).
-- **Glue Catalog**: Partitions the catalog structure to enforce predicate pushdown during Athena queries.
-- **EKS AI Hosting**: Pods are separated using Kubernetes namespaces (e.g., `ai-inference`, `ai-batch-jobs`). Network policies block cross-namespace network routes, preventing batch worker pods from connecting to core database or monitoring systems.
-- **DynamoDB State Table**: Partitioned using a compound key structure (`account_id#cost_period`) to prevent cross-account run state interference.
+- **Data Isolation**: Cost data collected from member accounts is stored in a single S3 bucket partitioned by Account ID: `s3://cdo-curated-bucket/account_id=123456789012/year=2026/month=06/`.
+- **Query Isolation**: Athena table definitions use Glue partition projection. Athena queries executed for dashboard materialized views are restricted by the `account_id` partition key.
+- **Ownership Resolution**: Resources are mapped to specific engineering squads using the standardized metadata tags `owner` and `squad`. When the ingestion pipeline encounters resources lacking these tags, it automatically assigns them to a default squad (`unassigned-resources`) and routes alerts to the CDO infrastructure channel for manual remediation.
 
 ### 4.3 Onboarding flow
 
-To onboard a new AWS account into the FinOps Watch platform, the following automated steps occur:
+When onboarding a new AWS account or squad to the FinOps Watch platform, the following automated pipeline is executed:
+
 ```
-1. Deploy FinOps IAM roles (Reader & Worker) in target account via CloudFormation StackSet.
-2. Register account metadata (Account ID, Squad Owner, Slack Endpoint) in DynamoDB 'Accounts' table.
-3. Configure CUR 2.0 export target to the FinOps Raw S3 bucket using cross-account policies.
-4. Execute Step Functions onboarding sanity run (Verify read permission, pull initial 24h cost, write raw).
-5. Verify schema normalization in Glue and validate dashboard overlay view.
+1. Add account ID and owner mapping to the Terraform 'accounts.tfvars' configuration.
+2. Terraform execution applies IAM Stack:
+   - Provisions 'FinOpsCrossAccountAccessRole' in the target member account.
+   - Configures trust policy allowing the central CDO Lambda and EKS roles to assume it.
+   - Updates target account CUR export configuration to deliver data to S3.
+3. Glue crawler is triggered to update partitions in the Glue Data Catalog.
+4. E2E Validation run:
+   - Ingestion Lambda makes a test API call to target account Cost Explorer.
+   - Verifies OIDC connection to EKS internal service endpoint.
+5. Account status marked as 'ACTIVE' in the DynamoDB registry.
 ```
 
 ### 4.4 Idempotency
 
-To prevent double-processing cost data for a single timeframe (which leads to duplicated alerts and containment actions), the orchestrator registers an idempotency lock before calling the AI Engine.
-- **Idempotency key format**: `{account_id}:{cost_period_start}:{cost_period_end}` (e.g., `123456789012:2026-06-22T00:00:00Z:2026-06-23T00:00:00Z`).
-- **DynamoDB Run State Table (`finops-run-state`)**:
-  - `IdempotencyKey` (Partition Key - String)
-  - `RunId` (String - UUID)
-  - `Status` (String - PENDING, RUNNING, COMPLETED, FAILED)
-  - `StartedAt` (Number - Epoch)
-  - `CompletedAt` (Number - Epoch)
-  - `EvidenceUri` (String - S3 path to decision output json)
-  - `ErrorDetails` (String - details if status is FAILED)
+To prevent duplicate runs for the same cost period (which would skew dashboard data and incur duplicate Cost Explorer API fees), the CDO platform implements an idempotency mechanism:
+- Every daily execution generates an idempotency key: `account_id:billing_period:execution_date` (e.g., `123456789012:2026-06:2026-06-22`).
+- The Step Functions workflow begins by querying the DynamoDB `cdo-run-state-table` for the key.
+- If the key exists with `Status = COMPLETED` or `Status = IN_PROGRESS`, the Step Functions workflow aborts gracefully, recording the duplicate attempt in the audit logs.
+- If the key does not exist, a new record is created with `Status = IN_PROGRESS` and a TTL of 48 hours to lock the run.
 
-When a scheduled run triggers, a conditional DynamoDB write checks if `IdempotencyKey` exists. If the status is `RUNNING` or `COMPLETED`, the workflow aborts. If it is `FAILED`, the workflow resets status to `PENDING` and triggers a retry.
+---
 
 ## 5. Alternatives considered
 
 ### 5.1 Orchestration layer
 
-- **Option A - Apache Airflow / MWAA**: Checked as a pipeline runner. Rejected due to high baseline fixed cost ($200+/month for managed runtime), complex Python dependency management, and slow deployment cycle.
-- **Option B - AWS Batch**: Analyzed for running ingestion scripts. Rejected because it lacks state machine visual tracking and complex branching logic (e.g., timeout fallbacks, separate alert paths).
-- Yes **Chosen: EventBridge Scheduler + Step Functions Standard**: Provides serverless visual workflows, native AWS service integrations, built-in retry-on-failure steps, and zero idle costs.
+- **Option A**: Apache Airflow on AWS (MWAA).
+  - *Pros*: Excellent Python integration, native complex dependency trees, detailed task visualizer.
+  - *Cons*: High fixed cost (~$350/month minimum), slow startup time (20+ minutes), complex infrastructure configuration.
+- **Option B**: Kubernetes CronJobs inside EKS.
+  - *Pros*: Runs inside the EKS cluster, no external AWS service dependencies.
+  - *Cons*: Difficult to orchestrate external Lambda functions, no native cross-account workflow state machine, and harder to monitor execution state from outside the cluster.
+- **Chosen**: EventBridge Scheduler + Step Functions Standard.
+  - *Reason*: 100% serverless, zero idle costs, native integration with AWS Lambda and DynamoDB, and robust out-of-the-box error retry handlers.
 
 ### 5.2 Data layer
 
-- **Option A - Amazon Redshift Serverless**: Evaluated as the primary cost analytical store. Rejected because it is over-provisioned for a 24h batch ingestion cadence, generating high minimum query billing.
-- **Option B - DynamoDB Only**: Considered for hosting historical cost logs. Rejected because DynamoDB does not support complex analytical SQL queries (e.g., historical standard deviation calculations) required by AIOps integration without costly full table scans.
-- Yes **Chosen: S3 + Glue Data Catalog + Athena**: Provides a low-cost, serverless lakehouse engine that queries structured Parquet partitions on S3, mapping directly to BI dashboard views.
+- **Option A**: Amazon Redshift.
+  - *Pros*: Ultra-fast relational SQL query performance on petabyte-scale datasets.
+  - *Cons*: High minimum cost (~$180/month for a small provisioned node), excessive overhead for a mid-size company running 24h batch cycles.
+- **Option B**: Amazon RDS PostgreSQL.
+  - *Pros*: Structured queries, familiar transaction support, easy index management.
+  - *Cons*: Fixed monthly instance charge, manual storage scaling, and lacks direct, performant integration with raw S3 parquet files.
+- **Chosen**: Amazon S3 + Glue Data Catalog + Amazon Athena.
+  - *Reason*: Leverages the true lakehouse model. Storage costs are minimal (S3), query costs are pay-per-use (Athena), and it supports raw semi-structured JSON alongside optimized Parquet data cataloging.
+
+---
 
 ## 6. Scaling strategy
 
-The platform scales dynamically across all layers:
-- **Data Ingestion**: EventBridge triggers Step Functions using parallel map states. If the company grows from 12 squads to 120, target account ingestions execute concurrently up to Lambda's default concurrency limit (1000).
-- **Athena Query Engine**: Scales horizontally automatically. Athena splits large datasets across its internal execution engine, charging only for scanned bytes. Query execution limits are managed via S3 Partition Projection.
-- **EKS AI Inference**: Pods of `ai-engine-api` auto-scale via Kubernetes **Horizontal Pod Autoscaler (HPA)** based on average CPU/Memory targets (70%). Highly concurrent loads scale out pod replicas across on-demand nodes.
-- **EKS Worker Jobs**: Batch, training, and feature engineering jobs trigger dynamically. The cluster uses **Karpenter** or **Cluster Autoscaler** to provision temporary EC2 spot instances when pending worker pods are scheduled, and terminates them immediately when jobs complete.
+The CDO platform scales dynamically to handle increases in data volume and compute requirements:
+
+- **EKS Pod Autoscaling**: The `ai-engine-api` and `ai-engine-explainer` pods use Kubernetes **Horizontal Pod Autoscalers (HPA)** to scale out (based on target CPU utilization of 70%) if concurrent request volume spikes.
+- **EKS Node Autoscaling**: The EKS cluster utilizes **Karpenter** for node autoscaling. Karpenter dynamically provisions additional EC2 nodes when pending pods are detected. It schedules `ai-engine-worker` batch scoring jobs onto Spot nodes and stable API pods onto On-Demand nodes. It terminates idle nodes within 30 seconds of workload completion.
+- **Athena Query Optimization**: S3 buckets are partitioned by `account_id`, `year`, and `month`. Athena queries limit data scans to specific partitions, preventing execution bottlenecks.
+- **DynamoDB Scaling**: The `cdo-run-state-table` is configured in **On-Demand Capacity Mode**, allowing it to scale instantly from zero to thousands of read/write requests without manual intervention.
+
+---
 
 ## 7. Failure modes + recovery
 
-The following table details failure modes, automated recovery steps, and operational targets:
+The following table outlines the failure modes, detection mechanisms, and recovery runbooks for the CDO platform:
 
 | Failure | Detection | Recovery | RTO | RPO |
 |---|---|---|---|---|
-| Member account CUR lag | Ingestion validation returns empty/truncated records | Log run state as `INCOMPLETE_DATA`, alert Engineering Slack, skip containment triggers, use previous run cache. | 1 hour | 24 hours |
-| Cost Explorer API rate limit | Lambda CUR/CE adapter receives HTTP 429 throttling | Exponential retry with jitter. Fall back to raw CUR partition exports. | 15 mins | 0 |
-| hosted AI API timeout | Step Functions Lambda client detects 60s timeout | Retry call 3 times. If timeout persists, trip circuit-breaker and fail-closed: log anomaly status `AI_UNAVAILABLE`. | 5 mins | 0 |
-| AI Engine Pod crash | Kubernetes Kubernetes replica target unreached | Pod restart by Kubelet. HPA schedules additional pod on healthy on-demand node. | < 10s | 0 |
-| Spot node reclamation | EC2 Spot Interruption Warning (2-minute warning) | Karpenter intercepts event, marks node as cordoned, drains pods, and launches replacement node. Batch jobs resume from checkpoint. | < 2 mins | Checkpoint |
-| Step Functions workflow failure | CloudWatch rule catches `State Entered: FAILED` | Log run status as `FAILED` in DynamoDB to release idempotency lock. Alert DevOps on Slack with trace details. | 10 mins | 24 hours |
-| Duplicate execution trigger | DynamoDB conditional put exception on idempotency check | Abort runner immediately. Record warning in logs, trace duplicate UUID. | < 5s | 0 |
-| QuickSight dashboard stale | Dashboard dashboard data ingestion timestamp > 26h | Raise CloudWatch alarm, trigger manual refresh via Lambda helper, notify Finance via email. | 30 mins | 24 hours |
-| SNS Alert delivery failure | SNS delivery status logs error (e.g., SMTP fail) | SNS retries delivery with backoff. If failure continues, route to backup email queue. | 5 mins | 0 |
-| Containment denial | Target account IAM change denies permission to tag | Log containment status `DENIED`, write incident audit log, alert Squad owner and security team immediately. | 1 hour | 0 |
+| **CUR Export Delay** | Step Functions validation Lambda returns empty or missing daily Parquet partition in S3. | Step Functions enters a wait state and retries every 2 hours. If delay exceeds 24 hours, it alerts the operator. | N/A | 24 hours |
+| **Cost Explorer Throttling** | Ingestion Lambda catches `LimitExceededException` from AWS API. | Exponential backoff with random jitter in Lambda code; retries up to 5 times. | 30 mins | 0 |
+| **AI Engine Timeout / Unavailability** | EKS internal ALB returns `504 Gateway Timeout` or `503 Service Unavailable`. | **CDO fails closed**: Ingestion workflow terminates, no automated containment actions are triggered, operators are alerted, and a run failure state is logged. | 4 hours | 24 hours |
+| **Failed Run Workflow** | Step Functions execution status updates to `FAILED`; triggers CloudWatch Alarm. | Step Functions logs the error block to DynamoDB. Engineers resolve the issue and trigger a manual redrive of the state machine from the failed step. | 2 hours | 24 hours |
+| **Duplicate Run Attempt** | DynamoDB write returns unique key constraint violation on the idempotency key. | The duplicate execution is terminated immediately without executing queries or calling the AI Engine API. | < 10s | 0 |
+| **Dashboard Stale Data** | CloudWatch Alarm triggers if the latest curated partition timestamp is >26 hours old. | Alerts engineers to review the pipeline logs and manually trigger a redrive of the daily ingestion run. | 1 hour | 24 hours |
+| **Alert Delivery Failure** | `LambdaAlertRouting` catches connection timeout or HTTP 5xx error from Slack API. | The Lambda function sends the alert payload to an SQS Dead Letter Queue (DLQ) and attempts delivery via SES email fallback. | 10 mins | 0 |
+| **Containment Action Denial** | Member account cross-account role assumption returns `AccessDeniedException`. | **CDO fails closed**: The incident is logged in the DynamoDB audit table as `DENIED`, and a critical alert is sent to the security channel. | 1 hour | 0 |
+
+---
 
 ## Related documents
 
-- [`03_security_design.md`](03_security_design.md) - Pod-level security, network policies, IAM/IRSA roles, and hard safety boundaries.
-- [`04_deployment_design.md`](04_deployment_design.md) - IaC modules, Helm workload configurations, and CI/CD quality gates.
-- [`05_cost_analysis.md`](05_cost_analysis.md) - Detailed cost projections for EKS hosting and serverless data pipelines.
-- [`08_adrs.md`](08_adrs.md) - Core architecture decision records (cadence trade-off, lakehouse design, EKS choice).
+- [`01_requirements_analysis.md`](01_requirements_analysis.md) - Business context, NFR targets, and CDO/AIOps boundaries.
+- [`03_security_design.md`](03_security_design.md) - IAM roles, Security Groups, OIDC IRSA, and KMS encryption keys.
+- [`04_deployment_design.md`](04_deployment_design.md) - Terraform IaC modular configurations, GitOps/Helm deployment stages.
+- [`05_cost_analysis.md`](05_cost_analysis.md) - Estimated pipeline operational budget and cadence comparisons.
+- [`08_adrs.md`](08_adrs.md) - Architectural decisions regarding 24h cadence and EKS node group selection.

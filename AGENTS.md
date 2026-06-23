@@ -373,6 +373,7 @@ Use these rules for all generated docs:
 
 - Produce every document in both English and Vietnamese.
 - Use Markdown.
+- Strictly do not use icons, emojis, checkmarks, warning symbols, or other pictorial indicators in the content or headings of the generated files.
 - Prefer concrete architecture and data-flow descriptions over generic cloud language.
 - Do not claim real measurements unless evidence exists in the repo or conversation.
 - Use `Evidence needed: <specific evidence>` for missing measured data.
