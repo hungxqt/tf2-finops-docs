@@ -42,38 +42,81 @@ The module boundary is intentionally service-oriented rather than team-oriented.
 - **GitOps Ingestion**: Plan outputs are generated on PR (`plan-on-PR`) and apply jobs consume reviewed plan artifacts instead of recomputing unreviewed changes.
 - **State Access**: CI roles can read/write only the state key for the target environment. Developers can run local validation, but staging and prod applies must be executed by CI with OIDC and environment controls.
 
-## 2. CI/CD pipeline
+### 2.1 CI/CD Pipeline
 
-### 2.1 Pipeline stages
+The CI/CD pipeline is implemented with **GitHub Actions** as the delivery control plane for the CDO infrastructure. It is not part of the runtime FinOps data path, but it controls how the infrastructure components in this design are validated, provisioned, updated, and verified.
 
-Deployment pipelines are driven by GitHub Actions. The flow consists of compilation, validation, security checks, sandbox deployment from `develop`, staging deployment from `main`, and production deployment only through a manual approval gate:
+The pipeline manages infrastructure and platform changes for:
 
+* EventBridge Scheduler and Step Functions workflow.
+* Lambda functions for ingestion, state handling, alert routing, and containment.
+* S3 raw/curated zones, Glue Data Catalog, Athena query resources.
+* DynamoDB run state and audit tables.
+* EKS cluster, managed node groups, Internal ALB, ECR, and Kubernetes workloads.
+* IAM roles and environment-specific configuration required by the CDO platform.
+
+```mermaid
+graph LR
+    Dev[Developer PR / Push] --> GHA[GitHub Actions]
+    GHA --> CI[Validate, Lint, Scan]
+    CI --> Plan[Terraform Plan]
+    Plan --> Review[PR Review]
+    Review --> Apply[Terraform Apply]
+    Apply --> AWS[AWS Infrastructure]
+    Apply --> ECR[Build and Push Image to ECR]
+    ECR --> EKS[EKS AI Engine Workloads]
+    AWS --> Smoke[Smoke Test]
+    EKS --> Smoke
 ```
-[PR Trigger] ──> Lint & Verify ──> Security Scan (Trivy/Gitleaks) ──> TF Plan ──> [Merge Approval]
-                                                                                      │
-[Smoke Test Prod] <── TF Apply Prod <── [Manual Approval Gate] <── Deploy Staging <───┘
+
+*Caption: GitHub Actions validates every infrastructure change, generates a Terraform plan, applies approved changes to AWS, publishes container images to ECR, updates EKS workloads, and runs a smoke test to verify that the CDO platform can execute the FinOps workflow.*
+
+The pipeline follows a simple environment flow:
+
+| Environment | Trigger                        | Purpose                                                                            |
+| ----------- | ------------------------------ | ---------------------------------------------------------------------------------- |
+| `sandbox`   | Merge to `develop`             | Validate infrastructure and run safe integration tests with synthetic FinOps data. |
+| `staging`   | Merge to `main`                | Verify the production-like workflow before final release.                          |
+| `prod`      | Manual approval or release tag | Apply reviewed infrastructure changes only after approval.                         |
+
+For Pull Requests, the pipeline runs only validation steps:
+
+* `terraform fmt -check`
+* `terraform validate`
+* `tflint`
+* Secret scanning
+* IaC security scanning
+* Kubernetes/Helm manifest validation
+* Terraform plan generation
+
+Pull Requests do **not** apply changes directly to AWS. The generated Terraform plan is reviewed before merge so the team can see which resources will be created, updated, replaced, or destroyed.
+
+After merge, the deployment stage provisions or updates the infrastructure using Terraform. GitHub Actions assumes an AWS IAM role through **GitHub OIDC**, so no long-lived AWS access keys are stored in GitHub Secrets. Each environment uses a separate IAM role to limit blast radius.
+
+| Pipeline stage  | Main target                           | Purpose                                                        |
+| --------------- | ------------------------------------- | -------------------------------------------------------------- |
+| Validate        | Terraform, Helm, scripts              | Catch invalid infrastructure code before deployment.           |
+| Plan            | Terraform modules                     | Preview AWS infrastructure changes before apply.               |
+| Apply           | AWS infrastructure                    | Provision or update CDO platform components.                   |
+| Build image     | ECR                                   | Store versioned container images for EKS workloads.            |
+| Deploy workload | EKS                                   | Update AI Engine API/worker workloads behind the Internal ALB. |
+| Smoke test      | Step Functions, Lambda, EKS, DynamoDB | Verify the FinOps workflow after deployment.                   |
+
+The post-deployment smoke test uses synthetic data and runs in dry-run mode:
+
+```text
+1. Trigger the Step Functions workflow manually.
+2. Run the ingestion Lambda against synthetic CUR/Cost Explorer data.
+3. Confirm raw and curated data are written to S3.
+4. Confirm Glue/Athena can query the curated cost dataset.
+5. Call the EKS-hosted AI Engine through the Internal ALB.
+6. Confirm alert routing produces Finance/Engineering payloads.
+7. Confirm containment stays in dry-run mode unless the target is dev/sandbox.
+8. Confirm run state and audit records are written to DynamoDB.
 ```
 
-The pipeline details are defined below:
+A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, EKS workloads become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
 
-| Stage | Tool | What it does | Quality gate |
-|---|---|---|---|
-| Ingest & Validate | `tflint`, `helm lint` | Validates Terraform syntax and Helm charts. | Zero syntax errors. |
-| Security Scan | Trivy / Gitleaks | Scans Docker images and Helm charts for CVEs; detects embedded secrets. | Fail on `CRITICAL` or `HIGH` CVEs; zero secrets. |
-| TF Plan | Terraform | Generates speculative plan for AWS infrastructure. | Successful plan execution. |
-| Apply Sandbox | Terraform / ArgoCD | Applies approved changes from `develop` to sandbox for fast integration. | Terraform apply succeeds; core smoke test passes. |
-| Smoke Test Sandbox | Custom Python runner | Runs a synthetic integration event through ingestion, AI contract validation, alert routing, and audit writing. | Dry-run audit record and test alert are produced. |
-| Apply Staging | Terraform / ArgoCD | Applies reviewed changes from `main` to staging and syncs EKS workload desired state. | Pod status `Running`; Step Functions smoke run succeeds; no drift. |
-| Manual Approval Gate | GitHub Environment Gate | Pauses production pipeline and requires explicit approval from CDO Lead or delegated reviewer. | Manual reviewer signature and reviewed plan artifact. |
-| Apply Prod | Terraform / ArgoCD | Applies only the reviewed production plan. Prod containment remains tag/suggest/dry-run only. | Zero errors, no destructive data/IAM changes, dry-run audit succeeds. |
-| Smoke Test Prod | Custom Python runner | Executes a production-safe dry-run sequence. | No apply-mode containment; audit record successfully written. |
-
-### 2.2 Branch strategy
-
-- `feature/*`: Dedicated branches for features. PR target: `develop`; validation only, no cloud apply.
-- `develop`: Sandbox integration branch. Pushes to `develop` can auto-apply to sandbox after checks pass.
-- `main`: Staging branch. Merges from `develop` into `main` trigger staging deployment and full integration validation.
-- `prod`: Production release path. Production apply is never automatic; it uses GitHub environment approval, reviewed plan artifacts, and prod-safe containment settings.
 
 ## 3. Deployment gates
 
