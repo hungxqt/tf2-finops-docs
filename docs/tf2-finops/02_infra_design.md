@@ -8,91 +8,148 @@
 
 The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with an AIOps-owned AI Engine hosted on a managed EKS cluster. The EKS compute tier uses a hybrid configuration of on-demand and spot node groups to optimize execution costs.
 
+To make the architecture easy to digest, it is broken down into a high-level overview followed by three detailed zoom-in views of each sub-system.
+
+### 1.1 High-Level Architecture Overview
+
+This diagram represents the high-level macro interactions between the central orchestrator, the lakehouse data plane, the EKS compute cluster, and the alerting/containment engines.
+
 ```mermaid
-graph TB
-    subgraph "AWS Member Accounts"
-        MemberS3[CUR S3 Export Buckets]
-        MemberCE[Cost Explorer API Endpoints]
+graph TD
+    subgraph "Member Accounts"
+        Members[AWS Resources & Cost Exports]
     end
 
-    subgraph "CDO Management Account VPC (ap-southeast-1)"
-        subgraph "Ingestion & Orchestration"
-            EB[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
-            SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
-            SF -->|Evaluate Run| LambdaState[State Lambda]
-            SF -->|Trigger Containment| LambdaCont[Containment Lambda]
-            SF -->|Route Alerts| LambdaAlert[Alert Routing Lambda]
-        end
-
-        subgraph "Data Lakehouse Tier"
-            S3Raw[(S3 Raw Zone)]
-            S3Cur[(S3 Curated Zone)]
-            GlueCat[Glue Data Catalog]
-            Athena[Athena Query Engine]
-        end
-
-        subgraph "Private Subnets (EKS Cluster)"
-            subgraph "EKS Control Plane"
-                ControlPlane[Kubernetes Control Plane]
-            end
-            
-            subgraph "On-Demand Node Group"
-                API_P[ai-engine-api Pods]
-                EXP_P[ai-engine-explainer Pods]
-                ESO_P[External Secrets Pods]
-                Core_P[Core CDO Platform Pods]
-            end
-
-            subgraph "Spot Node Group"
-                WRK_P[ai-engine-worker Pods]
-                Batch_J[Batch Scoring Jobs]
-                Train_J[Model Retraining Jobs]
-            end
-
-            InternalALB[Internal ALB]
-        end
-
-        subgraph "Database Store"
-            DDB[(DynamoDB Run State & Audit)]
-        end
+    subgraph "CDO Management Account"
+        SF[Step Functions Orchestrator] -->|1. Pull Data| Lakehouse[(S3 Lakehouse & Athena)]
+        Lakehouse -->|2. Ingested Cost Data| SF
+        SF -->|3. Invoke AI Inference| EKS[EKS Cluster: AI Engine]
+        EKS -->|4. Anomaly Decision| SF
+        SF -->|5. Contain & Alert| Actions[Alerting & Containment Engine]
     end
 
-    subgraph "Alerting & Presentation"
-        Slack[Slack Notification Engine]
-        Email[SES Email Target]
-        QuickSight[QuickSight Finance Dashboard]
-    end
-
-    %% Ingestion flows
-    LambdaPull -->|Fetch Cost Data| MemberCE
-    LambdaPull -->|Pull CUR Files| MemberS3
-    LambdaPull -->|Write raw cost| S3Raw
-
-    %% Transformation flows
-    S3Raw -->|Partition/Schema Validation| S3Cur
-    GlueCat -->|Catalog schemas| S3Cur
-    Athena -->|Query data| S3Cur
-
-    %% Orchestration & Database interactions
-    LambdaState -->|Idempotency key check & write state| DDB
-    LambdaCont -->|Write immutable audit trail| DDB
-    LambdaCont -->|Assume role & tag/suggest/shutdown| MemberAccounts[Member Accounts Resources]
-    LambdaAlert -->|Route alert payload| Slack
-    LambdaAlert -->|Route alert payload| Email
-
-    %% AI Engine Integration
-    SF -->|Detect Request via Internal ALB| InternalALB
-    InternalALB -->|Route Ingress| API_P
-    API_P -->|Coordinate batch scoring| WRK_P
-    WRK_P -->|Process logs| Batch_J
-    Batch_J -->|Read/Write features| S3Cur
-    
-    %% Dashboard presentation
-    QuickSight -->|Direct query without SQL| Athena
-    QuickSight -->|Read materialized runs| DDB
+    Actions -->|6. Apply Policy| Members
+    Actions -->|7. Publish| Dashboard[Finance Dashboard / Channels]
 ```
 
-*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR and Cost Explorer data to S3, and catalogs it. The workflow requests anomaly detection from the AIOps-owned AI Engine via the EKS internal ALB. The EKS cluster isolates stable APIs on an on-demand node group and batch-scoring/training tasks on a cost-optimized spot node group. Dashboard views and containment workflows pull clean state from Athena and DynamoDB.*
+*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting data to the Lakehouse, calling the EKS-hosted AI Engine for anomaly decisions, and invoking alerting and containment workflows based on the results.*
+
+### 1.2 Ingestion & Data Lakehouse Workflow
+
+This diagram zooms in on the ingestion pipeline and the lakehouse storage/query layers.
+
+```mermaid
+graph TB
+    subgraph "Member Accounts"
+        CUR[CUR S3 Export Buckets]
+        CE[Cost Explorer API]
+    end
+
+    subgraph "CDO Ingestion & Lakehouse"
+        Scheduler[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+        SF -->|1. Run Puller| Puller[Ingestion Lambda]
+        Puller -->|Fetch API Cost| CE
+        Puller -->|Copy CUR Files| CUR
+        Puller -->|2. Write Raw| RawS3[(S3 Raw Zone)]
+        
+        RawS3 -->|3. Partition & Convert| CuratedS3[(S3 Curated Zone)]
+        Catalog[Glue Data Catalog] -->|4. Catalog Schemas| CuratedS3
+        Athena[Athena Query Engine] -->|5. Run SQL Query| CuratedS3
+        
+        SF -->|6. Consume cost queries| Athena
+    end
+    
+    classDef external fill:#f9f,stroke:#333,stroke-width:2px;
+    class CUR,CE external;
+```
+
+*Caption: Step Functions invokes the Ingestion Lambda daily via EventBridge Scheduler. Raw cost data from Member Accounts is stored in the S3 Raw Zone, transitioned and cataloged into Parquet format in the S3 Curated Zone, and made queryable via Athena. The query results are passed back to the Step Functions orchestrator to feed the AI Engine.*
+
+### 1.3 AI Engine EKS Hosting Platform
+
+This diagram zooms in on the EKS cluster layout, illustrating the separation of stable API nodes (On-Demand) from batch-processing and retraining nodes (Spot).
+
+```mermaid
+graph TB
+    subgraph "CDO Orchestration"
+        SF[Step Functions Workflow]
+    end
+
+    subgraph "Data Lakehouse"
+        CuratedS3[(S3 Curated Zone)]
+    end
+
+    subgraph "EKS Cluster ap-southeast-1"
+        ALB[Internal ALB]
+        
+        subgraph "On-Demand Managed Node Group"
+            API[ai-engine-api Pods]
+            EXP[ai-engine-explainer Pods]
+            Core[Core Platform & ESO Pods]
+        end
+
+        subgraph "Spot Managed Node Group"
+            Worker[ai-engine-worker Pods]
+            Batch[Batch Scoring Jobs]
+            Train[Model Retraining Jobs]
+        end
+    end
+    
+    subgraph "Central Registry & Secrets"
+        ECR[Amazon ECR]
+        SM[Secrets Manager]
+    end
+
+    %% Flow
+    SF -->|1. POST /detect| ALB
+    ALB -->|2. Ingress Route| API
+    API -->|3. Coordinate Job| Worker
+    Worker -->|4. Run Batch/Retrain| Batch
+    Batch -->|5. Read/Write Features| CuratedS3
+    API -->|6. Return Confidence & Explanation| SF
+    
+    Core -->|ESO sync key| SM
+    API -.->|Pull Image| ECR
+    Worker -.->|Pull Image| ECR
+```
+
+*Caption: The AI Engine `/detect` request from the Step Functions orchestrator is routed via the Internal ALB to the `ai-engine-api` running on On-Demand nodes. Heavy-duty jobs are coordinated on Spot nodes to read/write curated features from S3. Credentials and configurations are synced from Secrets Manager using the External Secrets Operator (ESO).*
+
+### 1.4 Alerting & Containment Engine
+
+This diagram zooms in on the alerting and containment flow, detailing how policy is enforced safely across production and non-production environments with a compliance audit trail.
+
+```mermaid
+graph TB
+    subgraph "CDO Orchestration"
+        SF[Step Functions Workflow]
+    end
+
+    subgraph "Member Accounts"
+        DevSand[Dev/Sandbox Resources]
+        Prod[Prod Resources]
+    end
+
+    subgraph "CDO Management Account"
+        SF -->|1. Route Alerts| AlertLambda[Alert Routing Lambda]
+        SF -->|2. Execute Policy| ContLambda[Containment Lambda]
+        
+        StateLambda[State Lambda] -->|Read/Write Run Lock| StateDB[(DynamoDB Run State)]
+        SF -->|Query State| StateLambda
+        
+        ContLambda -->|Write Audit Record| AuditDB[(DynamoDB Audit Trail)]
+        ContLambda -->|3. Tag/Shutdown| DevSand
+        ContLambda -->|4. Dry-Run / Tag Only| Prod
+    end
+
+    subgraph "Channels & Presentation"
+        AlertLambda -->|Slack Alert| Slack[Slack Channels]
+        AlertLambda -->|Email Alert| SES[SES / Email Targets]
+        Dashboard[QuickSight Finance Dashboard] -->|Athena Views| AuditDB
+    end
+```
+
+*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write audit logs to DynamoDB, apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. QuickSight presents spend and containment status directly to Finance stakeholders.*
 
 ---
 
