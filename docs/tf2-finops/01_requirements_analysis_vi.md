@@ -68,7 +68,7 @@ Từ góc nhìn CDO06, platform cần đóng vai trò **FinOps control plane d�
 | Alert routing | >=2 routes | Finance route và Engineering route |
 | Containment implemented | >=1 pattern | Có dry-run mode |
 | Containment designed | >=2 patterns | Có boundary, approval và rollback path |
-| Production safety | 3 NEVER | Never terminate prod, never delete data, never modify IAM |
+| Production safety | `NEVER terminate prod, delete data, or modify IAM` | Prod chỉ tag/suggest/dry-run; mọi hành động destructive bị cấm |
 | Audit retention | >=90 ngày | Audit mọi proposal/action containment |
 
 ## 5. Non-functional Requirements
@@ -171,9 +171,9 @@ Quy tắc dữ liệu:
 
 Containment là guardrail có kiểm soát, không phải auto-remediation tự do. Boundary production là tuyệt đối:
 
-- Không bao giờ terminate prod.
-- Không bao giờ delete data.
-- Không bao giờ modify IAM.
+- `NEVER terminate prod, delete data, or modify IAM`.
+- Không terminate hoặc thực hiện hành động phá hủy trên tài nguyên prod.
+- Không xóa dữ liệu hoặc sửa đổi IAM trong bất kỳ containment path nào.
 - Prod chỉ được tag, suggest, alert hoặc dry-run nếu chưa có phê duyệt rõ ràng.
 
 Containment patterns:
@@ -225,4 +225,3 @@ Mọi containment proposal/action phải ghi `actor`, `timestamp`, `correlation_
 - [ ] Mentor/client: Dev/sandbox containment apply có cần human approval không, ai approve?
 - [ ] CDO: Dashboard chọn QuickSight hay dashboard nội bộ nhẹ cho evidence nhanh nhất?
 - [ ] CDO: Alert destination cuối cho Finance và Engineering là email, Slack, SNS hay ticket?
-

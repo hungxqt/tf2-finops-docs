@@ -1,4 +1,4 @@
-# Security Design - TF2 FinOps Watch CDO Platform
+# Security Design - TF2 FinOps Watch CDO06 Platform
 
 ## 1. Network Security
 
@@ -153,7 +153,7 @@ Used by the Lambda function that applies containment policies. This role has acc
 To satisfy the client's absolute hard security requirements, the CDO platform attaches an IAM Permission Boundary or a Service Control Policy (SCP) to all automation roles. 
 
 > [!IMPORTANT]
-> **Hard production safety boundary**: Under no circumstances will the CDO system terminate running production resources, delete persistent data stores, or modify IAM policy scopes.
+> **Hard production safety boundary**: `NEVER terminate prod, delete data, or modify IAM`. Under no circumstances will the CDO system terminate running production resources, delete persistent data stores, or modify IAM policy scopes.
 
 The following policy snippet is attached as an explicit Deny boundary to the containment worker role and all assumed cross-account roles:
 

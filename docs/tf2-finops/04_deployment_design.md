@@ -1,4 +1,4 @@
-# Deployment & CI/CD Design - Task Force 2 · CDO-0X
+# Deployment & CI/CD Design - Task Force 2 · CDO06
 
 
 ## 1. IaC Strategy
@@ -48,7 +48,7 @@ terraform {
 }
 ```
 - **Plan-on-PR**: GitHub Actions runs `terraform plan` and posts the output as a PR comment
-- **Apply-on-merge**: `terraform apply` runs automatically when merging into `develop` (sandbox/staging); prod requires a manual approval gate
+- **Apply-on-merge**: `terraform apply` runs automatically for sandbox when merging into `develop` and for staging when merging into `main`; prod requires a manual approval gate
 - Never run `terraform apply` locally directly against staging/prod — all changes go through the pipeline
 
 ---
@@ -73,8 +73,8 @@ PR opened ──► Lint ──► Test ──► Security Scan ──► TF Pla
 ### 2.2 Branch strategy
 
 ```
-main          ──── production-ready (auto-deploy sandbox, manual-approve prod)
-  └── develop ──── integration branch (auto-deploy staging)
+main          ──── production-ready (auto-deploy staging, manual-approve prod)
+  └── develop ──── integration branch (auto-deploy sandbox)
         └── feature/* ──── feature branches (trigger plan-only, no apply)
 ```
 

@@ -1,4 +1,4 @@
-# Thiết kế Hạ tầng - TF2 FinOps Watch CDO
+# Thiết kế Hạ tầng - TF2 FinOps Watch CDO06
 
 ## 1. Hướng tiếp cận Kiến trúc (Architecture Direction)
 

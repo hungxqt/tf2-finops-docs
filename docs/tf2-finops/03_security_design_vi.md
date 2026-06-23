@@ -1,4 +1,4 @@
-# Thiết kế Bảo mật (Security Design) - TF2 FinOps Watch CDO Platform
+# Thiết kế Bảo mật (Security Design) - TF2 FinOps Watch CDO06 Platform
 
 ## 1. Bảo mật Mạng (Network Security)
 
@@ -153,7 +153,7 @@ CDO platform thực thi phân tách nhiệm vụ giữa điều phối workflow,
 Để đáp ứng các yêu cầu bảo mật cứng tuyệt đối của khách hàng, CDO platform gắn một IAM Permission Boundary hoặc Service Control Policy (SCP) vào tất cả các role tự động hoá.
 
 > [!IMPORTANT]
-> **Ranh giới an toàn sản xuất cứng (Hard production safety boundary)**: Trong mọi tình huống, hệ thống CDO sẽ KHÔNG BAO GIỜ tắt các tài nguyên production đang chạy, xóa các kho lưu trữ dữ liệu vĩnh viễn hoặc sửa đổi phạm vi chính sách IAM.
+> **Ranh giới an toàn sản xuất cứng (Hard production safety boundary)**: `NEVER terminate prod, delete data, or modify IAM`. Trong mọi tình huống, hệ thống CDO sẽ KHÔNG BAO GIỜ tắt các tài nguyên production đang chạy, xóa các kho lưu trữ dữ liệu vĩnh viễn hoặc sửa đổi phạm vi chính sách IAM.
 
 Đoạn mã chính sách (policy snippet) sau đây được gắn dưới dạng ranh giới Deny rõ ràng cho containment worker role và tất cả các role cross-account được assume:
 
