@@ -64,11 +64,11 @@ PR opened ──► Lint ──► Test ──► Security Scan ──► TF Pla
 | Stage | Tool | Description | Quality gate |
 |---|---|---|---|
 | Lint | `terraform fmt`, `tflint` | Check Terraform format + best practices | No format error, no lint warning |
-| Unit test | `pytest` (Lambda functions) | Test Lambda logic: normalizer, router, containment policy | Coverage ≥ 80% |
+| Unit test | `go test ./...` (Lambda Go packages) | Test Lambda logic: normalizer, router, containment policy | Coverage ≥ 80% |
 | Security scan | **Trivy** (IaC scan) + **Gitleaks** (secret scan) | Detect IaC misconfigurations + secrets exposed in code | No CRITICAL IaC misconfiguration; no secret detected |
 | TF Plan | `terraform plan` | Preview infra changes, post diff to PR comment | Plan success; reviewer approves diff |
 | TF Apply | `terraform apply -auto-approve` | Deploy infra to the corresponding environment | Apply exit 0 |
-| Smoke test | Custom Python script | Call health check endpoint, verify Step Functions can start, verify S3 bucket accessible | All checks pass |
+| Smoke test | Custom smoke test script | Call health check endpoint, verify Step Functions can start, verify S3 bucket accessible | All checks pass |
 
 ### 2.2 Branch strategy
 
