@@ -10,6 +10,8 @@
 
 The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications and external model endpoint calls occur privately using AWS VPC Endpoints.
 
+The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The AIOps-owned AI Engine is reachable only through an internal EKS service endpoint; it does not receive direct credentials for member account containment actions.
+
 ```mermaid
 graph TD
     subgraph "CDO Management Account VPC (ap-southeast-1)"
@@ -75,6 +77,8 @@ VPC interface endpoints are configured with private DNS enabled, routing all tra
 
 Network policies are deployed in the EKS cluster to restrict pod-to-pod communications (e.g., blocking `ai-engine-worker` pods on spot nodes from initiating connections to anything other than the `ai-engine-api` pods).
 
+Endpoint policies are scoped to the smallest practical action set. The S3 gateway endpoint allows reads from approved CUR export prefixes and writes only to the CDO raw/curated buckets. The DynamoDB endpoint allows access only to run-state, idempotency, audit, and dashboard-materialization tables. Interface endpoints for Secrets Manager, ECR, and CloudWatch Logs are restricted to the CDO VPC security groups and execution roles. Network ACLs remain simple and stateless, with public ingress denied and ephemeral return traffic allowed only inside private subnet ranges.
+
 ## 2. IAM & Access Control
 
 ### 2.1 Service Roles
@@ -88,6 +92,9 @@ AWS IAM service roles enforce strict separation. Crucially, no service role has 
 | `EksClusterRole` | EKS Control Plane | Standard `AmazonEKSClusterPolicy` and `AmazonEKSVPCResourceController` |
 | `EksNodeGroupRole` | EC2 Node Instances | `AmazonEKSWorkerNodePolicy`, `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy` |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Explicit deny for `iam:*`, `s3:Delete*`, and prod resource termination. |
+| `FinOpsAiApiIamRole` | `ai-engine-api` via IRSA | Read model config, read curated feature inputs, write invocation health metrics; no member account access. |
+| `FinOpsAiWorkerIamRole` | `ai-engine-worker` via IRSA | Read curated feature inputs and write batch output/checkpoints; no IAM mutation and no direct containment permissions. |
+| `FinOpsExternalSecretsRole` | External Secrets Operator | Read only approved Secrets Manager keys needed by EKS workloads. |
 
 > [!IMPORTANT]
 > **Hard Security Boundary**: Every CDO execution role has an attached Service Control Policy (SCP) ensuring it can **NEVER terminate prod, delete data, or modify IAM**. Production containment tasks are strictly restricted to tag, suggest, or dry-run audits.
@@ -114,6 +121,8 @@ Kubernetes Access Control is mapped to AWS IAM using **IAM Roles for Service Acc
 Cross-account access to member account CUR buckets is governed by target account S3 bucket policies allowing read access to the centralized `FinOpsCURPullerRole` using External IDs.
 Containment actions in member accounts are triggered via cross-account IAM Role Assumption (`AssumeRole`). The management account `LambdaContainment` role assumes `FinOpsContainmentWorkerRole` in the target account, executing tag additions or scaling down sandbox ASGs.
 
+Every cross-account role trust policy includes an external ID, source account condition, and session tagging requirement so audit logs can map each action back to a CDO run. Production roles include explicit deny statements for termination, destructive storage operations, and IAM mutation. Non-production roles may allow limited containment actions only when the incoming request includes an approved `execution_mode`, environment tag, anomaly ID, and policy decision ID. If any of those fields are missing, the containment worker records a denied audit event and exits without retrying.
+
 ## 3. Secrets Management
 
 ### 3.1 Secrets Inventory
@@ -125,6 +134,8 @@ The following secrets are stored in AWS Secrets Manager:
 | `finops/ai-engine/api-key` | AWS Secrets Manager (KMS CMK encrypted) | 30 days automatic | `ai-engine-api` pod (via External Secrets Operator) |
 | `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | QuickSight dataset engine / Athena crawler |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | 90 days manual | `LambdaAlertRouting` |
+| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | 90 days automatic | Step Functions validation Lambda and `ai-engine-api` |
+| `finops/containment/external-id-seed` | AWS Secrets Manager | Manual rotation on incident | Containment role provisioning workflow |
 
 ### 3.2 Inject Pattern
 
@@ -151,11 +162,16 @@ spec:
 ```
 For Lambda functions, secrets are resolved during function cold-starts, cached in the `/tmp` memory directory, and validated with cache TTL policies to avoid direct API invocation overhead.
 
+The injection path intentionally differs by runtime. Lambda functions read secrets directly through the Secrets Manager SDK because they are short-lived adapters. EKS workloads receive secrets through ESO so Kubernetes manifests never contain plaintext values. Terraform creates secret containers and IAM permissions, but it does not store secret values in `.tfvars`, Terraform state, Helm values, or GitOps manifests.
+
 ### 3.3 Anti-leak Controls
 
 - **CI/CD Scanning**: Gitleaks is integrated into GitHub Actions pipelines, blocking PR merges if plain-text credentials or key headers are detected.
 - **VPC Endpoint Restriction**: Secrets Manager VPC Endpoints enforce policies restricting access to only the CDO management VPC CIDR.
 - **Log Redaction**: Outbound application logs are passed through a regex-based masking filter, replacing API keys, tokens, and authorization headers with `[REDACTED]`.
+- **Terraform State Control**: Terraform state is encrypted, access-controlled, and reviewed so sensitive values are modeled as secret references rather than plaintext outputs.
+- **Container Boundary**: EKS workloads run as non-root, mount secrets read-only, and avoid writing secret material to persistent volumes or checkpoints.
+- **Incident Response**: Suspected secret exposure triggers secret rotation, Git history review, CloudTrail lookup for `GetSecretValue`, and temporary suspension of affected deployment credentials.
 
 ## 4. Encryption
 
@@ -175,12 +191,16 @@ All platform data is encrypted at rest using Customer Managed Keys (CMKs) in AWS
 
 - **TLS Requirements**: All ingress and egress traffic requires TLS 1.3 (with TLS 1.2 as a minimum fallback). Weak ciphers are disabled on the internal ALB.
 - **Internal Service Traffic**: EKS pod-to-pod communications for API-to-worker traffic use HTTP/2 with mTLS via Linkerd/App Mesh (or Kubernetes internal ClusterIP services mapped to TLS endpoints).
+- **AI Engine Calls**: Step Functions and Lambda invoke the internal AI Engine endpoint through private networking only. The request includes a contract version and correlation ID, and the response is rejected if the signature, schema, or required fields are invalid.
+- **Alert Webhooks**: Slack or email integrations are called from the alerting Lambda after payload minimization. Sensitive cost evidence is linked through internal dashboard/audit references instead of embedded directly in external messages.
 
 ### 4.3 Key Management
 
 - **Rotation**: CMK keys rotate automatically every 365 days.
 - **Access Policies**: Key policies enforce separation of duties, ensuring only the deployment pipelines can modify key settings, and only execution roles (Lambda/EKS) can call decrypt operations.
 - **Audit**: All key usage is monitored and logged in AWS CloudTrail.
+- **Blast-radius control**: Separate CMKs are preferred for cost data, audit records, secrets, and EKS node volumes unless Finance and Security approve consolidation for cost reasons.
+- **Break-glass access**: Manual decrypt access is not granted to day-to-day developers. Temporary access requires incident approval, ticket reference, expiry time, and post-use review.
 
 ## 5. Audit Logging
 
@@ -221,6 +241,8 @@ Every action taken by the CDO platform is documented. For containment actions, t
 }
 ```
 
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Dry-run operations still produce audit records because Finance needs to see what the platform would have done and why the action remained safe. AI model training datasets are not logged by CDO; CDO logs only invocation metadata, returned decision fields, and operational evidence references needed for alerting and containment.
+
 ### 5.2 Storage + Retention
 
 Audit logs are stored securely with immutable controls:
@@ -232,12 +254,15 @@ Audit logs are stored securely with immutable controls:
 | EKS Cluster Logs | CloudWatch Logs | 30 days | CloudWatch Logs Insights |
 | App/Lambda Logs | CloudWatch Logs | 14 days | CloudWatch Logs Insights |
 
+Containment audit storage is append-only by design. DynamoDB supports low-latency dashboard lookup, while S3 with Object Lock is the durable evidence store. The dashboard should link to the audit record ID rather than duplicating sensitive before/after state in alert messages. Retention shorter than 90 days is not allowed for containment records, even in sandbox, because the capstone requirement measures traceability of automated decisions.
+
 ### 5.3 Synthetic Data Handling
 
 To prevent mixing synthetic anomaly logs with real account settings during testing:
-- Synthetic cost injections are marked with `source = "synthetic"`.
+- CDO-owned demo injections are marked with `source = "synthetic-demo"`.
 - QuickSight dashboard filters allow toggling between real and synthetic data displays.
 - Synthetic containment actions are routed to a mock target endpoint, leaving real AWS resources untouched.
+- AIOps-owned model training, enhancement, and backtest datasets remain outside CDO ownership. CDO may store AIOps-provided model metrics as integration evidence, but it does not copy or reclassify the AI team's training dataset as CDO operational data.
 
 ## 6. CI Security Controls
 
@@ -254,10 +279,14 @@ To prevent mixing synthetic anomaly logs with real account settings during testi
 | **ISO 27001** | Weekly access audit reports, immutable containment logs, automatic key rotation. |
 | **HIPAA** | Out of scope (Cost billing data contains no Protected Health Information). |
 
+The compliance mapping is intentionally limited to capstone-relevant controls. The platform handles billing and operational metadata, not customer application payloads, but the data still reveals account structure, resource usage, and owner tags. That makes least privilege, audit retention, encryption, and alert minimization mandatory even when no regulated customer data is present.
+
 ## 8. Open Questions
 
 - [ ] **Cross-Account KMS Strategy**: Should we use a centralized KMS key with cross-account access, or local target account keys for CUR S3 bucket encryption?
 - [ ] **Operator Notification Channels**: When a containment action is denied, should the platform escalate alerts via PagerDuty or direct Slack webhook notifications?
+- [ ] **External Alert Redaction**: Which cost fields are allowed in Slack/email, and which must remain dashboard-only?
+- [ ] **Break-glass Approver**: Who approves temporary decrypt or production investigation access during an incident?
 
 ## Related documents
 

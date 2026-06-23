@@ -8,6 +8,8 @@
 
 Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) để thu thập và phân tích dữ liệu chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với AI Engine do nhóm AIOps sở hữu được lưu trữ trên cụm EKS được quản lý. Lớp tính toán EKS sử dụng cấu hình lai (hybrid) giữa các nhóm nút on-demand và spot để tối ưu hóa chi phí thực thi.
 
+Kiến trúc này được định cỡ xoay quanh các trách nhiệm lặp lại của nền tảng CDO, chứ không xoay quanh bộ dữ liệu huấn luyện mô hình của AIOps. CDO phải kéo dữ liệu thanh toán một cách đáng tin cậy từ các nguồn AWS được phê duyệt, chuẩn hóa nó thành dạng sẵn sàng cho hợp đồng, gọi AI Engine do AIOps sở hữu và lưu giữ bằng chứng quyết định được trả về. Mọi bộ dữ liệu lịch sử tổng hợp được sử dụng để huấn luyện, nâng cao hoặc backtest mô hình đều thuộc sở hữu của AIOps.
+
 ```mermaid
 graph TB
     subgraph "AWS Member Accounts"
@@ -122,6 +124,8 @@ graph TD
 
 *Chú thích: Bộ điều phối trung tâm Step Functions Orchestrator vận hành toàn bộ vòng lặp FinOps: trích xuất dữ liệu vào Lakehouse, gọi EKS-hosted AI Engine để lấy quyết định bất thường và kích hoạt các luồng cảnh báo cũng như containment dựa trên kết quả.*
 
+Về mặt vận hành, Step Functions là ranh giới kiểm soát giữa logic CDO mang tính xác định và đầu ra AI mang tính xác suất. Mỗi quá trình chuyển đổi trạng thái đều ghi lại `run_id`, cửa sổ chi phí, phạm vi tài khoản và phiên bản hợp đồng để Finance có thể truy vết một bất thường trên dashboard về đúng lô thu thập dữ liệu và quyết định của AI. Thiết kế này cũng ngăn AI Engine tác động trực tiếp đến các tài khoản thành viên; tất cả các hành động cảnh báo và containment đều được điều phối thông qua các worker chính sách của CDO.
+
 ### 1.2 Quy trình Thu thập & Hồ dữ liệu (Ingestion & Data Lakehouse Workflow)
 
 Sơ đồ này đi sâu vào quy trình thu thập dữ liệu (ingestion pipeline) và các lớp lưu trữ/truy vấn của hồ dữ liệu (lakehouse).
@@ -152,6 +156,8 @@ graph TB
 ```
 
 *Chú thích: Step Functions kích hoạt hàm Ingestion Lambda hàng ngày thông qua EventBridge Scheduler. Dữ liệu chi phí thô từ các tài khoản thành viên (Member Accounts) được lưu trữ trong S3 Raw Zone, được chuyển tiếp và catalog hóa thành định dạng Parquet trong S3 Curated Zone, rồi được truy vấn thông qua Athena. Kết quả truy vấn được truyền ngược lại bộ điều phối Step Functions để cung cấp cho AI Engine.*
+
+Workflow thu thập chuẩn hóa hai dạng dữ liệu thanh toán vận hành trước khi gọi AI Engine. CUR cung cấp các trường ở cấp độ tài nguyên như account ID, product code, resource ID, unblended cost và các thẻ tài nguyên. Cost Explorer cung cấp các trường tổng hợp như linked account, service name, service code, region, unblended cost và trạng thái estimated/final. Lớp curated lưu trữ cả trường mã dịch vụ đã chuẩn hóa và tên hiển thị để CDO có thể chuyển các payload nhất quán tới AIOps và xây dựng các chế độ xem dashboard mà không cần sở hữu dữ liệu huấn luyện mô hình.
 
 ### 1.3 Nền tảng Lưu trữ AI Engine trên EKS (AI Engine EKS Hosting Platform)
 
@@ -203,6 +209,8 @@ graph TB
 
 *Chú thích: Yêu cầu `/detect` của AI Engine từ bộ điều phối Step Functions được định tuyến qua Internal ALB đến `ai-engine-api` chạy trên các nút On-Demand. Các tác vụ chạy theo lô nặng được điều phối trên các nút Spot để đọc/ghi các đặc trưng đã được lọc (curated features) từ S3. Thông tin xác thực và cấu hình được đồng bộ hóa từ Secrets Manager bằng cách sử dụng External Secrets Operator (ESO).*
 
+Nền tảng EKS tách biệt độ tin cậy thời gian chạy khỏi việc thực thi hàng loạt (batch) hiệu quả về chi phí. `ai-engine-api` và `ai-engine-explainer` vẫn chạy trên các nút on-demand vì Step Functions phụ thuộc vào hành vi phản hồi có thể dự đoán được trong suốt lượt chạy hàng ngày. `ai-engine-worker`, các job scoring theo lô, job kỹ nghệ đặc trưng và job huấn luyện lại được đặt trên các nút spot vì chúng có thể lưu checkpoint vào S3 và thử lại sau khi bị gián đoạn. Sự phân biệt này là bắt buộc đối với cả việc kiểm soát chi phí và khôi phục lỗi chính xác.
+
 ### 1.4 Động cơ Cảnh báo & Containment (Alerting & Containment Engine)
 
 Sơ đồ này đi sâu vào luồng cảnh báo và containment, mô tả cách thức chính sách được thực thi an toàn trên các môi trường production và phi production với một nhật ký kiểm toán tuân thủ.
@@ -239,6 +247,8 @@ graph TB
 
 *Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán vào DynamoDB, áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. QuickSight hiển thị chi tiêu và trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính.*
 
+Động cơ containment coi `execution_mode` as một đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên.
+
 ---
 
 ## 2. Bảng thành phần (Component table)
@@ -266,7 +276,15 @@ Các thành phần hạ tầng sau đây được triển khai tại vùng `ap-s
 | Tác nhân thực thi containment (Containment Worker) | AWS Lambda | Giả lập vai trò (assume role) trong các tài khoản thành viên để áp dụng nhãn (tag) hoặc tắt các tài nguyên dev/sandbox, thực thi nghiêm ngặt trong các chế độ dry-run hoặc apply. | Thanh toán theo mức sử dụng. |
 
 > [!NOTE]
-> Chi phí chạy thực tế cho CDO pipeline trong giai đoạn xây dựng hệ thống được theo dõi bằng: `Cần bằng chứng: CDO pipeline actual operational costs`.
+> Chi phí chạy thực tế cho CDO pipeline trong giai đoạn xây dựng hệ thống được theo dõi bằng: `Cần bằng chứng: Chi phí vận hành thực tế của pipeline CDO`.
+
+Mô hình thành phần bản đồ trực tiếp tới ba hợp đồng dữ liệu được sử dụng bởi nền tảng:
+
+| Hợp đồng | Thành phần CDO chịu trách nhiệm | Bằng chứng tối thiểu được lưu giữ |
+|---|---|---|
+| Hợp đồng kéo dữ liệu chi phí | EventBridge Scheduler, Step Functions, Ingestion Lambda, S3, Glue, Athena | URI đối tượng nguồn, cửa sổ chi phí, tài khoản, dịch vụ, vùng, tag chủ sở hữu, chi phí chưa pha trộn (unblended cost), cờ estimated/final. |
+| Hợp đồng đầu ra quyết định của AI | Internal ALB, `ai-engine-api`, Step Functions, DynamoDB | Phiên bản mô hình, mã bất thường (anomaly ID), độ tin cậy (confidence), mức độ nghiêm trọng (severity), chi tiêu dự kiến so với thực tế, cửa sổ bằng chứng, giải thích, định tuyến được khuyến nghị. |
+| Hợp đồng cảnh báo và containment | Alert Lambda, Containment Lambda, DynamoDB, nhật ký kiểm toán S3 | Mục tiêu định tuyến, yêu cầu phê duyệt, chế độ thực thi, trạng thái trước/sau, đường dẫn rollback, ID bản ghi kiểm toán. |
 
 ---
 
@@ -281,6 +299,8 @@ Nền tảng CDO triển khai một **kiến trúc FinOps control plane theo mô
    - Các endpoint suy luận ổn định (`ai-engine-api`, `ai-engine-explainer`) đòi hỏi độ khả dụng cao và độ trễ thấp.
    - Các tác vụ chạy theo lô nặng (`ai-engine-worker` phục vụ kỹ nghệ đặc trưng, chấm điểm theo lô và huấn luyện lại mô hình) tiêu tốn nhiều tài nguyên tính toán nhưng có thể bị ngắt quãng.
    Việc lưu trữ AI Engine trên EKS cho phép CDO đặt các API ổn định trên các **on-demand managed node groups** để đảm bảo các cam kết SLO, và các worker chạy theo lô trên các **spot node groups** sử dụng các cấu hình node selector và toleration tự động. Thiết kế này giúp giảm 60-70% chi phí tính toán cho AI. Fargate không hỗ trợ mức độ kiểm soát chi tiết về node affinity này, trong khi mô hình container serverless thuần túy sẽ gây lãng phí tài nguyên tính toán khi không có luồng công việc chạy.
+
+Lý do thực tế điều này quan trọng là tính độc lập vận hành. AIOps có thể lặp lại logic mô hình, kỹ nghệ đặc trưng và xử lý false-positive mà không cần thay đổi workflow của CDO. CDO giữ cho lakehouse, bộ lập lịch, đường dẫn gọi API, định tuyến cảnh báo và chính sách containment luôn ổn định, trong khi AI Engine do EKS host có thể phát triển đằng sau một hợp đồng có phiên bản.
 
 ### 3.2 Các điểm vượt trội (kèm số liệu) (Strengths (with metrics))
 
@@ -310,27 +330,31 @@ Nền tảng CDO được triển khai tại một tài khoản trung tâm **CDO
 - **Thu thập chi phí Cross-Account**: Hàm `LambdaCURPuller` trung tâm giả lập vai trò (assume role) đọc dữ liệu `FinOpsCURPullerRole` tại mỗi tài khoản thành viên đích. Vai trò này cấp quyền truy xuất dữ liệu Cost Explorer API cục bộ và sao chép các tệp CUR từ bucket S3 xuất của tài khoản thành viên.
 - **Containment Cross-Account**: Hàm `LambdaContainment` trung tâm giả lập vai trò `FinOpsContainmentWorkerRole` tại tài khoản thành viên đích. Vai trò giả lập này chứa các quyền được giới hạn chặt chẽ để gắn nhãn (tag) tài nguyên hoặc điều chỉnh Auto Scaling Groups (ASGs) tại tài khoản thành viên cụ thể đó.
 
+Mô hình tài khoản phải bảo toàn ngữ cảnh môi trường vì cùng một loại bất thường sẽ có các giới hạn hành động khác nhau tùy thuộc vào môi trường. Một workload GPU chạy quá mức kiểm soát trong tài khoản nghiên cứu non-prod có thể đủ điều kiện để containment sau khi phê duyệt; một tín hiệu tương tự trong tài khoản thanh toán production phải giữ ở mức chỉ tag/suggest/dry-run.
+
 ### 4.2 Mô hình cô lập (Isolation pattern)
 
 - **Cô lập dữ liệu**: Dữ liệu chi phí thu thập từ các tài khoản thành viên được lưu trữ trong một bucket S3 duy nhất, được phân vùng theo mã tài khoản (Account ID): `s3://cdo-curated-bucket/account_id=123456789012/year=2026/month=06/`.
 - **Cô lập truy vấn**: Các định nghĩa bảng trong Athena sử dụng tính năng chiếu phân vùng (partition projection) của Glue. Các truy vấn Athena được thực thi để phục vụ các materialized view của bảng điều khiển được giới hạn chặt chẽ theo khóa phân vùng `account_id`.
 - **Xác định sở hữu (Ownership)**: Tài nguyên được ánh xạ tới các nhóm kỹ thuật (squad) cụ thể bằng cách sử dụng các thẻ siêu dữ liệu tiêu chuẩn là `owner` và `squad`. Khi pipeline thu thập dữ liệu phát hiện các tài nguyên thiếu các thẻ này, hệ thống sẽ tự động gán chúng vào một nhóm mặc định (`unassigned-resources`) và định tuyến cảnh báo đến kênh hạ tầng của CDO để xử lý thủ công.
 
+Phân vùng theo tài khoản và kỳ chi phí là biện pháp kiểm soát hiệu năng chính, trong khi thẻ tag cung cấp góc nhìn sở hữu kinh doanh. Nền tảng phải giữ cho chi tiêu không có tag hiển thị được thay vì loại bỏ nó trong quá trình chuẩn hóa, vì các tag sở hữu bị thiếu là một lộ trình leo thang quan trọng đối với Finance ngay cả khi AIOps sở hữu việc phân loại bất thường cuối cùng.
+
 ### 4.3 Quy trình onboard (Onboarding flow)
 
 Khi thực hiện onboard một tài khoản AWS hoặc squad mới vào nền tảng FinOps Watch, pipeline tự động dưới đây sẽ được thực thi:
 
 ```
-1. Thêm account ID và ánh xạ squad/owner vào cấu hình Terraform 'accounts.tfvars'.
-2. Thực thi Terraform để áp dụng Stack IAM:
-   - Cấp role 'FinOpsCrossAccountAccessRole' tại tài khoản thành viên đích.
-   - Cấu hình trust policy cho phép các vai trò Lambda và EKS trung tâm giả lập vai trò đó.
-   - Cập nhật cấu hình xuất dữ liệu CUR của tài khoản thành viên sang bucket S3.
-3. Kích hoạt Glue crawler để cập nhật các phân vùng trong Glue Data Catalog.
-4. Lượt chạy kiểm tra E2E:
-   - Hàm Ingestion Lambda gọi thử nghiệm đến API Cost Explorer của tài khoản đích.
-   - Xác thực kết nối OIDC đến endpoint dịch vụ nội bộ của EKS.
-5. Đánh dấu trạng thái tài khoản là 'ACTIVE' trong DynamoDB registry.
+1. Add account ID and owner mapping to the Terraform 'accounts.tfvars' configuration.
+2. Terraform execution applies IAM Stack:
+   - Provisions 'FinOpsCrossAccountAccessRole' in the target member account.
+   - Configures trust policy allowing the central CDO Lambda and EKS roles to assume it.
+   - Updates target account CUR export configuration to deliver data to S3.
+3. Glue crawler is triggered to update partitions in the Glue Data Catalog.
+4. E2E Validation run:
+   - Ingestion Lambda makes a test API call to target account Cost Explorer.
+   - Verifies OIDC connection to EKS internal service endpoint.
+5. Account status marked as 'ACTIVE' in the DynamoDB registry.
 ```
 
 ### 4.4 Tính bất biến (Idempotency)
@@ -338,7 +362,7 @@ Khi thực hiện onboard một tài khoản AWS hoặc squad mới vào nền t
 Nhằm ngăn chặn việc chạy trùng lặp cho cùng một kỳ chi phí (điều này sẽ làm sai lệch dữ liệu trên bảng điều khiển và phát sinh thêm chi phí gọi Cost Explorer API trùng lặp), nền tảng CDO triển khai cơ chế idempotency:
 - Mỗi lượt thực thi hàng ngày tạo ra một khóa idempotency: `account_id:billing_period:execution_date` (ví dụ: `123456789012:2026-06:2026-06-22`).
 - Luồng Step Functions bắt đầu bằng cách truy vấn bảng `cdo-run-state-table` trên DynamoDB theo khóa này.
-- Nếu khóa này đã tồn tại với trạng thái `Status = COMPLETED` hoặc `Status = IN_PROGRESS`, luồng Step Functions sẽ dừng lại một cách an toàn và ghi lại nỗ lực chạy trùng lặp này vào nhật ký kiểm toán (audit logs).
+- Nếu khóa này đã tồn tại với trạng thái `Status = COMPLETED` hoặc `Status = IN_PROGRESS`, luồng Step Functions sẽ dừng lại một cách an sau và ghi lại nỗ lực chạy trùng lặp này vào nhật ký kiểm toán (audit logs).
 - Nếu khóa chưa tồn tại, một bản ghi mới được tạo với trạng thái `Status = IN_PROGRESS` cùng thời gian sống (TTL) là 48 giờ để khóa lượt chạy.
 
 ---
@@ -378,6 +402,8 @@ Nền tảng CDO tự động mở rộng linh hoạt để xử lý lưu lượ
 - **Tối ưu hóa truy vấn Athena**: S3 bucket được phân vùng theo `account_id`, `year` và `month`. Các truy vấn Athena giới hạn quét dữ liệu trong các phân vùng cụ thể, giúp tránh nghẽn khi thực thi.
 - **Mở rộng DynamoDB**: Bảng `cdo-run-state-table` được cấu hình ở chế độ dung lượng **On-Demand Capacity Mode**, cho phép mở rộng tức thì từ không lên hàng nghìn yêu cầu đọc/ghi mà không cần can thiệp thủ công.
 
+Giả định mở rộng quy mô trong production là số lượng dòng chi tiết chi phí tăng nhanh hơn số lượng tài khoản. Do đó, phân vùng S3, giới hạn quét Athena và tự động mở rộng AI batch worker quan trọng hơn việc tăng tính đồng thời của Lambda. Kích thước bộ dữ liệu huấn luyện mô hình hoặc backtest do AIOps xử lý; CDO mở rộng quy mô thu thập vận hành, cuộc gọi API, dashboard và đường dẫn kiểm toán.
+
 ---
 
 ## 7. Các chế độ lỗi và khôi phục (Failure modes + recovery)
@@ -394,6 +420,8 @@ Bảng dưới đây trình bày các chế độ lỗi, cơ chế phát hiện 
 | **Dữ liệu bảng điều khiển bị cũ** | CloudWatch Alarm kích hoạt nếu mốc thời gian phân vùng curated mới nhất cũ hơn 26 giờ. | Cảnh báo cho kỹ sư để kiểm tra log của pipeline và kích hoạt thủ công chạy lại lượt thu thập dữ liệu hàng ngày. | 1 giờ | 24 giờ |
 | **Lỗi gửi cảnh báo** | `LambdaAlertRouting` bắt được lỗi hết thời gian kết nối hoặc mã lỗi HTTP 5xx từ Slack API. | Hàm Lambda gửi payload cảnh báo vào hàng đợi SQS Dead Letter Queue (DLQ) và thử gửi qua kênh dự phòng email SES. | 10 phút | 0 |
 | **Từ chối hành động Containment** | Việc giả lập vai trò cross-account tại tài khoản thành viên trả về lỗi `AccessDeniedException`. | **CDO fail closed**: Sự cố được ghi nhận vào bảng kiểm toán DynamoDB dưới trạng thái `DENIED`, đồng thời một cảnh báo khẩn cấp được gửi tới kênh bảo mật. | 1 giờ | 0 |
+| **Sai lệch phiên bản hợp đồng AI** | Xác thực trước khi chạy phát hiện phiên bản hợp đồng `ai-engine-api` được triển khai khác với schema mong đợi của Step Functions. | Block lượt chạy trước khi phát hiện, đánh dấu lượt chạy là `FAILED_CONTRACT_CHECK`, thông báo cho CDO và AIOps, và không thực thi containment. | 2 giờ | 24 giờ |
+| **Gián đoạn Spot Worker** | Kubernetes job nhận được sự kiện thu hồi (eviction) hoặc gián đoạn nút trên spot node group. | Thử lại batch job từ checkpoint S3 mới nhất trên nút spot khỏe mạnh hoặc nút on-demand dự phòng nếu hết cửa sổ thử lại. | 1 giờ | 0 cho công việc đã lưu checkpoint |
 
 ---
 
