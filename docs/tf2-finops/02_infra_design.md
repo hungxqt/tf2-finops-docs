@@ -1,249 +1,232 @@
-# Infrastructure Design - TF2 FinOps Watch CDO06
+# Infrastructure Design - Task Force 2 · FinOps Watch CDO
 
-## 1. Architecture Direction
+<!-- Doc owner: CDO Team
+     Status: Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
+-->
 
-The CDO platform for TF2 FinOps Watch is an AWS-only, lakehouse-centric FinOps control plane in `ap-southeast-1`. It is designed for scheduled cost-period processing rather than request-response traffic. The default cadence is 24h because it balances Cost and Usage Report delivery lag, Cost Explorer availability, operating cost, and false-positive control better than a 12h or 48h cadence for this capstone scope.
+## 1. Architecture diagram
 
-The platform ingests synthetic cost data unless real AWS bill access is explicitly provided. Data sources are AWS Data Exports/CUR 2.0 or CUR files in S3 plus Cost Explorer API. CDO owns the cost data pull, normalized cost windows, ownership metadata, orchestration, idempotency, dashboard materialization, alert routing, containment guardrails, and audit evidence. The AIOps team owns anomaly detection logic, model selection, model versioning, confidence scoring, explanation text, AI Engine runtime, and AI backtest metrics.
-
-The hard production safety boundary is: NEVER terminate prod, delete data, or modify IAM. All containment paths support `dry-run`; prod is limited to tag, suggest, or dry-run behavior. If the AIOps-owned AI Engine is unavailable, CDO fails closed for containment, alerts operators, preserves the failed run, and writes an audit record.
-
-## 2. Target Architecture
+The CDO platform uses a lakehouse-centric control plane combined with serverless orchestration workflows and a managed EKS cluster to host the AI Engine runtime. The data processing and anomaly detection flow operates on a scheduled 24h cadence.
 
 ```mermaid
 flowchart TB
-    subgraph AWSOrg["AWS Organization and Cost Sources"]
-        CUR["AWS Data Exports / CUR 2.0 in S3"]
-        CE["Cost Explorer API"]
-        Accounts["Member accounts"]
+    subgraph "AWS Multi-Account Environment"
+        subgraph "CDO Management Account (ap-southeast-1)"
+            subgraph "VPC (Private Subnets Only)"
+                subgraph "EKS Cluster (AI Engine Hosting)"
+                    direction TB
+                    subgraph "On-Demand Node Group"
+                        API[ai-engine-api Pods]
+                        EXP[ai-engine-explainer Pods]
+                        MON[kube-prometheus-stack Pods]
+                    end
+                    subgraph "Spot Node Group"
+                        WRK[ai-engine-worker Pods]
+                        JOB[Batch Scoring / Training Jobs]
+                    end
+                    API --- WRK
+                end
+                ALB[Internal Application Load Balancer]
+                VPCE[VPC Endpoints: S3, DynamoDB, Secrets Manager]
+            end
+
+            subgraph "Data Lakehouse & Storage"
+                S3Raw[(S3 Raw Zone)]
+                S3Cur[(S3 Curated Zone)]
+                Glue[(Glue Data Catalog)]
+                Athena[Athena Query Engine]
+                DDB[(DynamoDB Run State & Idempotency)]
+            end
+
+            subgraph "Orchestration & Serverless Workflows"
+                EB[EventBridge Scheduler]
+                SF[Step Functions Orchestrator]
+                L_Pull[Lambda CUR/CE Ingestion Adapter]
+                L_Call[Lambda AI Engine Client]
+                L_Route[Lambda Alert Routing Engine]
+                L_Cont[Lambda Containment Worker]
+            end
+
+            subgraph "User Presentation & Alerting"
+                QS[QuickSight Dashboard]
+                SNS[SNS Alert Topic]
+            end
+        end
+
+        subgraph "Target Member Accounts (Multi-Account)"
+            CUR_S3[(CUR Export S3 Buckets)]
+            CE_API[Cost Explorer API Endpoint]
+            Prod_Res[Production Resources]
+            Dev_Res[Dev/Sandbox Resources]
+        end
     end
 
-    subgraph Lakehouse["CDO Lakehouse - ap-southeast-1"]
-        Raw["S3 raw zone<br/>cost/raw/"]
-        Curated["S3 curated zone<br/>cost/curated/ ownership/ anomaly/ alert/ containment/ audit/"]
-        Glue["Glue Data Catalog"]
-        Athena["Athena views and dashboard queries"]
-    end
-
-    subgraph Orchestration["Scheduled CDO Control Plane"]
-        Scheduler["EventBridge Scheduler<br/>24h cadence"]
-        SFN["Step Functions Standard<br/>cost-period workflow"]
-        Puller["Lambda cost pull adapters"]
-        Normalize["Lambda normalization workers"]
-        AIInvoke["Lambda AI contract client"]
-        Route["Lambda routing and policy workers"]
-        Contain["Lambda containment workers"]
-        DDB["DynamoDB<br/>run state, idempotency, anomalies, routing, containment audit, dashboard materialized views"]
-    end
-
-    subgraph AIOps["AIOps-owned AI Engine Boundary"]
-        AI["Versioned AI Engine endpoint or queue contract"]
-    end
-
-    subgraph Outputs["Finance and Engineering Outputs"]
-        Dashboard["QuickSight or internal dashboard<br/>finance-readable, no SQL required"]
-        FinanceAlert["Finance alert route<br/>email / Slack / SNS"]
-        EngAlert["Engineering alert route<br/>Slack / SNS / ticket"]
-        Audit["S3 append-only audit evidence<br/>retention >=90 days"]
-    end
-
-    Scheduler --> SFN
-    SFN --> Puller
-    Puller --> CUR
-    Puller --> CE
-    CUR --> Raw
-    CE --> Raw
-    Raw --> Normalize
-    Normalize --> Curated
-    Curated --> Glue
-    Glue --> Athena
-    Athena --> Dashboard
-    SFN --> DDB
-    SFN --> AIInvoke
-    AIInvoke --> AI
-    AIInvoke --> DDB
-    DDB --> Route
-    Route --> FinanceAlert
-    Route --> EngAlert
-    Route --> Dashboard
-    Route --> Contain
-    Contain --> Accounts
-    Contain --> DDB
-    Contain --> Audit
-    DDB --> Audit
+    %% Ingestion Flow
+    EB -->|Trigger 24h| SF
+    SF -->|1. Ingest| L_Pull
+    L_Pull -->|Pull CUR parquet / API data| CUR_S3
+    L_Pull -->|Call API| CE_API
+    L_Pull -->|2. Write Raw| S3Raw
+    S3Raw -->|Partition Trigger| S3Cur
+    S3Cur -->|Register Schema| Glue
+    
+    %% AI Inference Flow
+    SF -->|3. Query Aggregated Cost| Athena
+    Athena -->|Return Cost Matrix| SF
+    SF -->|4. Invoke Anomaly Detection| L_Call
+    L_Call -->|Internal ALB HTTPS request| ALB
+    ALB -->|Route traffic| API
+    API -->|Deploy batch worker pod| WRK
+    API -->|Write operational log| VPCE
+    
+    %% Alert & Action Flow
+    SF -->|5. Retrieve Decision Schema| L_Call
+    SF -->|6. Process Alerts| L_Route
+    L_Route -->|Publish Anomaly Alert| SNS
+    SNS -->|Finance Email/Slack| QS
+    SNS -->|Engineering Alert| Dev_Res
+    SF -->|7. Enforce Safety Policy| L_Cont
+    L_Cont -->|Dry-run or Safe tag action| Dev_Res
+    L_Cont -->|Audit evidence log| DDB
+    L_Cont -->|Write JSON audit file| S3Cur
 ```
 
-This layout keeps the data plane durable and queryable in S3, Glue, and Athena, while keeping workflow state and idempotency in DynamoDB. Step Functions Standard is preferred over ad hoc Lambda chaining because the workflow needs visible retries, failure states, and evidence for each cost period. Lambda is the default compute choice for short CDO adapters and policy workers. Fargate is reserved for a future long-running connector if the final AI Engine contract requires persistent connections or heavier batch processing.
+*Caption: The CDO management VPC contains private subnets with no public route tables. External cost data is pulled from member accounts via OIDC trust roles. The AI Engine endpoints are exposed internally via an AWS ALB routing to EKS services, segregating stable APIs on on-demand nodes and batch workers on spot nodes. Workflows are scheduled and monitored by Step Functions.*
 
-### AWS Services Workflow Diagram
+## 2. Component table
 
-```mermaid
-flowchart TD
-    EB["EventBridge Scheduler<br/>24h trigger"] --> SFN["Step Functions Standard<br/>FinOps run"]
-    SFN --> IDEM["DynamoDB conditional write<br/>idempotency key"]
+The following infrastructure components are deployed for the CDO platform and hosted workloads:
 
-    IDEM -- duplicate run --> DUPAUDIT["S3 audit evidence<br/>duplicate recorded and exit"]
-    IDEM -- new run --> PULL["Lambda cost puller"]
-
-    PULL --> CURS3["S3 CUR / Data Exports<br/>source objects"]
-    PULL --> CEAPI["Cost Explorer API<br/>summary and delta check"]
-    CURS3 --> RAW["S3 raw zone"]
-    CEAPI --> RAW
-
-    RAW --> NORM["Lambda normalization worker"]
-    NORM --> CURATED["S3 curated zone"]
-    CURATED --> GLUE["Glue Data Catalog"]
-    GLUE --> ATHENA["Athena views"]
-
-    SFN --> AIClient["Lambda AI contract client"]
-    ATHENA --> AIClient
-    AIClient --> AI["AIOps-owned AI Engine<br/>versioned contract"]
-    AI --> DECISION["DynamoDB anomaly records<br/>decision evidence"]
-
-    DECISION --> DASHMAT["DynamoDB dashboard materialized view"]
-    ATHENA --> DASH["QuickSight or internal dashboard"]
-    DASHMAT --> DASH
-
-    DECISION --> ROUTE["Lambda routing worker"]
-    ROUTE --> SNSFIN["SNS / email / Slack<br/>Finance route"]
-    ROUTE --> SNSENG["SNS / Slack / ticket<br/>Engineering route"]
-
-    ROUTE --> POLICY["Lambda containment policy worker"]
-    POLICY --> MODE{"Allowed action?"}
-    MODE -- prod or denied --> DRY["dry-run / suggest only"]
-    MODE -- approved dev or sandbox --> APPLY["Scoped containment role<br/>tag, schedule shutdown, or quota cap"]
-
-    DRY --> AUDIT["S3 append-only audit<br/>retention >=90 days"]
-    APPLY --> STS["STS assume scoped role"]
-    STS --> MEMBER["Member account resource"]
-    MEMBER --> AUDIT
-    SFN --> CW["CloudWatch logs, metrics, alarms"]
-```
-
-This workflow diagram shows the runtime order of AWS services for one scheduled cost period. The Step Functions execution remains the control spine, DynamoDB prevents duplicate processing, S3/Glue/Athena provide the lakehouse evidence path, and all alerting or containment decisions end in append-only S3 audit evidence.
-
-## 3. Data Flow
-
-1. **Schedule start**: EventBridge Scheduler starts one Step Functions Standard execution for the current eligible cost period at the chosen 24h cadence.
-2. **Idempotency check**: The workflow writes a conditional DynamoDB run-state item before processing. If the same cost period and data version already exist, the workflow records a duplicate-run audit event and exits without reprocessing.
-3. **Cost data pull**: Lambda adapters pull synthetic CUR/Data Exports objects from S3 and query Cost Explorer for summary validation, service-level totals, and recent cost deltas.
-4. **Normalization**: Workers normalize account, service, region, owner tag, environment, usage date, cost period, cost amount, and USD currency into curated S3 prefixes and Athena tables.
-5. **AI invocation**: The AI contract client sends the normalized cost window and evidence URI to the AIOps-owned AI Engine. CDO validates required response fields, timeouts, retries transient errors, and trips a circuit breaker for repeated failures.
-6. **Evidence persistence**: AI decision outputs are stored in DynamoDB anomaly records and S3 evidence prefixes. CDO stores model version and backtest metrics only as AIOps-provided integration evidence.
-7. **Dashboard materialization**: Athena views and DynamoDB materialized dashboard records update spend trend, anomaly overlay, confidence display, owner routing, containment status, and audit links.
-8. **Alert routing**: Routing workers send Finance alerts for business impact and Engineering alerts for owner action. Routes are based on anomaly type, severity, owner tags, account, environment, and approval requirement.
-9. **Containment decision**: Policy workers evaluate whether an action is allowed. Prod receives tag, suggest, or dry-run only. Dev and sandbox may allow approved schedule shutdown or quota cap paths.
-10. **Audit write**: Every containment proposal or action writes actor, timestamp, correlation ID, idempotency key, anomaly ID, owner, before state, proposed or applied after state, execution mode, rollback path, approval status, retention location, and retention period.
-
-## 4. Component Table
-
-| Component | AWS service | Responsibility | Reason | Cost note |
-|---|---|---|---|---|
-| Cost export storage | S3 for AWS Data Exports/CUR 2.0 | Receives detailed cost and usage files | Native AWS billing export source and durable batch input | Storage grows with synthetic history and partition count; lifecycle policy required |
-| Cost summary access | Cost Explorer API | Provides recent service/account cost summaries and cross-checks | Complements CUR lag with API-level validation | API usage should stay low at 24h cadence; watch throttling |
-| Raw data lake | S3 raw zone | Stores immutable pulled source data by cost period and ingestion time | Preserves source evidence for replay and audit | Use partitioned prefixes and lifecycle controls |
-| Curated data lake | S3 curated zone | Stores normalized cost, ownership, anomaly, alert, containment, and audit datasets | Keeps dashboard and downstream jobs off raw files | Evidence needed: expected GB-month for synthetic 3-month dataset |
-| Metadata catalog | Glue Data Catalog | Defines schemas and partitions for Athena | Makes S3 data queryable without a warehouse cluster | Glue crawler frequency should match cadence, or use explicit partition registration |
-| Query layer | Athena | Serves dashboard and investigation queries | Serverless query layer fits batch FinOps evidence | Enforce query limits and partition pruning to control spend |
-| Scheduler | EventBridge Scheduler | Starts the 24h cost-period workflow | Simple managed cadence with low operational overhead | Lower frequency than 12h reduces duplicate work and API calls |
-| Workflow engine | Step Functions Standard | Coordinates pull, normalize, AI call, routing, containment, and audit steps | Durable execution history, retries, and visible failure states | Standard workflows fit low-frequency batch runs |
-| Short compute | Lambda | Implements adapters, validators, route workers, and policy workers | Low fixed cost and simple scaling for short CDO tasks | Evidence needed: measured Lambda duration and memory after W12 tests |
-| Long connector option | ECS Fargate | Optional worker for long-running AI connector or heavy batch job | Used only if Lambda limits are exceeded | Not part of the default path because it adds fixed runtime cost |
-| Operational state | DynamoDB | Stores run state, idempotency keys, anomaly records, routing state, containment audit index, and dashboard materialized views | Low-latency conditional writes and serverless metadata storage | On-demand mode is suitable until access patterns stabilize |
-| AI integration | AIOps-owned AI Engine endpoint or queue | Receives normalized cost window and returns anomaly decision contract | Keeps model ownership outside CDO while preserving integration evidence | AI runtime cost belongs to AIOps, not CDO platform cost |
-| Dashboard | QuickSight or lightweight internal dashboard | Displays finance-readable spend trend, anomaly overlay, confidence, owners, and audit links | Finance users must not need SQL knowledge | QuickSight refresh cadence should follow the 24h workflow |
-| Alerting | SNS plus email or Slack webhook targets | Separates Finance and Engineering notification paths | Keeps business escalation distinct from owner remediation | Alert volume should be budgeted and throttled |
-| Observability | CloudWatch Logs, metrics, alarms | Tracks workflow failures, API throttling, stale dashboards, and containment denials | Native AWS visibility for capstone operations | Log retention should be capped and reviewed in cost analysis |
-| Cross-account access | IAM roles and STS assume-role | Provides read-only cost access and scoped containment access | Supports multi-account AWS without static credentials | Role sprawl must be controlled with naming and policy boundaries |
-| Audit evidence | S3 append-only audit prefix with retention controls | Stores containment and run evidence for at least 90 days | Finance-readable and compliance-friendly evidence trail | Use lifecycle tiers after the hot review period |
-
-## 5. Multi-Account Access
-
-The management account hosts the CDO control plane and cost lakehouse. Member accounts expose read-only roles for cost metadata, tag inventory, and environment ownership lookup. Cost data access is centralized through CUR/Data Exports in S3 and Cost Explorer API permissions. No member account grants broad administrative access to the CDO workflow.
-
-Containment roles are separate from cost-read roles. They are tightly scoped by account, environment, action type, and resource pattern:
-
-| Environment | Allowed CDO containment behavior | Denied behavior |
-|---|---|---|
-| Prod | Tag for review, create recommendation, send alert, record dry-run result | Termination, deletion, IAM modification, schedule shutdown apply, quota cap apply |
-| Staging | Tag for review, dry-run schedule shutdown, dry-run quota cap, recommendation | Deletion and IAM modification |
-| Dev and sandbox | Tag for review, approved schedule shutdown, approved quota cap, right-sizing suggestion | Data deletion, IAM modification, unapproved apply action |
-
-All role assumptions include correlation ID and run ID in session tags where supported. CloudTrail management events and CDO audit records must be linkable by correlation ID.
-
-## 6. Idempotency and Run State
-
-The workflow must ensure the same cost period cannot be processed twice. The idempotency key format is:
-
-```text
-finops-watch:{cadence}:{cost-period-start}:{cost-period-end}:{account-scope}:{source-data-version}
-```
-
-`source-data-version` is derived from the CUR/Data Exports object manifest, object ETag set, or synthetic dataset version. The first workflow step writes a DynamoDB item with a conditional expression that only succeeds when the key does not exist. The item stores:
-
-| Field | Purpose |
-|---|---|
-| `idempotency_key` | Primary duplicate-run guard |
-| `run_id` | Correlates Step Functions execution, alerts, AI request, and audit records |
-| `cost_period_start` and `cost_period_end` | Defines the cost window |
-| `cadence` | Records 24h schedule decision |
-| `source_data_version` | Detects whether source files changed |
-| `status` | `started`, `completed`, `failed`, `duplicate`, or `ai_unavailable` |
-| `ai_contract_version` | Records the AIOps contract version consumed by CDO |
-| `dashboard_refresh_status` | Shows whether dashboard materialization completed |
-| `audit_uri` | Points to S3 evidence for the run |
-
-If a run fails, the status remains queryable and replay requires an explicit operator action with a new source data version or a manual replay reason. Duplicate runs do not call the AI Engine, do not send duplicate alerts, and do not trigger containment.
-
-## 7. Containment Architecture
-
-Containment is policy-driven and dry-run-first. Each action is evaluated against account, environment, owner, anomaly type, approval requirement, and allowed action list before any apply path is considered.
-
-| Pattern | Capstone status | Apply scope | Description |
+| Component | AWS Service | Reason | Cost note |
 |---|---|---|---|
-| Tag for review | Implemented design pattern | Dev, sandbox, staging; prod as tag/suggest only | Adds or proposes a review tag such as `FinOpsWatch=ReviewRequired` with anomaly ID and owner context. In prod, this remains tag/suggest/dry-run only based on client approval. |
-| Schedule shutdown | Designed containment pattern | Dev and sandbox only after policy approval | For idle or runaway non-prod resources, proposes or applies a scheduled stop window. It never terminates resources and includes rollback by removing the schedule. |
-| Quota cap | Designed containment pattern | Dev and sandbox only after policy approval | For runaway training or spend spikes, proposes a service quota or budget guardrail action. IAM modification is not allowed; any quota action must use pre-approved mechanisms. |
+| Ingestion & Storage | S3 Standard + Glacier | Host raw cost data, normalized parquet files, model artifacts, and audit logs. | Low storage cost ($0.023/GB/month). Lifecycled. |
+| Schema Registry | Glue Data Catalog | Governs schema definitions for raw and curated datasets. | Serverless, first 1M objects free. |
+| Serverless Query | Athena | Allows ad-hoc SQL aggregation of CUR cost data without dedicated instances. | Pay-per-query ($5.00/TB scanned). Materialized. |
+| Ingestion & Logic | Lambda | Short-running serverless adapters for data ingestion, endpoint invocation, routing, and containment. | Pay-per-execution. High concurrency limit. |
+| Orchestration | Step Functions | Standard workflows provide persistent state, error retries, and conditional logic. | $0.000025 per state transition. |
+| Hosting Cluster | AWS EKS | Hosts the versioned AI Engine runtime and batch jobs with enterprise container isolation. | $0.10/hour cluster fee. |
+| Stable Compute | EC2 On-Demand Nodes | Managed Node Group (e.g., `m5.large`) for stable pods (`ai-engine-api`, monitoring). | ~2 nodes active. Stable runtime. |
+| Batch Compute | EC2 Spot Nodes | Managed Node Group (e.g., `c5.large`) for batch scoring, feature engineering, and retraining. | Up to 60-90% savings compared to on-demand. |
+| Container Registry | ECR | Securely stores Docker images generated by AIOps for EKS deployments. | $0.10/GB storage fee, free data transfer to EKS. |
+| Ingress / Service | internal ALB / NLB | Routes Step Functions traffic securely to the AI API endpoint within the VPC. | ~1 active load balancer (~$20/month base). |
+| Configuration Store | Secrets Manager | Stores API keys, OIDC credentials, and DB strings securely. | $0.40/secret/month + API call volume. |
+| Operational State | DynamoDB | Stores scheduled run state, idempotency keys, anomaly indexes, and audit logs. | On-demand capacity mode, low storage footprint. |
+| Presentation | QuickSight | Finance-friendly BI dashboards showing cost trends and anomaly metrics. | User-based licensing ($18-$24/user/month). |
+| Alerting Engine | SNS | Fan-out notification engine routing alerts to email, Slack webhooks, and HTTP targets. | First 1M notifications free. |
+| Observability | CloudWatch / Container Insights | Aggregates VPC flow logs, Lambda traces, EKS metrics, and cluster application logs. | Charged per GB ingested ($0.50/GB). Retained 14 days. |
+| Private Transport | VPC NAT Gateway / Endpoints | Interface endpoints allow Lambda and EKS to call AWS APIs privately without traversing the internet. | Hourly fee + processing charges per GB. |
 
-Every containment action records actor, timestamp, correlation ID, idempotency key, anomaly ID, resource/account/squad owner, before state, proposed or applied after state, execution mode, rollback path, approval status, retention location, and retention period. Audit retention is >=90 days.
+## 3. Differentiation angle deep-dive
 
-## 8. Failure Modes and Recovery
+### 3.1 Why this angle?
 
-| Failure mode | Detection | Recovery behavior | Containment behavior | Evidence |
+The lakehouse-centric scheduled FinOps control plane combined with EKS AI hosting matches production-grade requirements. Production billing data (CUR) changes on a daily batch frequency, making real-time streaming detection redundant. Organizing data into raw and curated S3 zones cataloged by Glue allows us to perform fast, scalable queries via Athena. 
+
+By hosting the AIOps AI Engine on EKS rather than serverless containers (like Fargate), the CDO platform achieves full infrastructure efficiency. EKS managed node groups split workloads cleanly: always-on, low-latency services (such as model APIs and monitoring tools) run on stable on-demand nodes. Compute-heavy, interruptible workloads (like model retraining, feature extraction, and batch cost scoring) are deployed as Kubernetes Jobs on cheap spot nodes. This ensures we scale dynamically without paying premium rates for idle GPU or high-CPU servers.
+
+### 3.2 Strengths (with metrics)
+
+The chosen EKS + Lakehouse architecture is compared below against alternative designs:
+
+| Metric | Lakehouse + EKS (CDO) | Pure Serverless (Lambda) | Serverless Container (Fargate) |
+|---|---|---|---|
+| **Fixed Platform Cost** | Medium (~$150/month base cluster) | Ultra-low (pay-per-use, ~$0) | Low-Medium (~$60/month base ALB) |
+| **Variable Cost / Batch Run** | Low (90% spot savings for worker jobs) | Medium (high compute overhead for ML) | Medium (standard compute rates) |
+| **Max Job Duration** | Unlimited (Supports hours-long ML jobs) | 15-minute limit (Fails for retraining) | Unlimited (No spot placement controls) |
+| **Workload Isolation** | Pod-level (EKS Network Policies + namespaces) | IAM function-level (Basic) | Task-level (Security groups only) |
+| **Model Scaling Latency** | <5s (HPA local replica scaling on nodes) | 10-30s (Cold starts on large ZIPs) | 30-90s (Provisioning container task) |
+| **Ops Overhead (hr/week)** | ~4 hours (Managed nodes update) | ~1 hour (Zero infra ops) | ~2 hours (Task configuration management) |
+| **Time to Onboard Tenant** | <5 minutes (Namespace + SQS routing setup) | <2 minutes (Deploy dynamic config) | <10 minutes (Task configuration update) |
+
+### 3.3 Accepted weaknesses
+
+- **Operational complexity**: Requires managing Helm charts, GitOps sync loops (ArgoCD/Flux), and Kubernetes RBAC.
+- **Bootstrapping latency**: Initial cluster provisioning and Kubernetes configuration takes ~15 minutes, making rapid sandbox setups slower.
+- **Spot Interruption Risk**: Spot workers running batch scoring or retraining can be reclaimed by AWS with a 2-minute warning. The system must implement application checkpointing and automatic job retry mechanisms.
+
+## 4. Multi-account approach
+
+### 4.1 Account model
+
+The CDO platform is centralized in a designated **FinOps Management Account**. Cross-account data gathering uses standard read-only IAM roles in target member accounts.
+- **FinOps Management Account**: Hosts the Step Functions orchestrator, S3 Data Lake, Glue Data Catalog, EKS cluster, QuickSight dashboard, and DynamoDB.
+- **Target Member Accounts**: Maintain a read-only role (`FinOpsCostReaderRole`) allowing S3 access to CUR exports and query permissions for the local Cost Explorer API. It also hosts the execution role (`FinOpsContainmentWorkerRole`) allowing resource tagging, schedule registration, and quota enforcement.
+
+### 4.2 Isolation pattern
+
+- **S3 Data Lake**: Prefixes partition historical cost datasets by account ID (e.g., `s3://cdo-curated-zone/account_id=123456789012/year=2026/`).
+- **Glue Catalog**: Partitions the catalog structure to enforce predicate pushdown during Athena queries.
+- **EKS AI Hosting**: Pods are separated using Kubernetes namespaces (e.g., `ai-inference`, `ai-batch-jobs`). Network policies block cross-namespace network routes, preventing batch worker pods from connecting to core database or monitoring systems.
+- **DynamoDB State Table**: Partitioned using a compound key structure (`account_id#cost_period`) to prevent cross-account run state interference.
+
+### 4.3 Onboarding flow
+
+To onboard a new AWS account into the FinOps Watch platform, the following automated steps occur:
+```
+1. Deploy FinOps IAM roles (Reader & Worker) in target account via CloudFormation StackSet.
+2. Register account metadata (Account ID, Squad Owner, Slack Endpoint) in DynamoDB 'Accounts' table.
+3. Configure CUR 2.0 export target to the FinOps Raw S3 bucket using cross-account policies.
+4. Execute Step Functions onboarding sanity run (Verify read permission, pull initial 24h cost, write raw).
+5. Verify schema normalization in Glue and validate dashboard overlay view.
+```
+
+### 4.4 Idempotency
+
+To prevent double-processing cost data for a single timeframe (which leads to duplicated alerts and containment actions), the orchestrator registers an idempotency lock before calling the AI Engine.
+- **Idempotency key format**: `{account_id}:{cost_period_start}:{cost_period_end}` (e.g., `123456789012:2026-06-22T00:00:00Z:2026-06-23T00:00:00Z`).
+- **DynamoDB Run State Table (`finops-run-state`)**:
+  - `IdempotencyKey` (Partition Key - String)
+  - `RunId` (String - UUID)
+  - `Status` (String - PENDING, RUNNING, COMPLETED, FAILED)
+  - `StartedAt` (Number - Epoch)
+  - `CompletedAt` (Number - Epoch)
+  - `EvidenceUri` (String - S3 path to decision output json)
+  - `ErrorDetails` (String - details if status is FAILED)
+
+When a scheduled run triggers, a conditional DynamoDB write checks if `IdempotencyKey` exists. If the status is `RUNNING` or `COMPLETED`, the workflow aborts. If it is `FAILED`, the workflow resets status to `PENDING` and triggers a retry.
+
+## 5. Alternatives considered
+
+### 5.1 Orchestration layer
+
+- **Option A - Apache Airflow / MWAA**: Checked as a pipeline runner. Rejected due to high baseline fixed cost ($200+/month for managed runtime), complex Python dependency management, and slow deployment cycle.
+- **Option B - AWS Batch**: Analyzed for running ingestion scripts. Rejected because it lacks state machine visual tracking and complex branching logic (e.g., timeout fallbacks, separate alert paths).
+- Yes **Chosen: EventBridge Scheduler + Step Functions Standard**: Provides serverless visual workflows, native AWS service integrations, built-in retry-on-failure steps, and zero idle costs.
+
+### 5.2 Data layer
+
+- **Option A - Amazon Redshift Serverless**: Evaluated as the primary cost analytical store. Rejected because it is over-provisioned for a 24h batch ingestion cadence, generating high minimum query billing.
+- **Option B - DynamoDB Only**: Considered for hosting historical cost logs. Rejected because DynamoDB does not support complex analytical SQL queries (e.g., historical standard deviation calculations) required by AIOps integration without costly full table scans.
+- Yes **Chosen: S3 + Glue Data Catalog + Athena**: Provides a low-cost, serverless lakehouse engine that queries structured Parquet partitions on S3, mapping directly to BI dashboard views.
+
+## 6. Scaling strategy
+
+The platform scales dynamically across all layers:
+- **Data Ingestion**: EventBridge triggers Step Functions using parallel map states. If the company grows from 12 squads to 120, target account ingestions execute concurrently up to Lambda's default concurrency limit (1000).
+- **Athena Query Engine**: Scales horizontally automatically. Athena splits large datasets across its internal execution engine, charging only for scanned bytes. Query execution limits are managed via S3 Partition Projection.
+- **EKS AI Inference**: Pods of `ai-engine-api` auto-scale via Kubernetes **Horizontal Pod Autoscaler (HPA)** based on average CPU/Memory targets (70%). Highly concurrent loads scale out pod replicas across on-demand nodes.
+- **EKS Worker Jobs**: Batch, training, and feature engineering jobs trigger dynamically. The cluster uses **Karpenter** or **Cluster Autoscaler** to provision temporary EC2 spot instances when pending worker pods are scheduled, and terminates them immediately when jobs complete.
+
+## 7. Failure modes + recovery
+
+The following table details failure modes, automated recovery steps, and operational targets:
+
+| Failure | Detection | Recovery | RTO | RPO |
 |---|---|---|---|---|
-| CUR/Data Exports delay | Expected object or manifest missing for cost period | Mark run as waiting or failed depending on age; retry on next schedule | No containment | Run-state item and CloudWatch alarm |
-| Cost Explorer throttling | API 429 or throttling exception | Exponential backoff with bounded retries; use CUR-derived data when sufficient | No apply action until data confidence is acceptable | Error metric and run audit event |
-| AI Engine timeout | AI contract client exceeds timeout | Retry transiently, then open circuit breaker for the run | Fail closed; no automatic apply action | `ai_unavailable` run status and operator alert |
-| AI Engine unavailable | 5xx, network failure, authentication failure, or circuit open | Preserve failed run, alert operators, write audit event | Fail closed; no automatic apply action | S3 audit record and DynamoDB status |
-| Failed workflow step | Step Functions task failure after retries | Mark run failed and preserve partial artifacts | No new containment action | Step Functions execution history |
-| Duplicate scheduled run | DynamoDB conditional write fails for idempotency key | Exit as duplicate without AI call or alert send | No containment | Duplicate-run audit record |
-| Dashboard stale data | Dashboard materialized view timestamp older than last completed run | Raise stale-dashboard alarm and show last refresh time | Containment does not depend on dashboard freshness | Dashboard status field and CloudWatch alarm |
-| Alert delivery failure | SNS, email, Slack, or webhook delivery failure | Retry route, then send fallback operator alert | Containment remains gated by policy and approval | Routing-state record |
-| Containment denial | Policy denies action due to prod, missing approval, unknown owner, or unsupported resource | Record denial and route recommendation to owner | Dry-run or suggest only | Containment audit record |
-| Audit write failure | S3 put or DynamoDB audit index write fails | Treat as workflow failure; do not apply containment without audit write | Fail closed | Failed audit metric and run status |
+| Member account CUR lag | Ingestion validation returns empty/truncated records | Log run state as `INCOMPLETE_DATA`, alert Engineering Slack, skip containment triggers, use previous run cache. | 1 hour | 24 hours |
+| Cost Explorer API rate limit | Lambda CUR/CE adapter receives HTTP 429 throttling | Exponential retry with jitter. Fall back to raw CUR partition exports. | 15 mins | 0 |
+| hosted AI API timeout | Step Functions Lambda client detects 60s timeout | Retry call 3 times. If timeout persists, trip circuit-breaker and fail-closed: log anomaly status `AI_UNAVAILABLE`. | 5 mins | 0 |
+| AI Engine Pod crash | Kubernetes Kubernetes replica target unreached | Pod restart by Kubelet. HPA schedules additional pod on healthy on-demand node. | < 10s | 0 |
+| Spot node reclamation | EC2 Spot Interruption Warning (2-minute warning) | Karpenter intercepts event, marks node as cordoned, drains pods, and launches replacement node. Batch jobs resume from checkpoint. | < 2 mins | Checkpoint |
+| Step Functions workflow failure | CloudWatch rule catches `State Entered: FAILED` | Log run status as `FAILED` in DynamoDB to release idempotency lock. Alert DevOps on Slack with trace details. | 10 mins | 24 hours |
+| Duplicate execution trigger | DynamoDB conditional put exception on idempotency check | Abort runner immediately. Record warning in logs, trace duplicate UUID. | < 5s | 0 |
+| QuickSight dashboard stale | Dashboard dashboard data ingestion timestamp > 26h | Raise CloudWatch alarm, trigger manual refresh via Lambda helper, notify Finance via email. | 30 mins | 24 hours |
+| SNS Alert delivery failure | SNS delivery status logs error (e.g., SMTP fail) | SNS retries delivery with backoff. If failure continues, route to backup email queue. | 5 mins | 0 |
+| Containment denial | Target account IAM change denies permission to tag | Log containment status `DENIED`, write incident audit log, alert Squad owner and security team immediately. | 1 hour | 0 |
 
-## 9. Operational Scaling and Limits
+## Related documents
 
-The expected workload is low-frequency batch processing, not high-RPS API serving. Scaling pressure comes from account count, CUR file size, Athena query cost, and alert volume. The default approach is to partition S3 data by cost period, account, service, and environment; use Athena partition pruning; keep DynamoDB access patterns keyed by run ID, anomaly ID, and owner route; and limit dashboard refresh to the completed workflow cadence.
-
-The 24h cadence reduces Cost Explorer calls, Step Functions executions, dashboard refreshes, and duplicate alert risk compared with 12h. A 48h cadence is cheaper but weakens time-to-detection for runaway non-prod spend such as training clusters. Evidence needed: measured workflow duration, Athena bytes scanned, Lambda duration, and dashboard refresh time from W12 synthetic demo runs.
-
-## 10. Open Questions
-
-| Question | Owner needed | Why it matters |
-|---|---|---|
-| Final AI Engine contract shape: endpoint vs queue, authentication, timeout, and response schema | AIOps team | CDO must implement the exact invocation, retry, and validation behavior |
-| Synthetic dataset versioning format | Client or mentor | Idempotency depends on stable source-data-version calculation |
-| Final account and squad ownership mapping | Client | Routing and containment policy require reliable owner metadata |
-| Human approval owner for dev/sandbox apply actions | Client | Schedule shutdown and quota cap apply paths require explicit approval authority |
-| Dashboard implementation choice: QuickSight or internal web dashboard | CDO team and client | Determines refresh mechanism, access control, and evidence screenshots |
-| Alert targets for Finance and Engineering | Client | CDO needs route destinations and escalation expectations |
-
-## Related Documents
-
-- `01_requirements_analysis.md` defines the CFO problem, CDO requirements, and CDO/AIOps ownership boundary.
-- `03_security_design.md` expands IAM least privilege, encryption, secrets, network boundaries, and audit controls.
-- `04_deployment_design.md` defines IaC, CI/CD, environment separation, deployment gates, and rollback.
-- `05_cost_analysis.md` estimates the CDO platform cost separately from AIOps AI Engine runtime cost.
-- `06_dashboard_alerting_design.md` defines finance-readable dashboard views and alert payloads.
-- `08_adrs.md` records the 24h cadence, lakehouse-centric architecture, dry-run-first containment, and audit-retention decisions.
+- [`03_security_design.md`](03_security_design.md) - Pod-level security, network policies, IAM/IRSA roles, and hard safety boundaries.
+- [`04_deployment_design.md`](04_deployment_design.md) - IaC modules, Helm workload configurations, and CI/CD quality gates.
+- [`05_cost_analysis.md`](05_cost_analysis.md) - Detailed cost projections for EKS hosting and serverless data pipelines.
+- [`08_adrs.md`](08_adrs.md) - Core architecture decision records (cadence trade-off, lakehouse design, EKS choice).

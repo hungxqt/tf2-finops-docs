@@ -1,228 +1,150 @@
-# Deployment & CI/CD Design - Task Force 2 · CDO06
+# Deployment & CI/CD Design - Task Force 2 · FinOps Watch CDO
 
+<!-- Doc owner: CDO Team
+     Status: Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
+-->
 
-## 1. IaC Strategy
+## 1. IaC strategy
 
 ### 1.1 Tool choice
 
-- **IaC tool**: **Terraform**
-  - Rationale: the entire cohort uses Terraform; clear state management with S3 backend + `use_lockfile = true` (S3 native locking); good module reuse for multi-account patterns; no runtime container required unlike CDK.
-- **State backend**: S3 bucket (`finops-watch-tf-state-<account-id>`) with **S3 native locking** (`use_lockfile = true`) — remote state per environment, lock prevents concurrent applies. **DynamoDB lock table is NOT used** — requires AWS provider ≥ 5.47.
-- **Modular structure**: shared reusable modules + environment-specific roots that override variables.
+The CDO platform uses a dual-layer deployment strategy to separate infrastructure provisioning from application workload deployments.
+1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, EKS cluster, node groups, DynamoDB, S3, IAM roles).
+2. **Workload Layer (Kubernetes & Applications)**: Deployed using **Helm (v3)** and **GitOps (ArgoCD)** for application states within EKS, and native zip deployment zip files for Lambda functions.
 
 ### 1.2 Module structure
 
+The repository is organized to separate infrastructure modules from environmental variables:
 ```
-infra/
-├── modules/
-│   ├── networking/          # VPC, subnets, SG, VPC endpoints (S3, Step Functions)
-│   ├── lakehouse/           # S3 buckets (raw/curated/audit), Glue catalog, Athena workgroup
-│   ├── orchestration/       # EventBridge Scheduler, Step Functions Standard, DynamoDB tables
-│   ├── compute-lambda/      # Lambda functions (puller, normalizer, ai-client, router, containment)
-│   ├── alerting/            # SNS topics, subscriptions (Finance route + Engineering route)
-│   ├── observability/       # CloudWatch log groups, metric filters, alarms, dashboard
-│   ├── iam/                 # IAM roles: execution roles, cross-account read, containment scoped roles
-│   └── dashboard/           # QuickSight dataset + analysis (or lightweight internal dashboard)
-├── environments/
-│   ├── sandbox/             # main.tf + terraform.tfvars (account-sandbox)
-│   ├── staging/             # main.tf + terraform.tfvars (account-staging)
-│   └── prod/                # main.tf + terraform.tfvars (account-prod) — manual apply only
-└── README.md
+├── iac/
+│   ├── modules/
+│   │   ├── vpc/                  # Private VPC, subnets, NAT gateways, VPC endpoints
+│   │   ├── eks/                  # EKS cluster control plane, on-demand/spot node groups
+│   │   ├── s3-lakehouse/         # Raw and curated S3 buckets, lifecycle policies
+│   │   ├── glue-catalog/         # Glue databases and tables
+│   │   ├── step-functions/       # Step Functions workflow definitions
+│   │   ├── lambdas/              # Lambda functions (CUR puller, routing, containment)
+│   │   └── dynamodb/             # Run state, idempotency, and audit tables
+│   └── environments/
+│       ├── sandbox/              # Sandbox environment variables (.tfvars)
+│       ├── staging/              # Staging environment variables
+│       └── prod/                 # Production environment variables
 ```
 
 ### 1.3 State management
 
-- Remote state per environment: `s3://finops-watch-tf-state-<env>/terraform.tfstate`
-- State lock via **S3 native lockfile** (`use_lockfile = true`) — Terraform automatically creates the `.terraform.lock.info` object in the same S3 bucket; no DynamoDB table required
+- **Remote State**: Terraform state is stored in a secure, centralized S3 bucket with server-side encryption (`AES256`) and versioning enabled.
+- **State Locking**: Lock states are managed using a DynamoDB table (`cdo-tflock-table`) to prevent concurrent execution runs.
+- **GitOps Ingestion**: Plan outputs are generated on PR (`plan-on-PR`) and applied automatically upon merging (`apply-on-merge`) following senior review approval.
 
-**Sample Terraform backend config:**
-```hcl
-terraform {
-  backend "s3" {
-    bucket       = "finops-watch-tf-state-<env>"
-    key          = "terraform.tfstate"
-    region       = "ap-southeast-1"
-    use_lockfile = true   # S3 native locking — requires AWS provider >= 5.47
-    encrypt      = true
-  }
-}
-```
-- **Plan-on-PR**: GitHub Actions runs `terraform plan` and posts the output as a PR comment
-- **Apply-on-merge**: `terraform apply` runs automatically for sandbox when merging into `develop` and for staging when merging into `main`; prod requires a manual approval gate
-- Never run `terraform apply` locally directly against staging/prod — all changes go through the pipeline
-
----
-
-## 2. CI/CD Pipeline
+## 2. CI/CD pipeline
 
 ### 2.1 Pipeline stages
 
+Deployment pipelines are driven by GitHub Actions. The flow consists of compilation, validation, testing, staging deploy, and production manual approvals:
+
 ```
-PR opened ──► Lint ──► Test ──► Security Scan ──► TF Plan ──► Review ──► Merge ──► TF Apply ──► Smoke Test
+[PR Trigger] ──> Lint & Verify ──> Security Scan (Trivy/Gitleaks) ──> TF Plan ──> [Merge Approval]
+                                                                                      │
+[Smoke Test Prod] <── TF Apply Prod <── [Manual Approval Gate] <── Deploy Staging <───┘
 ```
 
-| Stage | Tool | Description | Quality gate |
+The pipeline details are defined below:
+
+| Stage | Tool | What it does | Quality gate |
 |---|---|---|---|
-| Lint | `terraform fmt`, `tflint` | Check Terraform format + best practices | No format error, no lint warning |
-| Unit test | `go test ./...` (Lambda Go packages) | Test Lambda logic: normalizer, router, containment policy | Coverage ≥ 80% |
-| Security scan | **Trivy** (IaC scan) + **Gitleaks** (secret scan) | Detect IaC misconfigurations + secrets exposed in code | No CRITICAL IaC misconfiguration; no secret detected |
-| TF Plan | `terraform plan` | Preview infra changes, post diff to PR comment | Plan success; reviewer approves diff |
-| TF Apply | `terraform apply -auto-approve` | Deploy infra to the corresponding environment | Apply exit 0 |
-| Smoke test | Custom smoke test script | Call health check endpoint, verify Step Functions can start, verify S3 bucket accessible | All checks pass |
+| Ingest & Validate | `tflint`, `helm lint` | Validates Terraform syntax and Helm charts. | Zero syntax errors. |
+| Security Scan | Trivy / Gitleaks | Scans Docker images and Helm charts for CVEs; detects embedded secrets. | Fail on `CRITICAL` or `HIGH` CVEs; zero secrets. |
+| TF Plan | Terraform | Generates speculative plan for AWS infrastructure. | Successful plan execution. |
+| Apply Staging | Terraform / ArgoCD | Deploys modules to staging account; synchronization of EKS Helm charts. | Pod status `Running` in EKS; 100% resource match. |
+| Smoke Test Staging | Custom Python runner | Injects a test cost record and validates end-to-end alert routing. | Alert successfully delivered to test Slack. |
+| Manual Approval Gate | GitHub Environment Gate | Pauses production pipeline, requiring manual approval from CDO Lead. | Manual reviewer signature. |
+| Apply Prod | Terraform / ArgoCD | Provisions infrastructure and EKS workloads in production. | Zero errors in execution. |
+| Smoke Test Prod | Custom Python runner | Executes a dry-run test sequence. | Dry-run audit record successfully written. |
 
 ### 2.2 Branch strategy
 
-```
-main          ──── production-ready (auto-deploy staging, manual-approve prod)
-  └── develop ──── integration branch (auto-deploy sandbox)
-        └── feature/* ──── feature branches (trigger plan-only, no apply)
-```
+- `feature/*`: Dedicated branches for features. PR target: `develop`.
+- `develop`: Staging environment branch. Auto-triggers deployment to the Staging account on push.
+- `main`: Production branch. Merges from `develop` trigger staging validation before pausing at the production approval gate.
 
-- PR into `develop`: triggers Lint + Test + Scan + Plan. Sandbox auto-deploys after merge.
-- PR into `main` from `develop`: triggers staging Plan. Staging auto-deploys; prod apply requires manual approval.
-- **No direct push** into `main` or `develop` — protected branches, require PR + review.
+## 3. Deployment gates
 
----
+### 3.1 Security scans
 
-## 3. GitOps
+In addition to static code analysis, ECR repositories are configured with **Scan on Push** enabled. Any image uploaded by AIOps is automatically scanned. Container deployment is blocked if the image contains severe CVEs. CI pipelines authenticate to AWS using **OpenID Connect (OIDC)**, eliminating the need to store static AWS Access Keys in GitHub.
 
-### 3.1 Approach
+### 3.2 Destructive-change review
 
-This platform **does not use ArgoCD/Flux** because there is no Kubernetes cluster — compute is Lambda + Step Functions (serverless). The GitOps pattern is applied as follows:
+Any Terraform plan that modifies resource indexes or indicates resource deletion (e.g., S3 bucket recreation or IAM role changes) is flagged in the PR summary. These changes require explicit manual verification and dual approvals from both the CDO and Security Leads.
 
-- **Git is the source of truth**: all infra changes go through commit → PR → merge. No console clicks, no manual `apply`.
-- **IaC = desired state**: Terraform state drift is detected via a scheduled daily `terraform plan`.
-- **Audit trail**: Git history + Terraform state + CloudTrail = a complete chain of evidence for every change.
+### 3.3 AI contract compatibility
 
-### 3.2 Drift detection
+Before EKS updates are allowed, a pre-deployment script runs validation checks:
+1. Compares the AIOps model version registry against the current EKS target configuration.
+2. Performs JSON schema validation on the AI Engine `/detect` request/response API contracts.
+3. If schemas mismatch, the build fails before applying Kubernetes changes, ensuring deployment compatibility.
 
-| Mechanism | Frequency | Action |
-|---|---|---|
-| Scheduled `terraform plan` | Daily at 9:00 AM | GitHub Actions runs plan; if diff exists → automatically opens an issue + notifies Slack Engineering |
-| CloudTrail → CloudWatch alarm | Real-time | Alarm if any manual console change occurs on a Terraform-managed resource |
-| S3 run state check | After every workflow run | Verify last successful run < 26h via S3 object metadata (last-modified); if not → CloudWatch alarm |
+## 4. Deployment strategy
 
-### 3.3 Change control
+### 4.1 Strategy
 
-- **Non-destructive changes** (adding resources, updating Lambda code): auto-apply after review.
-- **Destructive changes** (deleting S3 buckets, modifying core resources): require explicit `lifecycle { prevent_destroy = true }` override + manual approval step in the pipeline.
-- **Contract-related changes** (modifying the Lambda AI client interface): require AIOps team sign-off before merging — this is a frozen contract after T5 W11.
+- **EKS API Workloads**: Deployed using **Rolling Updates** with a max surge of `25%` and max unavailable of `0%`. This ensures stable pods (`ai-engine-api`) have new replicas ready before old ones are terminated.
+- **EKS Batch Workers**: Kubernetes Jobs execute dynamically. Updates to worker configurations affect new job invocations without interrupting active runs.
+- **Lambda Functions**: Deployed using **Weighted Aliases**. Traffic shifts gradually: `10%` canary for 5 minutes, transitioning to `100%` if no errors occur.
+- **Spot Node Draining**: Karpenter handles spot node interruptions. Node termination signals trigger Kubernetes pod eviction, gracefully draining active worker pods. If a batch scoring job is evicted, the orchestrator automatically schedules a retry on a healthy node.
 
----
+### 4.2 Rollback method
 
-## 4. Deployment Strategy
+- **Primary Rollback**: Driven by ArgoCD. Reverting a Git commit to the previous stable release SHA triggers an automatic sync rollback in the EKS cluster within 60 seconds.
+- **Secondary Rollback**: For Lambda functions, the Step Functions workflow catches invocation errors and immediately shifts the Lambda alias weight back to the previous stable version (RTO < 10 seconds).
 
-### 4.1 Lambda deployment strategy
+## 5. Environment separation
 
-Lambda has no traffic routing like a container service, so **alias + weighted routing** is used:
+We enforce isolation across three AWS accounts:
 
-```
-Lambda function: finops-watch-ai-client
-  ├── $LATEST           (development)
-  ├── alias: stable     (100% traffic — current version)
-  └── alias: canary     (10% → 50% → 100% shift via CodeDeploy Lambda)
-```
-
-- **Canary shift**: 10% → 50% → 100% over 15 minutes (CodeDeploy `LambdaLinear10PercentEvery3Minutes`)
-- **Abort criteria**:
-  - Lambda error rate > 1% in any canary window
-  - P99 duration > 800ms (CloudWatch alarm trigger)
-  - Step Functions execution fail rate > 5%
-- **Auto-rollback**: CodeDeploy automatically rolls back the alias to the previous version if an alarm triggers
-
-### 4.2 Step Functions + EventBridge update strategy
-
-- Step Functions state machine definition changes via Terraform → apply automatically creates a new revision.
-- EventBridge Scheduler is not interrupted during state machine updates (in-flight executions complete with the old definition).
-- If a state machine rollback is needed: `terraform apply` the previous commit → creates the earlier revision.
-
-### 4.3 Rollback method
-
-| Layer | Primary rollback | Secondary rollback | Target RTO |
+| Env | Purpose | Account | Auto-deploy |
 |---|---|---|---|
-| Lambda | CodeDeploy alias rollback to previous version | `terraform apply` with previous version in tfvars | < 60s |
-| Step Functions | `terraform apply` previous commit | Manual update via AWS Console (emergency only) | < 5 minutes |
-| S3/Glue/Athena | No rollback — append-only data; rollback = reprocess | Restore from S3 Versioning if object overwritten | < 30 minutes |
-| S3 State Lock | Manually delete `.terraform.lock.info` object if lock is stuck | `terraform force-unlock` | < 5 minutes |
+| **Sandbox** | Local developer testing and testing of synthetic data formats. | `1111-2222-3333` | True (on PR push) |
+| **Staging** | Validation of AIOps container artifacts and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True (on merge to `develop`) |
+| **Prod** | Production control plane. Monitors cost across all company accounts. Auto-containment is strictly dry-run. | `7777-8888-9999` | False (requires manual approval signature) |
 
----
+## 6. Secrets in pipeline
 
-## 5. Environment Separation
+Secrets are never embedded in the code or pipeline variables.
+1. The CI/CD runner assumes an IAM role via OIDC to retrieve short-lived tokens.
+2. Secrets (such as Slack webhooks or database passwords) are stored directly in AWS Secrets Manager.
+3. ArgoCD mounts these secrets into EKS pods using the External Secrets Operator during runtime initialization.
 
-| Env | Purpose | AWS Account | Auto-deploy | Containment behavior |
-|---|---|---|---|---|
-| **Sandbox** | Dev experimentation, W11 base IaC build, W12 testing | `account-sandbox` | Automatic on merge into `develop` | Tag + schedule shutdown + quota cap (approved) |
-| **Staging** | Pre-prod integration, E2E test, chaos test W12 | `account-staging` | Automatic on merge into `main` | Tag + dry-run schedule shutdown + dry-run quota cap |
-| **Prod** | Demo day T5 02/07, panel presentation | `account-prod` | Manual approval gate in pipeline | Tag only + suggest only — DO NOT apply any containment |
+## 7. Scheduled batch deployment
 
-**Hard rule**: `NEVER terminate prod, delete data, or modify IAM` — enforced by:
-1. `lifecycle { prevent_destroy = true }` on critical resources in the prod module.
-2. SCP (Service Control Policy) on account-prod blocking dangerous actions.
-3. Lambda containment worker checks the `ENVIRONMENT` env var before every action — if `prod` → dry-run only.
-
----
-
-## 6. Secrets in Pipeline
-
-- **CI/CD authentication**: GitHub Actions uses **OIDC + IAM assume-role** — no static AWS keys in GitHub Secrets.
-- **Lambda runtime secrets**: AWS Secrets Manager — Lambda IAM role has `secretsmanager:GetSecretValue` scoped only to specific secret ARNs.
-- **Secret scanning**: Gitleaks runs on every PR — blocks merge if a secret pattern is detected.
-- **AI Engine credentials** (if any): stored in Secrets Manager, Lambda AI client fetches at runtime, not hardcoded in environment variables.
-- **Rotation**: Secrets Manager auto-rotation every 30 days for database credentials (if used).
-
----
-
-## 7. Tenant (Account) Onboarding Deployment
-
-For TF2, a "tenant" = an AWS member account that needs cost monitoring.
+The Step Functions state machine and EventBridge Scheduler are deployed using Terraform modules. The deployment process incorporates operational check runbooks:
 
 ```
-1. Operator adds account ID to accounts.tfvars in the repo
-2. PR review → merge → Terraform plan/apply:
-   - Creates cross-account IAM role on management account (read-only cost + scoped containment)
-   - Adds account to S3 owner mapping file (accounts/owner_mapping.json in lakehouse bucket)
-   - Updates EventBridge Scheduler scope (if per-account schedule is needed)
-3. Smoke test: Lambda puller test assumes-role into new account → verify Cost Explorer accessible
-4. Confirm in S3: account status object = "active" (s3://finops-watch-accounts/<account-id>/status.json)
+1. Deploy updated Step Functions JSON definition via Terraform.
+2. Temporarily disable the EventBridge Scheduler rule to prevent triggering midway.
+3. Execute smoke-test run to verify API endpoint connectivity and Glue tables.
+4. Enable the EventBridge Scheduler rule targeting the new state machine version.
+5. Record pipeline transition and execution time in the DynamoDB deployment log.
 ```
 
-Target time: **< 30 minutes** from PR merge to account having data in the lakehouse.
+## 8. Observability stack
 
----
-
-## 8. Observability Stack
+The platform's operational health is monitored using a centralized observability suite:
 
 | Component | Tool | Purpose |
 |---|---|---|
-| Metrics | **CloudWatch Metrics** (custom namespace `FinOpsWatch/CDO`) | Lambda duration/errors, Step Functions execution success/fail, S3 request metrics |
-| Logs | **CloudWatch Logs** — structured JSON logging | Every Lambda emits JSON logs with `run_id`, `correlation_id`, `cost_period`, `status` |
-| Traces | **AWS X-Ray** + Lambda active tracing | End-to-end trace of a workflow run: Scheduler → SFN → Lambda chain → AI call |
-| Dashboards | **CloudWatch Dashboard** `FinOpsWatch-CDO-Ops` | Ops dashboard for the team (separate from the finance dashboard for CFO) |
-| Alerts | **CloudWatch Alarms** → SNS Engineering route | Lambda error rate, SFN failure, AI client timeout, drift detection, audit write failure |
+| **Log Aggregator** | CloudWatch Logs / Container Insights | Centralizes application, Lambda, and EKS container stdout logs. |
+| **Trace Analyzer** | AWS X-Ray | Traces requests from Step Functions, through Lambda, to the EKS internal ALB. |
+| **Metrics Collector** | Prometheus / Managed Grafana | Tracks EKS pod CPU/Memory usage, node group counts, and Karpenter actions. |
+| **Alarms Engine** | CloudWatch Alarms | Sends alerts via SNS if Step Functions fail, or if the dashboard data is stale (>26 hours). |
 
-**Key alarms required before demo:**
+## 9. Open questions
 
-| Alarm | Metric | Threshold | Action |
-|---|---|---|---|
-| `WorkflowFailed` | SFN ExecutionsFailed | > 0 in 5 minutes | SNS Engineering |
-| `AIClientTimeout` | Lambda `ai-client` errors | > 2 in 5 minutes | SNS Engineering + set `ai_unavailable` |
-| `DriftDetected` | Custom metric from scheduled plan | plan diff != 0 | SNS Engineering + open GitHub issue |
-| `AuditWriteFailed` | Lambda `audit-writer` errors | > 0 | SNS Engineering + fail-closed workflow |
-| `StaleWorkflow` | Custom metric: hours since last success | > 26h | SNS Finance + Engineering |
+- [ ] **ArgoCD Topology**: Should we run ArgoCD in a hub-and-spoke model from the Management account, or deploy localized ArgoCD instances inside each environment's EKS cluster?
+- [ ] **Grafana Integration**: Should the engineering metrics dashboard be shared with the AIOps team, or kept restricted to the CDO infrastructure team?
 
----
+## Related documents
 
-## 9. Open Questions
-
-- [ ] **Q1**: Is the AI Engine skeleton deployed on Lambda or Fargate? — needed to configure VPC peering or public endpoint for the Lambda AI client. *Resolve with AIOps EOD T4 W11.*
-- [ ] **Q2**: Is CodeDeploy Lambda canary available on the sandbox account? — if not, fall back to manual alias swap. *Verify T3 W11.*
-- [ ] **Q3**: Does the prod account need a separate real AWS account or can it share the sandbox with an `env=prod` flag? — affects SCP and IAM isolation. *Resolve T5 onsite with mentor.*
-
----
-
-## Related Documents
-
-- [`01_requirements_analysis.md`](01_requirements_analysis.md) — NFR targets and serverless-first differentiation angle
-- [`02_infra_design.md`](02_infra_design.md) — Lakehouse architecture, Step Functions, Lambda chain, containment patterns
-- [`03_security_design.md`](03_security_design.md) — IAM least-privilege, cross-account roles, SCP, audit trail
-- [`08_adrs.md`](08_adrs.md) — ADR: Terraform over CDK; ADR: GitOps without ArgoCD (serverless); ADR: canary Lambda alias over blue/green
+- [`02_infra_design.md`](02_infra_design.md) - EKS cluster layout, network subnets, and node group routing.
+- [`03_security_design.md`](03_security_design.md) - IRSA configurations, secrets inventory, and network policies.

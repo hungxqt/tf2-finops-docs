@@ -55,8 +55,12 @@ Use these defaults unless the user provides different decisions:
 - Data sources: AWS Data Exports/CUR 2.0 or CUR in S3 plus Cost Explorer API.
 - Data lake: S3 raw and curated zones, Glue Data Catalog, Athena views, and governed prefixes for cost, ownership, anomaly, alert, containment, and audit datasets.
 - Orchestration: EventBridge Scheduler triggers Step Functions Standard workflows.
-- Compute: Lambda for short CDO adapters and policy workers; Fargate only if a long-running adapter or AI Engine connector is required.
-- AI integration: call an AIOps-owned AI Engine endpoint, queue, or contract boundary; CDO owns invocation, timeout, retry, and fallback behavior, not the model internals.
+- Compute: Lambda for short CDO adapters and policy workers; EKS for hosting the AI Engine runtime and batch workloads.
+- AI integration: CDO hosts the AIOps-provided AI Engine on EKS; CDO owns the hosting platform, deployment plumbing, runtime monitoring, autoscaling, node placement, and platform SLOs; AIOps owns AI Engine code, model versions, detection logic, confidence scoring, explanation text, and backtest metrics.
+- AI Engine runtime: EKS cluster in `ap-southeast-1`, private subnets, ECR for container images, IRSA for pod-level IAM, internal ALB/NLB or Kubernetes ClusterIP service, CloudWatch Container Insights, Secrets Manager with External Secrets Operator or CSI driver.
+- EKS on-demand node group workloads: ai-engine-api, ai-engine-explainer, monitoring, core CDO platform services (stable, always-on).
+- EKS spot node group workloads: ai-engine-worker, batch scoring jobs, feature engineering jobs, model retraining jobs (interruptible, cost-optimized with retry/backoff and checkpoint storage).
+- EKS scaling: HPA/KEDA for pod autoscaling, Cluster Autoscaler or Karpenter for node scaling, node affinity and tolerations for workload placement across on-demand and spot node groups.
 - Analytics storage/query: S3, Glue Data Catalog, Athena, and materialized dashboard tables/views where needed.
 - Operational metadata: DynamoDB tables for run state, anomaly records, routing state, idempotency keys, containment audit records, and dashboard materialized views.
 - Dashboard: QuickSight or a lightweight internal web dashboard backed by Athena/DynamoDB views.
@@ -67,9 +71,9 @@ Use these defaults unless the user provides different decisions:
 
 Use this boundary in every generated document:
 
-- CDO owns cost data ingestion, normalized cost windows, ownership/tag metadata, scheduling, idempotency, workflow state, dashboard views, alert routing, containment guardrails, audit logs, and platform operational SLOs.
-- AIOps owns anomaly detection logic, model selection, model training/retraining design, model versioning, confidence scoring, anomaly classification, explanation text, AI Engine runtime, and AI backtest metrics.
-- CDO consumes the AI Engine through a versioned contract. CDO must document request/response fields, authentication, timeout, retry, circuit-breaker, unavailable-AI fallback, and evidence storage.
+- CDO owns cost data ingestion, normalized cost windows, ownership/tag metadata, scheduling, idempotency, workflow state, dashboard views, alert routing, containment guardrails, audit logs, platform operational SLOs, and the EKS hosting platform for the AI Engine (cluster lifecycle, managed node groups, networking, ingress/service exposure, deployment plumbing, runtime monitoring, autoscaling, node placement, and hosting SLOs).
+- AIOps owns anomaly detection logic, model selection, model training/retraining design, model versioning, confidence scoring, anomaly classification, explanation text, AI Engine code and model internals, and AI backtest metrics. AIOps provides versioned container artifacts (images, model weights, configs); CDO deploys and operates them on EKS.
+- CDO hosts the AI Engine on EKS and exposes it through an internal service endpoint. CDO consumes the AI Engine through a versioned contract. CDO must document request/response fields, authentication, timeout, retry, circuit-breaker, unavailable-AI fallback, evidence storage, and the EKS deployment/operations runbook.
 - CDO must not claim responsibility for AI precision/recall internals. It may report AI metrics only as AIOps-provided integration evidence.
 - If AI Engine is unavailable, CDO must fail closed for containment: no automatic apply action, alert operators, preserve the failed run, and write an audit record.
 
@@ -139,7 +143,7 @@ Required sections:
 
 Required sections:
 
-- `## 1. Architecture diagram` — Mermaid diagram showing AWS Data Exports/CUR S3 bucket, Cost Explorer API, S3 raw/curated zones, Glue/Athena, EventBridge Scheduler, Step Functions, Lambda, DynamoDB, the AIOps-owned AI Engine boundary, dashboard, alerting, and containment workers. Include a caption explaining the flow.
+- `## 1. Architecture diagram` — Mermaid diagram showing AWS Data Exports/CUR S3 bucket, Cost Explorer API, S3 raw/curated zones, Glue/Athena, EventBridge Scheduler, Step Functions, Lambda, DynamoDB, EKS cluster with on-demand and spot node groups hosting the AI Engine, ECR, internal service endpoint, dashboard, alerting, and containment workers. Include a caption explaining the flow.
 - `## 2. Component table` — Table with columns: Component, AWS Service, Reason, Cost note. One row per service.
 - `## 3. Differentiation angle deep-dive`
   - `### 3.1 Why this angle?` — Why lakehouse-centric FinOps control plane with serverless orchestration.
@@ -166,16 +170,16 @@ Required sections:
 Required sections:
 
 - `## 1. Network Security`
-  - `### 1.1 Network Diagram` — Mermaid diagram showing VPC layout, subnets, security groups, VPC endpoints.
+  - `### 1.1 Network Diagram` — Mermaid diagram showing VPC layout, subnets (including EKS private subnets), security groups, VPC endpoints, and EKS cluster networking.
   - `### 1.2 Security Groups` — Table with columns: SG name, Inbound, Outbound, Attached to.
   - `### 1.3 Network ACL / VPC Endpoint` — List VPC endpoints (S3, Secrets Manager, etc.) for private traffic.
 - `## 2. IAM & Access Control`
-  - `### 2.1 Service Roles` — Table with columns: Role, Used by, Permissions (least-privilege). Explicitly state: NEVER terminate prod, delete data, or modify IAM.
+  - `### 2.1 Service Roles` — Table with columns: Role, Used by, Permissions (least-privilege). Include EKS node roles, IRSA service account roles, and pod execution roles. Explicitly state: NEVER terminate prod, delete data, or modify IAM.
   - `### 2.2 Containment Permissions` — Environment-aware permissions: prod is tag/suggest/dry-run only; dev/sandbox may allow schedule shutdown or quota cap when approved by policy.
   - `### 2.3 Cross-account Access` — Read-only cost access roles, tightly scoped containment roles, AI Engine API authentication.
 - `## 3. Secrets Management`
   - `### 3.1 Secrets Inventory` — Table with columns: Secret, Storage, Rotation, Accessed by.
-  - `### 3.2 Inject Pattern` — How secrets reach Lambda/Fargate tasks.
+  - `### 3.2 Inject Pattern` — How secrets reach Lambda functions and EKS pods (External Secrets Operator or Secrets Store CSI driver for Kubernetes workloads).
   - `### 3.3 Anti-leak Controls` — Gitleaks, no baked credentials, log redaction.
 - `## 4. Encryption`
   - `### 4.1 At Rest` — Table with columns: Data, Storage, KMS key, Notes. Include audit log, cost data, containment records.
@@ -199,7 +203,7 @@ Required sections:
 Required sections:
 
 - `## 1. IaC strategy`
-  - `### 1.1 Tool choice` — IaC tool, state backend, modular structure.
+  - `### 1.1 Tool choice` — Terraform for AWS infrastructure including EKS; GitOps (ArgoCD/Flux) or Helm-based deployment for Kubernetes workloads; state backend; modular structure.
   - `### 1.2 Module structure` — Directory tree showing IaC modules for the CDO platform.
   - `### 1.3 State management` — Remote state per environment, state lock, plan-on-PR + apply-on-merge gate.
 - `## 2. CI/CD pipeline`
@@ -208,9 +212,9 @@ Required sections:
 - `## 3. Deployment gates`
   - `### 3.1 Security scans` — Image/dependency scan, secret scanning, OIDC-based CI access (no static cloud credentials).
   - `### 3.2 Destructive-change review` — How destructive IaC changes are flagged and approved.
-  - `### 3.3 AI contract compatibility` — AI Engine dependency handling, contract version check.
+  - `### 3.3 AI contract compatibility` — AI Engine dependency handling, contract version check, AIOps container artifact compatibility gate, EKS deployment validation.
 - `## 4. Deployment strategy`
-  - `### 4.1 Strategy` — Rolling/canary/blue-green approach, abort criteria, auto-rollback.
+  - `### 4.1 Strategy` — Rolling/canary/blue-green approach for EKS workloads and Lambda functions, abort criteria, auto-rollback, spot node draining strategy.
   - `### 4.2 Rollback method` — Primary and secondary rollback, target RTO.
 - `## 5. Environment separation` — Table with columns: Env, Purpose, Account, Auto-deploy. Sandbox, staging, prod.
 - `## 6. Secrets in pipeline` — OIDC + IAM assume-role, secret scanning on PR, block merge on secret detected.
@@ -227,7 +231,7 @@ Required sections:
 
 Required sections:
 
-- `## 1. Cost model per cadence run (forecast)` — Table with columns: Component, Unit cost, Usage per run, $/run. Rows for Lambda, Step Functions, S3, Glue/Athena, DynamoDB, dashboard, CloudWatch logs, alerting, NAT/VPC endpoints if used. Separate CDO platform costs from AIOps AI Engine runtime costs. Mark unmeasured numbers with `Evidence needed: ...`.
+- `## 1. Cost model per cadence run (forecast)` — Table with columns: Component, Unit cost, Usage per run, $/run. Rows for Lambda, Step Functions, S3, Glue/Athena, DynamoDB, EKS control plane, on-demand node group, spot node group, EBS volumes, ECR, load balancer, dashboard, CloudWatch logs and Container Insights, alerting, NAT/VPC endpoints. Separate CDO platform costs from AI Engine hosting costs. Mark unmeasured numbers with `Evidence needed: ...`.
 - `## 2. Cost at scale` — Table comparing monthly cost at different tenant/account counts. Show economies of scale.
 - `## 3. Cost optimization applied` — Checklist of cost optimizations: S3 lifecycle tiering, DynamoDB on-demand vs provisioned, log retention tiering, VPC endpoints to avoid NAT, Athena query limits.
 - `## 4. Cadence cost comparison` — Table comparing 12h, 24h, and 48h cadence costs and operational trade-offs. Defend the chosen 24h cadence.
@@ -283,6 +287,10 @@ Required sections:
   - `### 4.1 AI contract tests` — AI Engine request/response field validation against versioned contract.
   - `### 4.2 AI Engine timeout handling` — Timeout, retry behavior, circuit-breaker behavior.
   - `### 4.3 Unavailable-AI fallback` — Verify fail-closed containment, operator alert, audit record.
+  - `### 4.4 EKS node placement tests` — Verify on-demand/spot workload separation, node affinity, and tolerations.
+  - `### 4.5 Spot interruption and retry tests` — Verify batch job retry/backoff on spot interruption, checkpoint recovery.
+  - `### 4.6 API availability tests` — Verify AI Engine internal endpoint availability and health checks.
+  - `### 4.7 Autoscaling tests` — Verify HPA/KEDA pod scaling and node group scaling behavior.
 - `## 5. Alert and containment tests`
   - `### 5.1 Alert routing` — Finance vs Engineering channel routing validation.
   - `### 5.2 Containment dry-run` — Verify dry-run mode for all containment paths.
@@ -312,6 +320,8 @@ Required ADR entries (minimum, each as `## ADR-NNN - <Short title>`):
 - `## ADR-004 - CUR S3 plus Cost Explorer API data access` — Data source decision.
 - `## ADR-005 - Dry-run-first containment guardrail` — Safety-first containment approach.
 - `## ADR-006 - DynamoDB/S3 audit trail with >=90 days retention` — Audit storage decision.
+- `## ADR-007 - EKS for AI Engine hosting over serverless containers` — Why CDO hosts AI Engine on EKS with managed node groups instead of Fargate or Lambda.
+- `## ADR-008 - On-demand plus spot node group separation` — Cost-performance trade-off for stable vs interruptible workloads.
 
 Each ADR must include these fields (matching template format exactly):
 
@@ -319,7 +329,7 @@ Each ADR must include these fields (matching template format exactly):
 - **Date**: YYYY-MM-DD
 - **Context**: 1-3 sentences on what forced the decision.
 - **Decision**: Specific commitment.
-- **Consequence**: Bulleted list with ✅ pros and ⚠️ trade-offs.
+- **Consequence**: Bulleted list with Yes pros and Note: trade-offs.
 - **Alternatives considered**: Bulleted list with rejection reasons.
 
 Append new ADRs below existing ones. Never delete old ADRs; mark superseded ones with `Status: Superseded by ADR-NNN`.
@@ -419,6 +429,9 @@ Before considering the document pack complete, verify:
 - `template-docs/` was not overwritten.
 - The English docs mention `lakehouse-centric`.
 - The English docs mention `AIOps-owned AI Engine`.
+- The English docs mention `EKS` and `node group`.
+- The English docs mention `on-demand` and `spot` node groups.
+- The English docs mention `ai-engine-api` and `ai-engine-worker`.
 - The English docs mention `EventBridge Scheduler`.
 - The English docs mention `CUR` and `Athena`.
 - The English docs mention `dry-run`.
@@ -453,5 +466,5 @@ Get-ChildItem docs/tf2-finops/*_vi.md | Select-Object Name
 Run this targeted constraint check:
 
 ```powershell
-rg -n "lakehouse-centric|AIOps-owned AI Engine|EventBridge Scheduler|CUR|Athena|dry-run|90 days|NEVER terminate prod|delete data|modify IAM" AGENTS.md docs/tf2-finops
+rg -n "lakehouse-centric|AIOps-owned AI Engine|EKS|node group|on-demand|spot|ai-engine-api|ai-engine-worker|EventBridge Scheduler|CUR|Athena|dry-run|90 days|NEVER terminate prod|delete data|modify IAM" AGENTS.md docs/tf2-finops
 ```

@@ -1,228 +1,150 @@
-# Deployment & CI/CD Design - Task Force 2 · CDO06
+# Thiết kế Triển khai và CI/CD (Deployment & CI/CD Design) - Task Force 2 · FinOps Watch CDO
 
+<!-- Doc owner: CDO Team
+     Status: Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
+-->
 
-## 1. IaC Strategy
+## 1. IaC strategy
 
 ### 1.1 Tool choice
 
-- **IaC tool**: **Terraform**
-  - Lý do: toàn bộ cohort dùng Terraform; state management rõ ràng với S3 backend + `use_lockfile = true` (S3 native locking); module reuse tốt cho multi-account pattern; không cần runtime container như CDK.
-- **State backend**: S3 bucket (`finops-watch-tf-state-<account-id>`) với **S3 native locking** (`use_lockfile = true`) — remote state per environment, lock tránh concurrent apply. **Không dùng DynamoDB lock table** — yêu cầu AWS provider ≥ 5.47.
-- **Modular structure**: shared modules tái sử dụng + environment-specific roots override variables.
+CDO platform sử dụng chiến lược triển khai hai lớp để phân tách rõ ràng giữa việc thiết lập hạ tầng và việc triển khai các ứng dụng chạy trên đó.
+1. **Lớp hạ tầng (AWS Resources)**: Sử dụng **Terraform (v1.5+)** để khởi tạo các tài nguyên bất biến (VPC, EKS cluster, node groups, DynamoDB, S3, IAM roles).
+2. **Lớp ứng dụng (Kubernetes & Applications)**: Sử dụng **Helm (v3)** và **GitOps (ArgoCD)** đối với các trạng thái ứng dụng trong cụm EKS, và cơ chế đóng gói tệp zip tiêu chuẩn để triển khai cho các hàm Lambda.
 
 ### 1.2 Module structure
 
+Cấu trúc thư mục mã nguồn được phân chia rõ ràng giữa các modules định nghĩa tài nguyên và cấu hình môi trường cụ thể:
 ```
-infra/
-├── modules/
-│   ├── networking/          # VPC, subnets, SG, VPC endpoints (S3, Step Functions)
-│   ├── lakehouse/           # S3 buckets (raw/curated/audit), Glue catalog, Athena workgroup
-│   ├── orchestration/       # EventBridge Scheduler, Step Functions Standard, DynamoDB tables
-│   ├── compute-lambda/      # Lambda functions (puller, normalizer, ai-client, router, containment)
-│   ├── alerting/            # SNS topics, subscriptions (Finance route + Engineering route)
-│   ├── observability/       # CloudWatch log groups, metric filters, alarms, dashboard
-│   ├── iam/                 # IAM roles: execution roles, cross-account read, containment scoped roles
-│   └── dashboard/           # QuickSight dataset + analysis (hoặc lightweight internal dashboard)
-├── environments/
-│   ├── sandbox/             # main.tf + terraform.tfvars (account-sandbox)
-│   ├── staging/             # main.tf + terraform.tfvars (account-staging)
-│   └── prod/                # main.tf + terraform.tfvars (account-prod) — manual apply only
-└── README.md
+├── iac/
+│   ├── modules/
+│   │   ├── vpc/                  # Thiết lập VPC riêng tư, subnets, NAT gateways, VPC endpoints
+│   │   ├── eks/                  # Cụm EKS control plane, on-demand/spot node groups
+│   │   ├── s3-lakehouse/         # S3 raw và curated buckets, lifecycle policies
+│   │   ├── glue-catalog/         # Khởi tạo Glue databases và tables
+│   │   ├── step-functions/       # Định nghĩa các trạng thái workflow của Step Functions
+│   │   ├── lambdas/              # Các mã nguồn Lambda (CUR puller, routing, containment)
+│   │   └── dynamodb/             # Bảng DynamoDB lưu run state, idempotency, và audit logs
+│   └── environments/
+│       ├── sandbox/              # File biến cấu hình sandbox (.tfvars)
+│       ├── staging/              # File biến cấu hình staging
+│       └── prod/                 # File biến cấu hình production
 ```
 
 ### 1.3 State management
 
-- Remote state per environment: `s3://finops-watch-tf-state-<env>/terraform.tfstate`
-- State lock via **S3 native lockfile** (`use_lockfile = true`) — Terraform tự tạo object `.terraform.lock.info` trong cùng S3 bucket; không cần DynamoDB table
+- **Quản lý file State**: File state của Terraform được lưu trữ bảo mật trong một bucket S3 tập trung, được cấu hình mã hóa phía máy chủ (`AES256`) và bật tính năng versioning.
+- **State Locking**: Cơ chế khóa file state được quản lý qua một bảng DynamoDB (`cdo-tflock-table`) nhằm ngăn chặn việc chạy đồng thời nhiều tác vụ IaC.
+- **Phê duyệt triển khai**: Các plan thay đổi được xuất tự động trên PR (`plan-on-PR`) và chỉ được apply khi code được merge (`apply-on-merge`) sau khi đã có sự phê duyệt từ senior reviewer.
 
-**Terraform backend config mẫu:**
-```hcl
-terraform {
-  backend "s3" {
-    bucket       = "finops-watch-tf-state-<env>"
-    key          = "terraform.tfstate"
-    region       = "ap-southeast-1"
-    use_lockfile = true   # S3 native locking — requires AWS provider >= 5.47
-    encrypt      = true
-  }
-}
-```
-- **Plan-on-PR**: GitHub Actions chạy `terraform plan` và post output vào PR comment
-- **Apply-on-merge**: `terraform apply` chạy tự động cho sandbox khi merge vào `develop` và cho staging khi merge vào `main`; prod yêu cầu manual approval gate
-- Không bao giờ run `terraform apply` local trực tiếp lên staging/prod — mọi change qua pipeline
-
----
-
-## 2. CI/CD Pipeline
+## 2. CI/CD pipeline
 
 ### 2.1 Pipeline stages
 
+Pipeline triển khai được tự động hóa qua GitHub Actions. Quy trình gồm các bước kiểm tra cú pháp, quét bảo mật, chạy thử Terraform, triển khai staging và cổng phê duyệt manual trước khi lên production:
+
 ```
-PR opened ──► Lint ──► Test ──► Security Scan ──► TF Plan ──► Review ──► Merge ──► TF Apply ──► Smoke Test
+[PR Trigger] ──> Lint & Verify ──> Security Scan (Trivy/Gitleaks) ──> TF Plan ──> [Merge Approval]
+                                                                                      │
+[Smoke Test Prod] <── TF Apply Prod <── [Manual Approval Gate] <── Deploy Staging <───┘
 ```
 
-| Stage | Tool | Mô tả | Quality gate |
+Các bước chi tiết trong pipeline được mô tả dưới đây:
+
+| Giai đoạn (Stage) | Công cụ (Tool) | Nhiệm vụ | Chỉ tiêu chất lượng (Quality gate) |
 |---|---|---|---|
-| Lint | `terraform fmt`, `tflint` | Kiểm tra format + best practices Terraform | No format error, no lint warning |
-| Unit test | `go test ./...` (các package Lambda Go) | Test logic Lambda: normalizer, router, containment policy | Coverage ≥ 80% |
-| Security scan | **Trivy** (IaC scan) + **Gitleaks** (secret scan) | Phát hiện misconfiguration IaC + secrets bị lộ trong code | No CRITICAL IaC misconfiguration; no secret detected |
-| TF Plan | `terraform plan` | Preview infra change, post diff vào PR comment | Plan success; reviewer approve diff |
-| TF Apply | `terraform apply -auto-approve` | Deploy infra lên environment tương ứng | Apply exit 0 |
-| Smoke test | Script smoke test tùy chỉnh | Gọi health check endpoint, verify Step Functions có thể start, verify S3 bucket accessible | All checks pass |
+| Lint & Verify | `tflint`, `helm lint` | Kiểm tra cú pháp Terraform và các Helm charts. | Không có lỗi cú pháp nào. |
+| Quét bảo mật | Trivy / Gitleaks | Quét các lỗ hổng CVE trong Docker images và Helm charts; phát hiện secret bị lộ. | Dừng build nếu phát hiện lỗi CVE mức `CRITICAL` hoặc `HIGH`; 0 secret bị lộ. |
+| TF Plan | Terraform | Khởi chạy plan thử nghiệm để so sánh thay đổi hạ tầng trên AWS. | Thực thi plan thành công và xuất báo cáo. |
+| Triển khai Staging | Terraform / ArgoCD | Triển khai hạ tầng lên tài khoản staging; ArgoCD đồng bộ Helm charts vào EKS. | Trạng thái Pod trong EKS đạt `Running`; 100% tài nguyên đồng bộ. |
+| Chạy thử Staging | Kịch bản Python riêng | Inject một cost record thử nghiệm để kiểm tra luồng định tuyến alert end-to-end. | Cảnh báo được gửi thành công về kênh Slack test. |
+| Manual Approval Gate | GitHub Environment Gate | Tạm dừng pipeline lên production, chờ phê duyệt thủ công từ CDO Lead. | Chữ ký phê duyệt từ reviewer được chỉ định. |
+| Triển khai Prod | Terraform / ArgoCD | Cập nhật hạ tầng và các workload EKS trên môi trường production. | Quá trình áp dụng hoàn thành không có lỗi. |
+| Chạy thử Prod | Kịch bản Python riêng | Chạy thử nghiệm các tác vụ containment ở chế độ dry-run. | Nhật ký kiểm toán dry-run được ghi nhận thành công. |
 
 ### 2.2 Branch strategy
 
-```
-main          ──── production-ready (auto-deploy staging, manual-approve prod)
-  └── develop ──── integration branch (auto-deploy sandbox)
-        └── feature/* ──── feature branches (trigger plan-only, no apply)
-```
+- `feature/*`: Các nhánh làm việc riêng cho từng tính năng. Target PR: `develop`.
+- `develop`: Nhánh chạy chính cho môi trường staging. Tự động trigger triển khai lên tài khoản AWS Staging mỗi khi có push mới.
+- `main`: Nhánh chạy chính cho môi trường production. Việc merge code từ `develop` vào `main` sẽ chạy kiểm thử staging trước khi dừng lại chờ phê duyệt thủ công để lên production.
 
-- PR vào `develop`: trigger Lint + Test + Scan + Plan. Apply sandbox tự động sau merge.
-- PR vào `main` từ `develop`: trigger Plan staging. Apply staging tự động; apply prod cần manual approval.
-- **No direct push** vào `main` hoặc `develop` — protected branches, require PR + review.
+## 3. Deployment gates
 
----
+### 3.1 Security scans
 
-## 3. GitOps
+Bên cạnh việc quét mã nguồn tĩnh, các kho lưu trữ ECR được bật cấu hình **Scan on Push**. Mọi image do AIOps đẩy lên sẽ được tự động quét lỗi bảo mật. Việc deploy lên EKS sẽ bị chặn lại nếu image chứa các lỗ hổng bảo mật nghiêm trọng. Pipeline CI/CD xác thực với tài khoản AWS thông qua giao thức **OpenID Connect (OIDC)**, loại bỏ việc lưu trữ cố định các AWS Access Keys trên GitHub.
 
-### 3.1 Approach
+### 3.2 Destructive-change review
 
-Platform này **không dùng ArgoCD/Flux** vì không có Kubernetes cluster — compute là Lambda + Step Functions (serverless). GitOps pattern được áp dụng theo cách:
+Bất kỳ Terraform plan nào hiển thị cảnh báo thay đổi index tài nguyên hoặc có hành động xóa/khởi tạo lại (như tạo lại S3 bucket hoặc thay đổi IAM role) sẽ được gắn nhãn cảnh báo trong PR. Các thay đổi này bắt buộc phải có sự xác nhận thủ công và phê duyệt kép (dual approvals) từ CDO Lead và Security Lead.
 
-- **Git là source of truth**: mọi thay đổi infra đều qua commit → PR → merge. Không click console, không manual `apply`.
-- **IaC = desired state**: Terraform state drift được phát hiện qua scheduled `terraform plan` hàng ngày.
-- **Audit trail**: Git history + Terraform state + CloudTrail = chuỗi bằng chứng đầy đủ cho mọi change.
+### 3.3 AI contract compatibility
 
-### 3.2 Drift detection
+Trước khi cập nhật container trong EKS, pipeline sẽ khởi chạy một tập lệnh kiểm tra độ tương thích:
+1. Đối chiếu model version đăng ký từ AIOps với cấu hình EKS hiện tại.
+2. Kiểm tra JSON schema của API contract đầu vào và đầu ra tại endpoint `/detect` của AI Engine.
+3. Nếu schema không tương thích, quá trình build sẽ bị dừng ngay lập tức trước khi tác động vào cụm Kubernetes, đảm bảo tính nhất quán của hệ thống.
 
-| Cơ chế | Tần suất | Hành động |
-|---|---|---|
-| Scheduled `terraform plan` | Hàng ngày 9h sáng | GitHub Actions chạy plan; nếu có diff → mở issue tự động + notify Slack Engineering |
-| CloudTrail → CloudWatch alarm | Real-time | Alarm nếu có manual console change trên resource được quản lý bởi Terraform |
-| S3 run state check | Sau mỗi workflow run | Verify last successful run < 26h qua S3 object metadata (last-modified); nếu không → CloudWatch alarm |
+## 4. Deployment strategy
 
-### 3.3 Change control
+### 4.1 Strategy
 
-- **Non-destructive changes** (thêm resource, update Lambda code): auto-apply sau review.
-- **Destructive changes** (xóa S3 bucket, thay đổi core resource): require explicit `lifecycle { prevent_destroy = true }` override + manual approval step trong pipeline.
-- **Contract-related changes** (thay đổi Lambda AI client interface): require AIOps team sign-off trước khi merge — đây là frozen contract sau T5 W11.
+- **EKS API Workloads**: Sử dụng chiến lược **Rolling Updates** với cấu hình max surge `25%` và max unavailable `0%`. Điều này đảm bảo các pod chạy ổn định (`ai-engine-api`) luôn có replica mới sẵn sàng trước khi thu hồi các pod cũ.
+- **EKS Batch Workers**: Các Kubernetes Jobs thực thi động. Các cập nhật về cấu hình worker sẽ áp dụng cho các lượt gọi job tiếp theo mà không làm ảnh hưởng đến các job đang chạy.
+- **Lambda Functions**: Triển khai theo cơ chế **Weighted Aliases**. Traffic được chuyển dịch dần dần: chạy thử nghiệm canary `10%` traffic trong 5 phút, và tự động chuyển sang `100%` nếu không phát sinh lỗi.
+- **Spot Node Draining**: Sử dụng Karpenter để xử lý ngắt spot nodes. Khi có tín hiệu ngắt từ EC2, Karpenter sẽ phát tín hiệu trục xuất (evict) pod để drain các pod worker một cách an toàn. Nếu một job batch scoring đang chạy bị dừng giữa chừng, orchestrator sẽ tự động phát hiện và chạy lại ở node healthy khác.
 
----
+### 4.2 Rollback method
 
-## 4. Deployment Strategy
+- **Rollback chính**: Thực hiện qua ArgoCD. Việc hoàn tác (revert) một commit Git về SHA ổn định trước đó sẽ tự động kích hoạt ArgoCD đồng bộ lại cấu hình trong cụm EKS trong vòng 60 giây.
+- **Rollback phụ**: Đối với các hàm Lambda, workflow Step Functions sẽ bắt các mã lỗi gọi function và ngay lập tức chuyển trọng số (weight) của Lambda alias về phiên bản ổn định trước đó (RTO < 10 giây).
 
-### 4.1 Lambda deployment strategy
+## 5. Environment separation
 
-Lambda không có traffic routing như container service, nên dùng **alias + weighted routing**:
+Hạ tầng được cô lập hoàn toàn trên ba tài khoản AWS độc lập:
 
-```
-Lambda function: finops-watch-ai-client
-  ├── $LATEST           (development)
-  ├── alias: stable     (100% traffic — current version)
-  └── alias: canary     (10% → 50% → 100% shift qua CodeDeploy Lambda)
-```
-
-- **Canary shift**: 10% → 50% → 100% trong 15 phút (CodeDeploy `LambdaLinear10PercentEvery3Minutes`)
-- **Abort criteria**:
-  - Lambda error rate > 1% trong bất kỳ canary window nào
-  - P99 duration > 800ms (CloudWatch alarm trigger)
-  - Step Functions execution fail rate > 5%
-- **Auto-rollback**: CodeDeploy tự động rollback alias về version cũ nếu alarm trigger
-
-### 4.2 Step Functions + EventBridge update strategy
-
-- Step Functions state machine definition thay đổi qua Terraform → apply tạo revision mới tự động.
-- EventBridge Scheduler không bị interrupt trong quá trình update state machine (execution đang chạy hoàn thành với definition cũ).
-- Nếu cần rollback state machine: Terraform `apply` lại commit cũ → tạo revision trước đó.
-
-### 4.3 Rollback method
-
-| Layer | Primary rollback | Secondary rollback | Target RTO |
+| Môi trường (Env) | Mục đích sử dụng | Tài khoản AWS | Auto-deploy |
 |---|---|---|---|
-| Lambda | CodeDeploy alias rollback về version cũ | `terraform apply` với version cũ trong tfvars | < 60s |
-| Step Functions | `terraform apply` commit trước đó | Manual update via AWS Console (emergency only) | < 5 phút |
-| S3/Glue/Athena | Không rollback — append-only data; rollback = reprocess | Restore từ S3 Versioning nếu object bị overwrite | < 30 phút |
-| S3 State Lock | Xóa thủ công object `.terraform.lock.info` nếu lock bị treo | `terraform force-unlock` | < 5 phút |
+| **Sandbox** | Lập trình viên chạy thử nghiệm cục bộ và kiểm tra định dạng dữ liệu synthetic. | `1111-2222-3333` | Có (khi push lên PR) |
+| **Staging** | Kiểm thử tích hợp container artifact từ AIOps và chạy toàn trình Step Functions E2E pipeline. | `4444-5555-6666` | Có (khi merge vào `develop`) |
+| **Prod** | Control plane chạy chính thức. Giám sát chi phí toàn công ty. Các hành động containment bắt buộc chạy ở chế độ dry-run. | `7777-8888-9999` | Không (yêu cầu phê duyệt manual) |
 
----
+## 6. Secrets in pipeline
 
-## 5. Environment Separation
+Secrets tuyệt đối không được ghi trực tiếp vào mã nguồn hay biến môi trường của pipeline.
+1. CI/CD runner assume một IAM role thông qua liên kết OIDC để lấy token tạm thời.
+2. Các secret (như Slack webhooks hay database passwords) được lưu trữ trực tiếp trong AWS Secrets Manager.
+3. ArgoCD mount các secret này vào pod trong cụm EKS thông qua External Secrets Operator tại thời điểm pod khởi chạy.
 
-| Env | Mục đích | AWS Account | Auto-deploy | Containment behavior |
-|---|---|---|---|---|
-| **Sandbox** | Dev experimentation, W11 base IaC build, W12 testing | `account-sandbox` | Tự động khi merge vào `develop` | Tag + schedule shutdown + quota cap (approved) |
-| **Staging** | Pre-prod integration, E2E test, chaos test W12 | `account-staging` | Tự động khi merge vào `main` | Tag + dry-run schedule shutdown + dry-run quota cap |
-| **Prod** | Demo day T5 02/07, panel presentation | `account-prod` | Manual approval gate trong pipeline | Tag only + suggest only — KHÔNG apply bất kỳ containment nào |
+## 7. Scheduled batch deployment
 
-**Hard rule**: `NEVER terminate prod, delete data, or modify IAM` — enforced bằng:
-1. `lifecycle { prevent_destroy = true }` trên critical resources trong prod module.
-2. SCP (Service Control Policy) trên account-prod block các action nguy hiểm.
-3. Lambda containment worker kiểm tra `ENVIRONMENT` env var trước mọi action — nếu `prod` → chỉ dry-run.
-
----
-
-## 6. Secrets in Pipeline
-
-- **CI/CD authentication**: GitHub Actions dùng **OIDC + IAM assume-role** — không có static AWS keys trong GitHub Secrets.
-- **Lambda runtime secrets**: AWS Secrets Manager — Lambda IAM role có `secretsmanager:GetSecretValue` chỉ cho secret ARN cụ thể.
-- **Secret scanning**: Gitleaks chạy trên mọi PR — block merge nếu phát hiện secret pattern.
-- **AI Engine credentials** (nếu có): lưu trong Secrets Manager, Lambda AI client fetch tại runtime, không hardcode trong environment variables.
-- **Rotation**: Secrets Manager auto-rotation mỗi 30 ngày cho database credentials (nếu dùng).
-
----
-
-## 7. Tenant (Account) Onboarding Deployment
-
-Với TF2, "tenant" = một AWS member account cần được monitor chi phí.
+State machine của Step Functions và EventBridge Scheduler được quản lý và triển khai qua các module Terraform. Quy trình deploy tuân thủ quy trình kiểm tra vận hành:
 
 ```
-1. Operator thêm account ID vào accounts.tfvars trong repo
-2. PR review → merge → Terraform plan/apply:
-   - Tạo cross-account IAM role trên management account (read-only cost + scoped containment)
-   - Thêm account vào S3 owner mapping file (accounts/owner_mapping.json trong lakehouse bucket)
-   - Cập nhật EventBridge Scheduler scope (nếu cần per-account schedule)
-3. Smoke test: Lambda puller test assume-role vào account mới → verify Cost Explorer accessible
-4. Confirm trong S3: account status object = "active" (s3://finops-watch-accounts/<account-id>/status.json)
+1. Deploy định nghĩa JSON mới của Step Functions qua Terraform.
+2. Tạm thời vô hiệu hóa (disable) quy tắc EventBridge Scheduler để tránh kích hoạt pipeline giữa chừng.
+3. Chạy thử nghiệm (smoke-test) để xác minh kết nối đến endpoint API và các bảng Glue.
+4. Kích hoạt (enable) lại quy tắc EventBridge Scheduler để trỏ vào version state machine mới.
+5. Ghi nhận thời gian cập nhật và phiên bản triển khai vào bảng DynamoDB deployment log.
 ```
 
-Target time: **< 30 phút** từ khi merge PR đến khi account có data trong lakehouse.
+## 8. Observability stack
 
----
+Trạng thái vận hành và độ ổn định của hệ thống được giám sát qua bộ công cụ tập trung:
 
-## 8. Observability Stack
-
-| Component | Tool | Mục đích |
+| Thành phần | Công cụ sử dụng | Mục đích giám sát |
 |---|---|---|
-| Metrics | **CloudWatch Metrics** (custom namespace `FinOpsWatch/CDO`) | Lambda duration/errors, Step Functions execution success/fail, S3 request metrics |
-| Logs | **CloudWatch Logs** — structured JSON logging | Mọi Lambda emit JSON log với `run_id`, `correlation_id`, `cost_period`, `status` |
-| Traces | **AWS X-Ray** + Lambda active tracing | End-to-end trace một workflow run: Scheduler → SFN → Lambda chain → AI call |
-| Dashboards | **CloudWatch Dashboard** `FinOpsWatch-CDO-Ops` | Ops dashboard cho team (khác với finance dashboard cho CFO) |
-| Alerts | **CloudWatch Alarms** → SNS Engineering route | Lambda error rate, SFN failure, AI client timeout, drift detection, audit write failure |
+| **Log Aggregator** | CloudWatch Logs / Container Insights | Tập trung hóa nhật ký hoạt động từ application, Lambda, và stdout của EKS containers. |
+| **Trace Analyzer** | AWS X-Ray | Tracing đường đi của request từ Step Functions, qua Lambda, đến internal ALB trong EKS. |
+| **Metrics Collector** | Prometheus / Managed Grafana | Theo dõi mức sử dụng CPU/Memory của EKS pods, số lượng node group, và các hành động của Karpenter. |
+| **Alarms Engine** | CloudWatch Alarms | Gửi cảnh báo qua SNS nếu Step Functions gặp lỗi, hoặc dữ liệu dashboard không cập nhật (>26 giờ). |
 
-**Key alarms cần có trước demo:**
+## 9. Open questions
 
-| Alarm | Metric | Threshold | Action |
-|---|---|---|---|
-| `WorkflowFailed` | SFN ExecutionsFailed | > 0 trong 5 phút | SNS Engineering |
-| `AIClientTimeout` | Lambda `ai-client` errors | > 2 trong 5 phút | SNS Engineering + set `ai_unavailable` |
-| `DriftDetected` | Custom metric từ scheduled plan | plan diff != 0 | SNS Engineering + open GitHub issue |
-| `AuditWriteFailed` | Lambda `audit-writer` errors | > 0 | SNS Engineering + fail-closed workflow |
-| `StaleWorkflow` | Custom metric: hours since last success | > 26h | SNS Finance + Engineering |
+- [ ] **ArgoCD Topology**: Nên vận hành ArgoCD theo mô hình hub-and-spoke từ tài khoản quản trị chính, hay cài đặt các thực thể ArgoCD riêng biệt trong cụm EKS của từng môi trường?
+- [ ] **Grafana Integration**: Có nên chia sẻ dashboard theo dõi chỉ số hạ tầng với đội ngũ AIOps không, hay chỉ giới hạn quyền truy cập cho đội hạ tầng CDO?
 
----
+## Related documents
 
-## 9. Open Questions
-
-- [ ] **Q1**: AI Engine skeleton deploy trên Lambda hay Fargate? — cần biết để config VPC peering hay public endpoint cho Lambda AI client. *Resolve với AIOps EOD T4 W11.*
-- [ ] **Q2**: CodeDeploy Lambda canary có available trên account sandbox không? — nếu không thì fallback về alias swap manual. *Verify T3 W11.*
-- [ ] **Q3**: Prod account có cần separate AWS account thật hay dùng chung sandbox với env=prod flag? — ảnh hưởng SCP và IAM isolation. *Resolve T5 onsite với mentor.*
-
----
-
-## Related Documents
-
-- [`01_requirements_analysis.md`](01_requirements_analysis.md) — NFR targets và differentiation angle serverless-first
-- [`02_infra_design.md`](02_infra_design.md) — Architecture lakehouse, Step Functions, Lambda chain, containment patterns
-- [`03_security_design.md`](03_security_design.md) — IAM least-privilege, cross-account roles, SCP, audit trail
-- [`08_adrs.md`](08_adrs.md) — ADR: chọn Terraform over CDK; ADR: GitOps without ArgoCD (serverless); ADR: canary Lambda alias over blue/green
+- [`02_infra_design_vi.md`](02_infra_design_vi.md) - Cấu trúc cụm EKS, subnet mạng, và định tuyến node group.
+- [`03_security_design_vi.md`](03_security_design_vi.md) - Thiết lập IRSA, danh mục secret, và network policies.

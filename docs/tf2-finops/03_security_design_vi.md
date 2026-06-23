@@ -1,385 +1,265 @@
-# Thiết kế Bảo mật (Security Design) - TF2 FinOps Watch CDO06 Platform
+# Thiết kế Bảo mật (Security Design) - Task Force 2 · FinOps Watch CDO
 
-## 1. Bảo mật Mạng (Network Security)
+<!-- Doc owner: CDO Team
+     Status: Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
+-->
 
-Hạ tầng CDO platform cho TF2 FinOps Watch vận hành theo cấu trúc mạng serverless, hướng xử lý batch (theo lô) đặt tại `ap-southeast-1`. Thay vì công khai các API ra internet công cộng, hệ thống sử dụng mạng riêng tư (private networking), các Gateway/Interface VPC Endpoint và NAT Gateway được quản lý để thực hiện các workflow định kỳ theo chu kỳ 24 giờ.
+## 1. Network Security
 
-### 1.1 Sơ đồ Mạng (Network Diagram)
+### 1.1 Network Diagram
 
-Sơ đồ dưới đây mô tả cấu hình VPC, các subnet private, security group và các VPC Endpoint giúp cô lập data lakehouse, Step Functions điều phối (orchestration) và các Lambda worker khỏi internet công cộng. Sơ đồ cũng làm nổi bật kết nối outbound tới endpoint của AI Engine do AIOps sở hữu thông qua NAT Gateway.
+CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API và các cuộc gọi API bên ngoài đều được định tuyến nội bộ qua AWS VPC Endpoints.
 
 ```mermaid
-flowchart TB
-    subgraph VPC["AWS VPC tf2-finops (10.0.0.0/16)"]
-        subgraph PublicSubnet["Public Subnets (ap-southeast-1a/b)"]
-            NAT["NAT Gateways (EIP)"]
+graph TD
+    subgraph "CDO Management Account VPC (ap-southeast-1)"
+        subgraph "Private Subnets (EKS & Core Logic)"
+            subgraph "EKS Cluster"
+                API_P[ai-engine-api Pods]
+                WRK_P[ai-engine-worker Pods]
+                EXP_P[External Secrets Pods]
+            end
+            L_Pull[Ingestion Lambda]
+            L_Cont[Containment Lambda]
+            ALB[Internal Application Load Balancer]
         end
 
-        subgraph PrivateSubnetApp["Private Subnets - Orchestration & Workers (10.0.1.0/24)"]
-            Lambda["CDO Lambda Workers (Pull, Normalization, Routing, Containment)"]
-            SFN["Step Functions Orchestrator"]
-        end
-
-        subgraph PrivateSubnetData["Private Subnets - Data Lakehouse (10.0.2.0/24)"]
-            Athena["Athena Query Engines"]
-            DDB["DynamoDB Tables (Run state, Anomaly Index, Audit Trail)"]
-        end
-
-        subgraph VPCEndpoints["VPC PrivateLink Endpoints"]
-            VPCE_S3["Gateway Endpoint for S3"]
-            VPCE_DDB["Gateway Endpoint for DynamoDB"]
-            VPCE_KMS["Interface Endpoint for KMS (KMS CMK)"]
-            VPCE_SM["Interface Endpoint for Secrets Manager"]
-            VPCE_ATHENA["Interface Endpoint for Athena"]
+        subgraph "VPC Endpoint Subnet"
+            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR]
         end
     end
 
-    subgraph AIOpsBoundary["AIOps-owned AI Engine Boundary"]
-        AI_Engine["AI Engine API / Queue Contract"]
+    subgraph "External Cloud Environment"
+        S3Raw[(S3 Raw Zone)]
+        S3Cur[(S3 Curated Zone)]
+        DDB[(DynamoDB Run State)]
+        SM[Secrets Manager]
     end
 
-    SFN --> Lambda
-    Lambda --> VPCE_S3 --> S3_Lakehouse["S3 Data Lake (Raw/Curated/Audit)"]
-    Lambda --> VPCE_DDB --> DDB
-    Lambda --> VPCE_KMS
-    Lambda --> VPCE_SM
-    Lambda --> VPCE_ATHENA --> Athena
-    Lambda --> NAT --> AI_Engine
+    %% Network flows
+    L_Pull -->|VPC Endpoint HTTPS| VPCE
+    VPCE -->|Private link| S3Raw
+    L_Cont -->|VPC Endpoint HTTPS| VPCE
+    VPCE -->|Private link| DDB
+    
+    %% EKS traffic
+    ALB -->|HTTPS Port 8443| API_P
+    API_P -->|gRPC/REST| WRK_P
+    EXP_P -->|VPC Endpoint HTTPS| VPCE
+    VPCE -->|Fetch API Key| SM
 ```
 
-### 1.2 Nhóm Bảo mật (Security Groups)
+*Caption: Cụm EKS, load balancer, và các hàm Lambda điều phối được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (Privatelink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng.*
 
-Luồng lưu lượng được kiểm soát bằng cách sử dụng các security group được gắn trực tiếp vào các tài nguyên trong subnet. Vì CDO platform chạy các thành phần serverless (Lambda và truy vấn Athena) thay vì các cụm EC2 hoặc EKS chạy liên tục, các security group sẽ được áp dụng cho các Lambda function được kết nối VPC và các VPC interface endpoint.
+### 1.2 Security Groups
 
-| Tên Security Group | Quy tắc Inbound | Quy tắc Outbound | Gắn vào |
+Luồng traffic giữa các thành phần compute được kiểm soát thông qua các stateful security groups tuân thủ nguyên tắc đặc quyền tối thiểu:
+
+| SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `tf2-finops-lambda-sg` | Không có | `HTTPS (443)` tới VPC Endpoints; `HTTPS (443)` tới NAT Gateway (cho AI Engine) | Tất cả các CDO Lambda function kết nối VPC |
-| `tf2-finops-vpce-sg` | `HTTPS (443)` từ `tf2-finops-lambda-sg` | Không có | Các VPC Interface Endpoint (KMS, Secrets Manager, Athena) |
-| `tf2-finops-athena-sg` | `HTTPS (443)` từ `tf2-finops-lambda-sg` | Không có | Các nhóm thực thi truy vấn Athena |
+| `alb-sg` | TCP 443 (từ Step Functions / Lambda Client) | TCP 8443 (đến `eks-node-sg`) | internal ALB |
+| `eks-cluster-sg` | TCP 443 (từ CI/CD runner và bastion hosts) | TCP 10250, TCP 53 (đến Node groups) | EKS Control Plane |
+| `eks-node-sg` | TCP 10250 (từ Control Plane), TCP 8443 (từ `alb-sg`), TCP/UDP 53 (DNS) | TCP 443 (đến `vpce-sg`), TCP 10250, TCP/UDP 53 | EKS managed node groups (On-Demand & Spot) |
+| `lambda-sg` | None | TCP 443 (đến `vpce-sg`), TCP 443 (đến `alb-sg`) | Lambda functions |
+| `vpce-sg` | TCP 443 (từ `eks-node-sg` và `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr) |
 
-### 1.3 ACL Mạng / VPC Endpoint (Network ACL / VPC Endpoint)
+### 1.3 Network ACL / VPC Endpoint
 
-Để đảm bảo toàn bộ dữ liệu nội bộ, thông tin xác thực và lưu lượng khoá mã hoá luôn nằm trong mạng xương sống private của AWS, lưu lượng mạng sẽ không đi qua internet công cộng ngoại trừ các cuộc gọi đi (outbound call) tới API của AIOps AI Engine bên ngoài.
+Các VPC interface endpoints được cấu hình bật tính năng Private DNS, định tuyến toàn bộ traffic đến:
+- `com.amazonaws.ap-southeast-1.s3` (Gateway Endpoint)
+- `com.amazonaws.ap-southeast-1.dynamodb` (Gateway Endpoint)
+- `com.amazonaws.ap-southeast-1.secretsmanager` (Interface Endpoint)
+- `com.amazonaws.ap-southeast-1.ecr.api` (Interface Endpoint)
+- `com.amazonaws.ap-southeast-1.ecr.dkr` (Interface Endpoint)
+- `com.amazonaws.ap-southeast-1.logs` (Interface Endpoint - CloudWatch logs)
 
-- **S3 Gateway Endpoint**: Các bản ghi định tuyến (route table) trong subnet private điều hướng trực tiếp lưu lượng hướng tới các bucket CDO Lakehouse qua S3.
-- **DynamoDB Gateway Endpoint**: Phân giải lưu lượng tới các bảng DynamoDB ghi nhận trạng thái chạy (run state), idempotency và anomaly (bất thường) một cách riêng tư.
-- **Secrets Manager Interface Endpoint (`com.amazonaws.ap-southeast-1.secretsmanager`)**: Phân giải các cuộc gọi API để truy xuất thông tin xác thực giả lập và các API key bên trong VPC.
-- **KMS Interface Endpoint (`com.amazonaws.ap-southeast-1.kms`)**: Phân giải các thao tác khoá (mã hoá, giải mã, tạo data key) cho các KMS CMK.
-- **Athena Interface Endpoint (`com.amazonaws.ap-southeast-1.athena`)**: Bảo mật các truy vấn phân tích nội bộ được thực hiện bởi cổng kết nối dữ liệu của dashboard.
+Network policies được triển khai trong cụm EKS để giới hạn kết nối giữa các pod (ví dụ: chặn các pod `ai-engine-worker` trên các spot nodes khởi tạo kết nối đến bất kỳ tài nguyên nào ngoại trừ các pod `ai-engine-api`).
 
----
+## 2. IAM & Access Control
 
-## 2. Quản lý Định danh & Kiểm soát Truy cập (IAM & Access Control)
+### 2.1 Service Roles
 
-Quản lý Định danh và Truy cập (IAM) được cấu trúc xung quanh các service role theo nguyên tắc đặc quyền tối thiểu (least-privilege) và các quyền containment (ngăn chặn) nhận biết môi trường.
+Các IAM service roles trong AWS thực thi sự phân tách trách nhiệm nghiêm ngặt. Đặc biệt, không có service role nào có quyền admin hoặc quyền thực hiện các tác vụ phá hủy trên môi trường production:
 
-### 2.1 Quyền hạn Dịch vụ (Service Roles)
-
-CDO platform thực thi phân tách nhiệm vụ giữa điều phối workflow, chuẩn hoá dữ liệu, tích hợp AI engine và thực thi hành động containment.
-
-#### 1. CDO Platform Execution Role (`tf2-finops-cdo-workflow-role`)
-Được sử dụng bởi Step Functions state machine. Role này được phép kích hoạt và giám sát các CDO Lambda function, đọc và cập nhật các bản ghi run state trên DynamoDB, và ghi nhận các metric thực thi.
-
-#### 2. CDO AI Client Role (`tf2-finops-ai-client-role`)
-Được sử dụng bởi Lambda function thực hiện gọi AIOps-owned AI Engine. Role này có quyền đọc các file cost đã chuẩn hoá từ S3, lấy API key của AI Engine từ Secrets Manager và ghi nhận các bản ghi anomaly vào DynamoDB.
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "ReadNormalizedCostData",
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject"
-            ],
-            "Resource": "arn:aws:s3:::tf2-finops-lakehouse/cost/curated/*"
-        },
-        {
-            "Sid": "RetrieveAIEngineApiKey",
-            "Effect": "Allow",
-            "Action": [
-                "secretsmanager:GetSecretValue"
-            ],
-            "Resource": "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tf2-finops/ai-engine/api-key-*"
-        },
-        {
-            "Sid": "WriteAnomalyRecords",
-            "Effect": "Allow",
-            "Action": [
-                "dynamodb:PutItem",
-                "dynamodb:UpdateItem"
-            ],
-            "Resource": "arn:aws:dynamodb:ap-southeast-1:123456789012:table/tf2-finops-anomaly-records"
-        }
-    ]
-}
-```
-
-#### 3. CDO Containment Worker Role (`tf2-finops-containment-role`)
-Được sử dụng bởi Lambda function áp dụng các chính sách containment. Role này có quyền truy xuất dữ liệu anomaly và ghi lại nhật ký kiểm toán (audit record), nhưng phải assume các role đặc thù theo môi trường trong các member account để kích hoạt các hành động containment.
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "ReadAuditAndAnomalyMetadata",
-            "Effect": "Allow",
-            "Action": [
-                "dynamodb:GetItem",
-                "dynamodb:UpdateItem",
-                "s3:PutObject"
-            ],
-            "Resource": [
-                "arn:aws:dynamodb:ap-southeast-1:123456789012:table/tf2-finops-anomaly-records",
-                "arn:aws:s3:::tf2-finops-audit-log/*"
-            ]
-        },
-        {
-            "Sid": "AssumeScopedContainmentRoles",
-            "Effect": "Allow",
-            "Action": "sts:AssumeRole",
-            "Resource": [
-                "arn:aws:iam::*:role/tf2-finops-member-containment-role"
-            ]
-        }
-    ]
-}
-```
-
-### 2.2 Ranh giới Bảo mật Cứng (Deny Policy) (Hard Security Boundary (Deny Policy))
-
-Để đáp ứng các yêu cầu bảo mật cứng tuyệt đối của khách hàng, CDO platform gắn một IAM Permission Boundary hoặc Service Control Policy (SCP) vào tất cả các role tự động hoá.
+| Role | Used by | Permissions |
+|---|---|---|
+| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
+| `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (trên CUR S3 bucket của tài khoản đích), `s3:PutObject` (trên raw S3 bucket), `ce:GetCostAndUsage` |
+| `EksClusterRole` | EKS Control Plane | Cấu hình standard `AmazonEKSClusterPolicy` và `AmazonEKSVPCResourceController` |
+| `EksNodeGroupRole` | EC2 Node Instances | `AmazonEKSWorkerNodePolicy`, `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy` |
+| `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Cấu hình explicit deny cho các quyền `iam:*`, `s3:Delete*`, và xóa tài nguyên prod. |
 
 > [!IMPORTANT]
-> **Ranh giới an toàn sản xuất cứng (Hard production safety boundary)**: `NEVER terminate prod, delete data, or modify IAM`. Trong mọi tình huống, hệ thống CDO sẽ KHÔNG BAO GIỜ tắt các tài nguyên production đang chạy, xóa các kho lưu trữ dữ liệu vĩnh viễn hoặc sửa đổi phạm vi chính sách IAM.
+> **Ranh giới Bảo mật Cứng**: Mọi role thực thi của CDO đều đi kèm một Service Control Policy (SCP) để đảm bảo hệ thống **NEVER terminate prod, delete data, hoặc modify IAM**. Các tác vụ containment trên production chỉ giới hạn ở mức tag, suggest, hoặc dry-run kiểm toán.
 
-Đoạn mã chính sách (policy snippet) sau đây được gắn dưới dạng ranh giới Deny rõ ràng cho containment worker role và tất cả các role cross-account được assume:
+### 2.2 K8s RBAC & IRSA (IAM Roles for Service Accounts)
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "DenyUnsafeActions",
-            "Effect": "Deny",
-            "Action": [
-                "iam:*",
-                "organizations:*",
-                "ec2:TerminateInstances",
-                "rds:DeleteDBInstance",
-                "rds:DeleteDBCluster",
-                "s3:DeleteBucket",
-                "s3:DeleteObject",
-                "dynamodb:DeleteTable",
-                "dynamodb:DeleteBackup"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
+Cơ chế phân quyền trong Kubernetes được ánh xạ tới các AWS IAM roles thông qua tính năng **IAM Roles for Service Accounts (IRSA)**. Các pod sẽ assume các IAM role cụ thể qua liên kết OIDC thay vì kế thừa quyền từ các thực thể máy chủ EC2.
 
-### 2.3 Mô hình Truy cập Liên tài khoản (Cross-Account Access Pattern)
+- **K8s Service Accounts & Roles**:
+  - `ai-engine-api-sa`: Được liên kết với `FinOpsAiApiIamRole` cấp quyền read-only trên S3 để tải model artifacts.
+  - `ai-engine-worker-sa`: Được liên kết với `FinOpsAiWorkerIamRole` cấp quyền read-write trên các S3 checkpoint và output buckets.
+  - `external-secrets-sa`: Được liên kết với `FinOpsSecretsReaderIamRole` chỉ có quyền đọc các model configuration secret trong Secrets Manager.
 
-CDO platform nằm trong tài khoản FinOps Security/Management trung tâm. Các member account được truy cập bằng cách sử dụng cơ chế assume role liên tài khoản thông qua AWS Security Token Service (STS):
+- **RBAC Mapping**:
 
-1. **Truy cập Chi phí và Metadata ở chế độ Read-only**: Bộ phận cost puller và normalization worker assume một role read-only (`tf2-finops-member-read-role`) trong các member account. Điều này cho phép hệ thống liệt kê các tag của tài nguyên và đọc loại instance để đưa ra các đề xuất tối ưu hoá kích cỡ (right-sizing).
-2. **Truy cập Containment nhận biết Môi trường (Environment-Aware Containment Access)**: Bộ phận containment worker assume role `tf2-finops-member-containment-role` trong tài khoản đích. Quyền hạn của role này được giới hạn chặt chẽ dựa trên các tag môi trường của tài nguyên trong tài khoản đó:
+| Role / ClusterRole | Subject (Service Account) | Namespace | Verbs | Resources |
+|---|---|---|---|---|
+| `ai-api-role` | `ai-engine-api-sa` | `ai-inference` | `get`, `list`, `watch` | `pods`, `services` |
+| `job-runner-role` | `ai-engine-api-sa` | `ai-batch-jobs` | `create`, `get`, `list`, `watch`, `delete` | `jobs`, `cronjobs` |
+| `eso-role` | `external-secrets-sa` | `kube-system` | `get`, `list`, `create`, `update` | `secrets` |
 
-| Môi trường Đích | Hành động Containment được Phép | Hành động bị từ chối (Chặn cứng) |
-|---|---|---|
-| **Production** (`prod`) | `ec2:CreateTags` (Gắn tag để đánh giá), Đề xuất các khuyến nghị | Tắt (Terminate), Xoá (Delete), Sửa đổi IAM, Dừng instance (Stop), Giới hạn quota |
-| **Staging** (`staging`) | `ec2:CreateTags`, Dừng instance chạy thử (Dry-run schedule shutdown), Giới hạn quota chạy thử (Dry-run quota cap) | Tắt (Terminate), Xoá (Delete), Sửa đổi IAM, Dừng instance trực tiếp (Direct stop) |
-| **Development** (`dev`) | `ec2:CreateTags`, `ec2:StopInstances` (Dừng theo lịch trình), Áp dụng giới hạn Quota định sẵn | Tắt (Terminate), Xoá (Delete), Sửa đổi IAM, Xoá dữ liệu trực tiếp |
-| **Sandbox** (`sandbox`) | `ec2:CreateTags`, `ec2:StopInstances` (Dừng theo lịch trình), Áp dụng giới hạn Quota định sẵn | Tắt (Terminate), Xoá (Delete), Sửa đổi IAM, Xoá dữ liệu trực tiếp |
+### 2.3 Cross-account Access
 
-Tất cả các cuộc gọi API liên tài khoản đều được thực thi với một `correlation_id` được truyền qua session tag để đảm bảo có thể theo dõi được trong CloudTrail của các member account.
+Quyền truy cập chéo tài khoản (cross-account) tới các CUR buckets của tài khoản thành viên được quản lý bởi S3 bucket policies tại tài khoản đích, cho phép quyền đọc đối với `FinOpsCURPullerRole` tập trung thông qua External IDs.
+Các hành động containment tại các tài khoản thành viên được kích hoạt thông qua cơ chế Assume IAM Role chéo tài khoản (`AssumeRole`). Role `LambdaContainment` tại tài khoản quản trị (management account) sẽ assume role `FinOpsContainmentWorkerRole` tại tài khoản đích, thực hiện gắn thẻ tag hoặc scale down các sandbox ASGs.
 
----
+## 3. Secrets Management
 
-## 3. Quản lý Thông tin mật (Secrets Management)
-
-Thông tin xác thực và mã khoá không bao giờ được viết cứng (hardcode) hoặc đẩy vào hệ thống quản lý mã nguồn (Git).
-
-### 3.1 Danh mục Thông tin mật (Secrets Inventory)
+### 3.1 Secrets Inventory
 
 Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
-| Tên Secret | Lưu trữ / ARN | Chu kỳ Xoay vòng | Truy cập bởi | Mô tả |
-|---|---|---|---|---|
-| `tf2-finops/ai-engine/api-key` | Secrets Manager | Thủ công (xoay vòng khi khoá hết hạn) | `tf2-finops-ai-client-role` | API key để xác thực các yêu cầu gửi tới AIOps AI Engine |
-| `tf2-finops/platform/db-conn` | Secrets Manager | Tự động xoay vòng mỗi 30 ngày | Normalization worker | Thông tin xác thực metadata hoặc data warehouse (khi sử dụng cơ sở dữ liệu bên ngoài) |
-| `tf2-finops/platform/webhook` | Secrets Manager | Thủ công (kiểm tra hàng năm) | Lambda điều phối cảnh báo | Các mã xác thực đầu vào/đầu ra cho Slack webhook và các endpoint HTTP của SNS |
-
-### 3.2 Cơ chế Tiêm Thông tin mật (Inject Pattern)
-
-Đối với việc thực thi AWS Lambda, các secret được lấy động tại thời điểm chạy (runtime) bằng cách sử dụng **AWS Secrets Manager Lambda Layer (Caching Client)**.
-
-- Code Lambda yêu cầu secrets từ `localhost:2773` để lấy các secret đã được cache.
-- Điều này giúp giảm số lượng cuộc gọi API, tránh vượt quá giới hạn throttling của Secrets Manager và đảm bảo secrets chỉ được lưu trữ trong bộ nhớ container tạm thời.
-- Các task ECS Fargate tải các secret thông qua các tham số trong task definition sử dụng khai báo `valueFrom`, đảm bảo thông tin xác thực không bao giờ được lưu trữ dưới dạng text thông thường trong container image hoặc định nghĩa môi trường:
-
-```yaml
-secrets:
-  - name: AI_ENGINE_API_KEY
-    valueFrom: "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tf2-finops/ai-engine/api-key-abcde:api_key::"
-```
-
-### 3.3 Kiểm soát Chống rò rỉ (Anti-leak Controls)
-
-1. **Pre-commit Scan Hook**: Các nhà phát triển phải sử dụng các hook pre-commit tại local được cấu hình bằng `Gitleaks` hoặc `TruffleHog` để quét các khối mã nhằm tìm kiếm mật khẩu, private key hoặc API token.
-2. **Quét Secret trong Pipeline CI**: CI/CD runner quét kho lưu trữ trên mỗi pull request. Nếu phát hiện thấy secret, lượt chạy sẽ thất bại ngay lập tức.
-3. **Ẩn thông tin nhạy cảm trong Nhật ký ứng dụng (Application Log Redaction)**: Các CDO logging utility sử dụng các mẫu regex để chặn và loại bỏ dữ liệu nhạy cảm khỏi nhật ký JSON có cấu trúc trước khi ghi chúng vào CloudWatch:
-   - Mẫu `Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*` được thay thế bằng `[REDACTED]`.
-   - Mẫu `(?i)password|api_key|token\s*:\s*"[^"]*"` được ẩn đi.
-
----
-
-## 4. Mã hoá (Encryption)
-
-Tất cả dữ liệu được lưu trữ trong CDO platform hoặc di chuyển qua mạng đều được bảo vệ bằng các giao thức mã hoá tiêu chuẩn công nghiệp.
-
-### 4.1 Mã hoá Lưu trữ (At Rest)
-
-Data lakehouse và các metadata catalog sử dụng khoá do khách hàng quản lý (CMK) được cấu hình trong KMS thay vì các khoá mặc định do AWS quản lý.
-
-| Thành phần Dữ liệu | Phương tiện Lưu trữ | KMS Key / Loại | Kiểm soát An toàn |
+| Secret | Storage | Rotation | Accessed by |
 |---|---|---|---|
-| **Audit Logs** | S3 bucket `tf2-finops-audit` | `tf2-finops-audit-cmk` (CMK) | Bật Object Lock (Chế độ Compliance, thời gian lưu trữ 90 ngày) |
-| **Cost Raw Zone** | S3 bucket `tf2-finops-lakehouse` | `tf2-finops-data-cmk` (CMK) | SSE-KMS, Chính sách bucket bắt buộc mã hoá |
-| **Cost Curated Zone** | S3 bucket `tf2-finops-lakehouse` | `tf2-finops-data-cmk` (CMK) | SSE-KMS, Chính sách bucket bắt buộc mã hoá |
-| **Operational Metadata** | DynamoDB Tables | `tf2-finops-ddb-cmk` (CMK) | Mã hoá cấp bảng sử dụng CMK |
-| **Lambda Storage** | `/tmp` và gói triển khai (deployment package) | Khoá do AWS quản lý | Khoá thực thi mặc định của KMS |
+| `finops/ai-engine/api-key` | AWS Secrets Manager (mã hóa qua KMS CMK) | Tự động mỗi 30 ngày | Pod `ai-engine-api` (qua External Secrets Operator) |
+| `finops/dashboard/db-creds` | AWS Secrets Manager | Tự động mỗi 60 ngày | QuickSight dataset engine / Athena crawler |
+| `finops/alerting/slack-webhook` | AWS Secrets Manager | Thủ công mỗi 90 ngày | `LambdaAlertRouting` |
 
-### 4.2 Mã hoá Truyền tải (In Transit)
+### 3.2 Inject Pattern
 
-Tất cả các truyền tải dữ liệu bắt buộc phải sử dụng TLS 1.2 hoặc TLS 1.3:
+Chúng tôi sử dụng **External Secrets Operator (ESO)** trong EKS để đồng bộ secrets từ AWS Secrets Manager vào native Kubernetes Secrets. Các secrets này được mount dưới dạng các tệp read-only bên trong các phân vùng bộ nhớ tmpfs của container.
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: ai-engine-api-key
+  namespace: ai-inference
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager-store
+    kind: SecretStore
+  target:
+    name: k8s-ai-api-key
+    creationPolicy: Owner
+  data:
+    - secretKey: api-key
+      remoteRef:
+        key: finops/ai-engine/api-key
+        property: apiKey
+```
+Đối với các hàm Lambda, các secrets được truy xuất và phân giải trong quá trình cold-start, cache lại trong thư mục bộ nhớ tạm `/tmp` của function, và được kiểm tra hợp lệ theo các chính sách TTL cache để tránh gọi API trực tiếp quá nhiều.
 
-1. **VPC Endpoints**: Các kết nối tới KMS, Secrets Manager, S3 và DynamoDB được thực thi thông qua gateway và interface routing trong VPC, nghĩa là lưu lượng không bao giờ đi qua internet công cộng.
-2. **Outbound tới AI Engine**: Tất cả các cuộc gọi HTTP từ CDO AI client tới endpoint của AI Engine phải sử dụng HTTPS. Việc xác thực TLS tiêu chuẩn được thực thi; các chứng chỉ tự ký (self-signed) sẽ bị từ chối.
-3. **Dịch vụ Dữ liệu Nội bộ**: Các kết nối dữ liệu Athena và tích hợp QuickSight dashboard bắt buộc sử dụng HTTPS với chính sách mã hoá `ELBSecurityPolicy-TLS13-1-2-2021-06`.
+### 3.3 Anti-leak Controls
 
-### 4.3 Quản lý Khoá (Key Management)
+- **CI/CD Scanning**: Gitleaks được tích hợp vào pipeline GitHub Actions, chặn merge các PR nếu phát hiện các thông tin xác thực ở dạng plain-text hoặc các API key.
+- **VPC Endpoint Restriction**: Các chính sách (policies) trên Secrets Manager VPC Endpoints giới hạn quyền truy cập chỉ cho phép từ dải mạng CIDR của VPC quản trị CDO.
+- **Log Redaction**: Toàn bộ nhật ký hoạt động đầu ra của ứng dụng được chạy qua bộ lọc regex để che giấu các thông tin nhạy cảm, thay thế các API keys, tokens, và các header authorization bằng nhãn `[REDACTED]`.
 
-1. **Xoay vòng CMK**: Tính năng tự động xoay vòng được bật cho tất cả các khoá tuỳ chỉnh (`tf2-finops-*-cmk`) với chu kỳ xoay vòng 1 năm do KMS quản lý.
-2. **Chính sách Khoá Đặc quyền Tối thiểu (Least Privilege Key Policies)**: Các chính sách khoá giới hạn quyền truy cập cho role thực thi cụ thể của dịch vụ. Ngay cả quản trị viên cũng bị từ chối quyền giải mã khoá, ngăn chặn việc truy cập dữ liệu ngoài luồng.
-3. **Kiểm toán KMS qua CloudTrail (KMS CloudTrail Auditing)**: Các data event của CloudTrail được bật cho khoá kiểm toán (audit key), theo dõi mọi giao dịch mã hoá, giải mã và quản lý khoá.
+## 4. Encryption
 
----
+### 4.1 At Rest
 
-## 5. Nhật ký Kiểm toán (Audit Logging)
+Toàn bộ dữ liệu của hệ thống được mã hóa tại chỗ (at rest) sử dụng Customer Managed Keys (CMKs) trong dịch vụ AWS KMS:
 
-Yêu cầu cốt lõi của CDO platform là duy trì một vết kiểm toán (audit trail) hoàn chỉnh và chống giả mạo.
+| Dữ liệu (Data) | Nơi lưu trữ (Storage) | KMS key | Ghi chú |
+|---|---|---|---|
+| Dữ liệu chi phí Raw/Curated | S3 | `aws/s3` hoặc CMK tùy chỉnh | Bật tính năng S3 Bucket Key để giảm thiểu chi phí gọi KMS API. |
+| Run State & Metadata | DynamoDB | `aws/dynamodb` hoặc CMK tùy chỉnh | Mã hóa sử dụng KMS. |
+| Secrets Store | Secrets Manager | `finops-secrets-key` | Việc giải mã yêu cầu chính sách role trust rõ ràng. |
+| Node Disk Volumes | EC2 EBS (EKS Nodes) | `finops-ebs-key` | Toàn bộ dung lượng lưu trữ của node được mã hóa. |
+| Nhật ký kiểm toán (Audit Logs) | S3 Object Lock | `finops-audit-key` | Lưu trữ tối thiểu 90 ngày với compliance lock. |
 
-### 5.1 Các thông tin cần ghi nhận (What to Log)
+### 4.2 In Transit
 
-Nền tảng ghi nhận hai loại dữ liệu riêng biệt vào các vị trí có cấu trúc:
+- **Yêu cầu TLS**: Tất cả traffic đi vào và đi ra đều yêu cầu mã hóa TLS 1.3 (với TLS 1.2 là phiên bản tối thiểu được chấp nhận). Các cipher suites yếu đều bị vô hiệu hóa trên internal ALB.
+- **Traffic nội bộ**: Giao tiếp giữa các pod trong EKS (như traffic giữa API và worker) sử dụng giao thức HTTP/2 mã hóa mTLS qua Linkerd/App Mesh (hoặc sử dụng các Kubernetes internal ClusterIP services được cấu hình TLS endpoint).
 
-#### 1. Nhật ký Nhập dữ liệu và Quyết định của AI (Ingestion and AI Decision Logs)
-Mỗi lượt chạy định kỳ ghi lại các chi tiết payload đo lường từ xa, xác thực hợp đồng mô hình, thời gian truy vấn và kết quả độ tin cậy từ AI Engine:
-- Timestamp, Run ID, Correlation ID và Phiên bản Mô hình (Model Version).
-- URI tham chiếu tập dữ liệu đã chuẩn hoá (S3 path).
-- Phân loại anomaly, Điểm tin cậy (Confidence score) và Kết quả mức độ nghiêm trọng (Severity).
-- Quyết định định tuyến hành động của CDO (các kênh Finance vs Engineering).
+### 4.3 Key Management
 
-#### 2. Vết Kiểm toán Hành động Ngăn chặn (Containment Action Audit Trail)
-Mỗi hành động dry-run, đề xuất hoặc hành động containment được phê duyệt đều tạo ra một bản ghi JSON chứa các trường schema sau:
+- **Chu kỳ xoay vòng (Rotation)**: Các khóa CMK tự động xoay vòng mỗi 365 ngày.
+- **Access Policies**: Các key policies thực thi phân tách nhiệm vụ, đảm bảo chỉ có các pipeline CI/CD mới có quyền thay đổi cấu hình key, và chỉ có các role thực thi (Lambda/EKS) mới có quyền gọi các hàm giải mã (decrypt).
+- **Kiểm toán (Audit)**: Toàn bộ lịch sử sử dụng key được theo dõi và ghi lại qua AWS CloudTrail.
 
+## 5. Audit Logging
+
+### 5.1 What to Log
+
+Mọi hành động kiểm soát do CDO platform thực hiện đều được ghi chép lại. Đối với các hành động containment, schema log sau sẽ được lưu trữ vào cơ sở dữ liệu và S3:
 ```json
 {
-  "actor": "cdo-platform-containment-worker",
-  "timestamp": "2026-06-22T14:45:00Z",
-  "correlation_id": "run-f19472e3-bc12-4d56-a789-0123456789ab",
-  "idempotency_key": "finops-watch:24h:2026-06-21:2026-06-22:global:v1",
-  "anomaly_id": "anom-987654",
-  "target_resource": "arn:aws:ec2:ap-southeast-1:999999999999:instance/i-0bcd1234ef5678a99",
-  "account_id": "999999999999",
-  "squad_owner": "squad-billing-analytics",
-  "environment": "dev",
+  "actor": "cdo-platform-orchestrator",
+  "timestamp": "2026-06-23T07:20:00Z",
+  "correlation_id": "corr-uuid-4444-5555-6666",
+  "idempotency_key": "123456789012:2026-06-22T00:00:00Z",
+  "anomaly_id": "anom-9988-7766",
+  "resource_owner": "squad-prediction-models",
+  "resource_id": "arn:aws:ec2:ap-southeast-1:123456789012:instance/i-0abcdef123456",
   "before_state": {
-    "instance_state": "running",
+    "instance_type": "g5.4xlarge",
+    "status": "running",
     "tags": {
-      "Environment": "dev",
-      "Owner": "squad-billing-analytics"
+      "Environment": "sandbox"
     }
   },
-  "proposed_action": "stop-instance",
-  "after_state": {
-    "instance_state": "stopping",
+  "proposed_after_state": {
     "tags": {
-      "Environment": "dev",
-      "Owner": "squad-billing-analytics",
-      "FinOpsContainmentAction": "ScheduledShutdown",
-      "FinOpsAnomalyId": "anom-987654"
+      "Environment": "sandbox",
+      "FinOpsWatch": "ReviewRequired",
+      "AnomalyDetected": "true"
     }
   },
-  "execution_mode": "apply",
+  "execution_mode": "dry-run",
   "rollback_path": {
-    "action": "start-instance",
-    "revert_tags": [
-      "FinOpsContainmentAction",
-      "FinOpsAnomalyId"
-    ]
+    "action": "remove_tags",
+    "keys": ["FinOpsWatch", "AnomalyDetected"]
   },
-  "approval_status": "approved_by_policy",
-  "retention_location": "s3://tf2-finops-audit-log/containment/2026/06/",
+  "approval_status": "pending_squad_response",
+  "retention_location": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/",
   "retention_period_days": 90
 }
 ```
 
-### 5.2 Lưu trữ & Thời hạn Lưu giữ (Storage & Retention)
+### 5.2 Storage + Retention
 
-Bảng dưới đây liệt kê thời hạn giữ và phương thức truy vấn cho tất cả dữ liệu kiểm toán của hệ thống:
+Nhật ký kiểm toán được lưu trữ bảo mật với các cấu hình chống ghi đè:
 
-| Danh mục Nhật ký | Vị trí Lưu trữ | Ràng buộc Lưu giữ | Giao diện Truy vấn | Kiểm soát An toàn |
-|---|---|---|---|---|
-| **Containment Audits** | S3 bucket `tf2-finops-audit-log` | **>=90 ngày** (90 ngày S3 Object Lock; chuyển sang Glacier sau 90 ngày) | Athena SQL / QuickSight Audit Tab | Chính sách bucket chỉ cho phép append, S3 Object Lock ở chế độ compliance |
-| **AI Decision Records** | DynamoDB & S3 | 90 ngày hot; 1 năm cold trong S3 | Athena SQL | Mã hoá KMS với CMK dữ liệu riêng biệt |
-| **AWS CloudTrail Logs** | S3 bucket `tf2-finops-cloudtrail` | 1 năm | Athena / CloudTrail Lake | Bật tính năng xác thực tính toàn vẹn của file log |
-| **Application Debug Logs** | CloudWatch Logs | 14 ngày | CloudWatch Logs Insights | Chính sách tự động hết hạn thời gian lưu giữ |
+| Loại Log (Log type) | Nơi lưu trữ | Retention | Giao diện truy vấn |
+|---|---|---|---|
+| Containment Audits | S3 + Object Lock | Tối thiểu 90 ngày | Athena / DynamoDB |
+| AWS API Calls | CloudTrail (S3 Raw) | 1 năm | Athena |
+| EKS Cluster Logs | CloudWatch Logs | 30 ngày | CloudWatch Logs Insights |
+| App/Lambda Logs | CloudWatch Logs | 14 ngày | CloudWatch Logs Insights |
 
-### 5.3 Xử lý Dữ liệu Cá nhân (PII Handling - Cơ bản)
+### 5.3 Synthetic Data Handling
 
-1. **Danh sách Whitelist Nghiêm ngặt**: Dữ liệu đo lường từ xa được nhập từ CUR 2.0 hoặc Cost Explorer bị giới hạn ở tên dịch vụ, resource ID, account ID, các cặp tag key-value và các metric chi phí. Không thu thập thông tin hồ sơ người dùng, payload cơ sở dữ liệu hoặc thông tin định danh cá nhân.
-2. **Scrubbing khi Nhập**: Bất kỳ giá trị tag nào chứa cấu trúc tương tự như địa chỉ email hoặc thông tin xác thực của người dùng sẽ bị lọc hoặc thay thế bằng `[REDACTED]` trong quá trình chuẩn hoá dữ liệu.
+Để tránh trộn lẫn dữ liệu hóa đơn tổng hợp (synthetic logs) với các cấu hình thực tế trong quá trình kiểm thử:
+- Toàn bộ dữ liệu synthetic cost khi inject được đánh dấu `source = "synthetic"`.
+- Bộ lọc trên dashboard QuickSight cho phép bật/tắt giữa hiển thị dữ liệu thực tế và dữ liệu giả lập.
+- Các hành động containment giả lập được định tuyến đến một mock endpoint, giữ nguyên tài nguyên AWS thực tế không bị ảnh hưởng.
 
----
+## 6. CI Security Controls
 
-## 6. Bảo mật Container & Serverless (Container & Serverless Security)
+- **Quét Image & Dependency**: Trivy được tích hợp trực tiếp vào pipeline CI/CD. Tác vụ build sẽ tự động dừng nếu container image chứa các mã lỗi bảo mật CVE mức độ `CRITICAL` hoặc `HIGH`.
+- **Chạy quyền Non-Root**: Cấu hình container bắt buộc chạy ứng dụng dưới quyền user non-root (`securityContext.runAsNonRoot: true`).
+- **Pod Security Standards**: Các namespace trong EKS được cấu hình chế độ Pod Security Admission (PSA) ở mức `restricted`, ngăn chặn các quyền leo thang đặc quyền, gắn host network, và gọi các system call không an toàn.
+- **Cô lập Spot Workload**: Các pod chạy tác vụ batch được lên lịch với node selectors, tolerations, và node affinity, đảm bảo chúng chỉ chạy trên các spot instances EC2 được chỉ định, tránh gây thiếu hụt tài nguyên cho các pod API chạy ổn định trên các on-demand nodes.
 
-CDO platform sử dụng AWS Lambda cho các tác vụ thời gian ngắn và các thực thể ECS Fargate tuỳ chọn cho bất kỳ adapter nhập dữ liệu chạy dài nào trong tương lai.
+## 7. Compliance Touchpoints
 
-- **Quét Image trên ECR (ECR Container Image Scanning)**: Các Docker image được sử dụng cho ECS Fargate hoặc containerized Lambda function được đẩy lên Amazon ECR. Kho lưu trữ ECR đã bật tính năng "Scan on Push" bằng Amazon Inspector. Bất kỳ image nào chứa lỗ hổng bảo mật (CVE) mức `HIGH` hoặc `CRITICAL` sẽ bị chặn triển khai.
-- **Cô lập Môi trường Lambda (Lambda Environment Isolation)**: Các Lambda function hoạt động với một hệ thống tệp root ở chế độ read-only. Bộ nhớ `/tmp` bị giới hạn tối đa 512 MB và các hàm tạm thời được cấu hình với giới hạn concurrency tối đa để ngăn chặn các cuộc tấn công vắt kiệt tài nguyên.
-- **Tối ưu Bảo mật Runtime cho Task (Task Runtime Hardening)**: Các task definition của ECS Fargate chạy không có quyền root (`user: nobody` hoặc một người dùng Linux không phải root) và chạy với thuộc tính `readOnlyRootFilesystem: true` để ngăn chặn giả mạo container.
+| Standard | Relevant controls (capstone scope) |
+|---|---|
+| **SOC 2 Type II** | IAM least privilege, VPC private network boundaries, Secrets Manager rotation, encrypted S3 buckets. |
+| **ISO 27001** | Báo cáo rà soát truy cập hàng tuần, nhật ký containment không thể sửa đổi, tự động xoay KMS key. |
+| **HIPAA** | Nằm ngoài phạm vi (Dữ liệu hóa đơn chi phí không chứa thông tin sức khỏe cá nhân PHI). |
 
----
+## 8. Open Questions
 
-## 7. Các Điểm chạm Tuân thủ (Compliance Touchpoints)
+- [ ] **Cross-Account KMS Strategy**: Nên sử dụng KMS key tập trung với chính sách chia sẻ chéo tài khoản, hay sử dụng KMS key cục bộ tại mỗi tài khoản đích để mã hóa S3 CUR bucket?
+- [ ] **Operator Notification Channels**: Khi một hành động containment bị từ chối, hệ thống nên gửi cảnh báo qua PagerDuty hay gửi trực tiếp về kênh Slack của đội bảo mật?
 
-Các kiểm soát được triển khai trong CDO platform trực tiếp giải quyết các khung tiêu chuẩn công nghiệp.
+## Related documents
 
-| Tiêu chuẩn Tuân thủ | Mã Kiểm soát Khung (Framework Control ID) | Triển khai Kiểm soát Bảo mật Nền tảng |
-|---|---|---|
-| **SOC2 Type II** | CC6.1 (Logical Access) | Các IAM execution role được giới hạn phạm vi, các role assume liên tài khoản và các IAM Permission Boundary. |
-| **SOC2 Type II** | CC7.2 (System Monitoring) | Các metric và cảnh báo CloudWatch được kích hoạt bởi các dashboard bị cũ (stale), lỗi API throttling và lỗi AI Engine timeout. |
-| **SOC2 Type II** | CC8.1 (Change Management) | Mã nguồn hạ tầng bất biến (immutable IaC), xác thực plan-on-PR và các lượt quét CI tự động. |
-| **GDPR** | Điều 32 (Bảo mật Xử lý) | Mã hoá hai lớp (SSE-KMS + TLS 1.3), whitelist dữ liệu và tự động xoá bỏ PII. |
-| **ISO/IEC 27001** | A.12.4.1 (Event Logging) | Bucket S3 audit được tăng cường bảo mật, chỉ cho phép append với cấu hình Object Lock 90 ngày. |
-
----
-
-## 8. Các Câu hỏi Mở (Open Questions)
-
-1. **Cơ chế Xác thực Endpoint của AI Engine**: Đội ngũ AIOps sẽ hỗ trợ xác thực chứng chỉ client (mTLS) hay dựa trên API key được quản lý bởi Secrets Manager để xác thực API Gateway?
-2. **Luồng Khôi phục Ngăn chặn Khẩn cấp (Emergency Containment Rollback Flow)**: Chúng ta có cần xây dựng một nút UI rollback thủ công cho người dùng Finance không, hay việc rollback sẽ được kích hoạt bằng CLI chạy bởi các DevOps operator?
-
----
-
-## Các tài liệu liên quan (Related Documents)
-
-- [02_infra_design_vi.md](file:///E:/code-folder/xbrain_projects/capstone_phase2_main/tf2-finops-docs/docs/tf2-finops/02_infra_design_vi.md) - Thiết kế hạ tầng và cấu hình VPC.
-- [04_deployment_design_vi.md](file:///E:/code-folder/xbrain_projects/capstone_phase2_main/tf2-finops-docs/docs/tf2-finops/04_deployment_design_vi.md) - Quét bảo mật trong pipeline CI/CD và xác thực mã nguồn tĩnh.
-- [08_adrs_vi.md](file:///E:/code-folder/xbrain_projects/capstone_phase2_main/tf2-finops-docs/docs/tf2-finops/08_adrs_vi.md) - Các quyết định kiến trúc liên quan đến an toàn ngăn chặn (containment safety) và thời gian giữ nhật ký kiểm toán.
+- [`02_infra_design_vi.md`](02_infra_design_vi.md) - Thiết kế kiến trúc, layout VPC, và managed node groups.
+- [`04_deployment_design_vi.md`](04_deployment_design_vi.md) - Pipeline CI/CD, cơ chế GitOps, và chu kỳ xoay Secrets.

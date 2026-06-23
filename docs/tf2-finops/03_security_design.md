@@ -1,385 +1,265 @@
-# Security Design - TF2 FinOps Watch CDO06 Platform
+# Security Design - Task Force 2 · FinOps Watch CDO
+
+<!-- Doc owner: CDO Team
+     Status: Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
+-->
 
 ## 1. Network Security
 
-The TF2 FinOps Watch CDO control plane operates in a serverless, batch-driven network architecture in `ap-southeast-1`. Rather than exposing open public APIs, the platform uses private networking, Gateway/Interface VPC Endpoints, and managed NAT Gateways to execute its scheduled 24h cadence workflows.
-
 ### 1.1 Network Diagram
 
-The diagram below shows the VPC configuration, private subnets, security groups, and VPC Endpoints that isolate the data lakehouse, Step Functions orchestration, and Lambda workers from the public internet. It also highlights the outbound connection to the AIOps-owned AI Engine endpoint via the NAT Gateway.
+The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications and external model endpoint calls occur privately using AWS VPC Endpoints.
 
 ```mermaid
-flowchart TB
-    subgraph VPC["AWS VPC tf2-finops (10.0.0.0/16)"]
-        subgraph PublicSubnet["Public Subnets (ap-southeast-1a/b)"]
-            NAT["NAT Gateways (EIP)"]
+graph TD
+    subgraph "CDO Management Account VPC (ap-southeast-1)"
+        subgraph "Private Subnets (EKS & Core Logic)"
+            subgraph "EKS Cluster"
+                API_P[ai-engine-api Pods]
+                WRK_P[ai-engine-worker Pods]
+                ESO_P[External Secrets Pods]
+            end
+            L_Pull[Ingestion Lambda]
+            L_Cont[Containment Lambda]
+            ALB[Internal Application Load Balancer]
         end
 
-        subgraph PrivateSubnetApp["Private Subnets - Orchestration & Workers (10.0.1.0/24)"]
-            Lambda["CDO Lambda Workers (Pull, Normalization, Routing, Containment)"]
-            SFN["Step Functions Orchestrator"]
-        end
-
-        subgraph PrivateSubnetData["Private Subnets - Data Lakehouse (10.0.2.0/24)"]
-            Athena["Athena Query Engines"]
-            DDB["DynamoDB Tables (Run state, Anomaly Index, Audit Trail)"]
-        end
-
-        subgraph VPCEndpoints["VPC PrivateLink Endpoints"]
-            VPCE_S3["Gateway Endpoint for S3"]
-            VPCE_DDB["Gateway Endpoint for DynamoDB"]
-            VPCE_KMS["Interface Endpoint for KMS (KMS CMK)"]
-            VPCE_SM["Interface Endpoint for Secrets Manager"]
-            VPCE_ATHENA["Interface Endpoint for Athena"]
+        subgraph "VPC Endpoint Subnet"
+            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR]
         end
     end
 
-    subgraph AIOpsBoundary["AIOps-owned AI Engine Boundary"]
-        AI_Engine["AI Engine API / Queue Contract"]
+    subgraph "External Cloud Environment"
+        S3Raw[(S3 Raw Zone)]
+        S3Cur[(S3 Curated Zone)]
+        DDB[(DynamoDB Run State)]
+        SM[Secrets Manager]
     end
 
-    SFN --> Lambda
-    Lambda --> VPCE_S3 --> S3_Lakehouse["S3 Data Lake (Raw/Curated/Audit)"]
-    Lambda --> VPCE_DDB --> DDB
-    Lambda --> VPCE_KMS
-    Lambda --> VPCE_SM
-    Lambda --> VPCE_ATHENA --> Athena
-    Lambda --> NAT --> AI_Engine
+    %% Network flows
+    L_Pull -->|VPC Endpoint HTTPS| VPCE
+    VPCE -->|Private link| S3Raw
+    L_Cont -->|VPC Endpoint HTTPS| VPCE
+    VPCE -->|Private link| DDB
+    
+    %% EKS traffic
+    ALB -->|HTTPS Port 8443| API_P
+    API_P -->|gRPC/REST| WRK_P
+    ESO_P -->|VPC Endpoint HTTPS| VPCE
+    VPCE -->|Fetch API Key| SM
 ```
+
+*Caption: The EKS cluster, load balancer, and orchestration Lambda functions are deployed within private-only subnets. They utilize dedicated AWS VPC Interface Endpoints (Privatelink) to connect to AWS services, preventing data transmission over the public internet.*
 
 ### 1.2 Security Groups
 
-Traffic flows are restricted using security groups configured on resources attached to the subnets. Because the CDO platform runs serverless components (Lambda and Athena queries) rather than persistent EC2 or EKS clusters, security groups are applied to VPC-connected Lambda functions and VPC interface endpoints.
+Traffic between compute components is regulated using stateful security groups enforcing the principle of least privilege:
 
-| Security Group Name | Inbound Rules | Outbound Rules | Attached To |
+| SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `tf2-finops-lambda-sg` | None | `HTTPS (443)` to VPC Endpoints; `HTTPS (443)` to NAT Gateway (for AI Engine) | All VPC-connected CDO Lambda functions |
-| `tf2-finops-vpce-sg` | `HTTPS (443)` from `tf2-finops-lambda-sg` | None | VPC Interface Endpoints (KMS, Secrets Manager, Athena) |
-| `tf2-finops-athena-sg` | `HTTPS (443)` from `tf2-finops-lambda-sg` | None | Athena query execution groups |
+| `alb-sg` | TCP 443 (from Step Functions / Lambda Client) | TCP 8443 (to `eks-node-sg`) | internal ALB |
+| `eks-cluster-sg` | TCP 443 (from CI/CD runner and bastion hosts) | TCP 10250, TCP 53 (to Node groups) | EKS Control Plane |
+| `eks-node-sg` | TCP 10250 (from Control Plane), TCP 8443 (from `alb-sg`), TCP/UDP 53 (DNS) | TCP 443 (to `vpce-sg`), TCP 10250, TCP/UDP 53 | EKS managed node groups (On-Demand & Spot) |
+| `lambda-sg` | None | TCP 443 (to `vpce-sg`), TCP 443 (to `alb-sg`) | Lambda functions |
+| `vpce-sg` | TCP 443 (from `eks-node-sg` and `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr) |
 
-### 1.3 Network ACL / VPC Endpoints
+### 1.3 Network ACL / VPC Endpoint
 
-To keep all internal data, credentials, and encryption key traffic within the AWS private backbone, network traffic does not route over the public internet except for the outbound calls to the external AIOps AI Engine API. 
+VPC interface endpoints are configured with private DNS enabled, routing all traffic to:
+- `com.amazonaws.ap-southeast-1.s3` (Gateway Endpoint)
+- `com.amazonaws.ap-southeast-1.dynamodb` (Gateway Endpoint)
+- `com.amazonaws.ap-southeast-1.secretsmanager` (Interface Endpoint)
+- `com.amazonaws.ap-southeast-1.ecr.api` (Interface Endpoint)
+- `com.amazonaws.ap-southeast-1.ecr.dkr` (Interface Endpoint)
+- `com.amazonaws.ap-southeast-1.logs` (Interface Endpoint - CloudWatch logs)
 
-- **S3 Gateway Endpoint**: Routing table entries in the private subnets redirect traffic destined for the CDO Lakehouse buckets directly to S3.
-- **DynamoDB Gateway Endpoint**: Resolves traffic to the run-state, idempotency, and anomaly DynamoDB tables privately.
-- **Secrets Manager Interface Endpoint (`com.amazonaws.ap-southeast-1.secretsmanager`)**: Resolves API calls to fetch synthetic credentials and API keys inside the VPC.
-- **KMS Interface Endpoint (`com.amazonaws.ap-southeast-1.kms`)**: Resolves key operations (encrypt, decrypt, generate data key) for CMKs.
-- **Athena Interface Endpoint (`com.amazonaws.ap-southeast-1.athena`)**: Secures internal analytics queries performed by the dashboard data connector.
-
----
+Network policies are deployed in the EKS cluster to restrict pod-to-pod communications (e.g., blocking `ai-engine-worker` pods on spot nodes from initiating connections to anything other than the `ai-engine-api` pods).
 
 ## 2. IAM & Access Control
 
-Identity and Access Management (IAM) is structured around least-privilege service roles and environment-aware containment permissions. 
-
 ### 2.1 Service Roles
 
-The CDO platform enforces separation of duties between workflow orchestration, data normalization, AI engine integration, and containment action execution.
+AWS IAM service roles enforce strict separation. Crucially, no service role has administrative permissions or access to destructive functions on production environments:
 
-#### 1. CDO Platform Execution Role (`tf2-finops-cdo-workflow-role`)
-Used by the Step Functions state machine. It is allowed to trigger and monitor CDO Lambda functions, read and update DynamoDB run-state records, and log execution metrics.
-
-#### 2. CDO AI Client Role (`tf2-finops-ai-client-role`)
-Used by the Lambda function that invokes the AIOps-owned AI Engine. It has permissions to read normalized cost files from S3, fetch the AI Engine API key from Secrets Manager, and write anomaly records to DynamoDB.
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "ReadNormalizedCostData",
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject"
-            ],
-            "Resource": "arn:aws:s3:::tf2-finops-lakehouse/cost/curated/*"
-        },
-        {
-            "Sid": "RetrieveAIEngineApiKey",
-            "Effect": "Allow",
-            "Action": [
-                "secretsmanager:GetSecretValue"
-            ],
-            "Resource": "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tf2-finops/ai-engine/api-key-*"
-        },
-        {
-            "Sid": "WriteAnomalyRecords",
-            "Effect": "Allow",
-            "Action": [
-                "dynamodb:PutItem",
-                "dynamodb:UpdateItem"
-            ],
-            "Resource": "arn:aws:dynamodb:ap-southeast-1:123456789012:table/tf2-finops-anomaly-records"
-        }
-    ]
-}
-```
-
-#### 3. CDO Containment Worker Role (`tf2-finops-containment-role`)
-Used by the Lambda function that applies containment policies. This role has access to retrieve anomaly data and write audit records, but it must assume environment-specific roles in member accounts to trigger containment actions.
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "ReadAuditAndAnomalyMetadata",
-            "Effect": "Allow",
-            "Action": [
-                "dynamodb:GetItem",
-                "dynamodb:UpdateItem",
-                "s3:PutObject"
-            ],
-            "Resource": [
-                "arn:aws:dynamodb:ap-southeast-1:123456789012:table/tf2-finops-anomaly-records",
-                "arn:aws:s3:::tf2-finops-audit-log/*"
-            ]
-        },
-        {
-            "Sid": "AssumeScopedContainmentRoles",
-            "Effect": "Allow",
-            "Action": "sts:AssumeRole",
-            "Resource": [
-                "arn:aws:iam::*:role/tf2-finops-member-containment-role"
-            ]
-        }
-    ]
-}
-```
-
-### 2.2 Hard Security Boundary (Deny Policy)
-
-To satisfy the client's absolute hard security requirements, the CDO platform attaches an IAM Permission Boundary or a Service Control Policy (SCP) to all automation roles. 
+| Role | Used by | Permissions |
+|---|---|---|
+| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
+| `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (on target account CUR S3 bucket), `s3:PutObject` (on raw S3 bucket), `ce:GetCostAndUsage` |
+| `EksClusterRole` | EKS Control Plane | Standard `AmazonEKSClusterPolicy` and `AmazonEKSVPCResourceController` |
+| `EksNodeGroupRole` | EC2 Node Instances | `AmazonEKSWorkerNodePolicy`, `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy` |
+| `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Explicit deny for `iam:*`, `s3:Delete*`, and prod resource termination. |
 
 > [!IMPORTANT]
-> **Hard production safety boundary**: `NEVER terminate prod, delete data, or modify IAM`. Under no circumstances will the CDO system terminate running production resources, delete persistent data stores, or modify IAM policy scopes.
+> **Hard Security Boundary**: Every CDO execution role has an attached Service Control Policy (SCP) ensuring it can **NEVER terminate prod, delete data, or modify IAM**. Production containment tasks are strictly restricted to tag, suggest, or dry-run audits.
 
-The following policy snippet is attached as an explicit Deny boundary to the containment worker role and all assumed cross-account roles:
+### 2.2 K8s RBAC & IRSA (IAM Roles for Service Accounts)
 
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "DenyUnsafeActions",
-            "Effect": "Deny",
-            "Action": [
-                "iam:*",
-                "organizations:*",
-                "ec2:TerminateInstances",
-                "rds:DeleteDBInstance",
-                "rds:DeleteDBCluster",
-                "s3:DeleteBucket",
-                "s3:DeleteObject",
-                "dynamodb:DeleteTable",
-                "dynamodb:DeleteBackup"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
+Kubernetes Access Control is mapped to AWS IAM using **IAM Roles for Service Accounts (IRSA)**. Pods assume specific IAM roles via OIDC federation rather than inheriting permissions from host EC2 instances.
 
-### 2.3 Cross-Account Access Pattern
+- **K8s Service Accounts & Roles**:
+  - `ai-engine-api-sa`: Federated to `FinOpsAiApiIamRole` with read-only S3 access to fetch model artifacts.
+  - `ai-engine-worker-sa`: Federated to `FinOpsAiWorkerIamRole` with read-write access to S3 checkpoint and output buckets.
+  - `external-secrets-sa`: Federated to `FinOpsSecretsReaderIamRole` with access only to the model configuration secret in Secrets Manager.
 
-The CDO platform resides in a central FinOps Security/Management account. Member accounts are accessed using AWS Security Token Service (STS) cross-account role assumption:
+- **RBAC Mapping**:
 
-1. **Read-only Cost and Metadata Access**: The cost puller and normalization worker assume a read-only role (`tf2-finops-member-read-role`) in member accounts. This allows them to list resource tags and read instance types for right-sizing recommendations.
-2. **Environment-Aware Containment Access**: The containment worker assumes `tf2-finops-member-containment-role` in the target account. This role's permissions are tightly scoped depending on the environment tags of the resources in that account:
+| Role / ClusterRole | Subject (Service Account) | Namespace | Verbs | Resources |
+|---|---|---|---|---|
+| `ai-api-role` | `ai-engine-api-sa` | `ai-inference` | `get`, `list`, `watch` | `pods`, `services` |
+| `job-runner-role` | `ai-engine-api-sa` | `ai-batch-jobs` | `create`, `get`, `list`, `watch`, `delete` | `jobs`, `cronjobs` |
+| `eso-role` | `external-secrets-sa` | `kube-system` | `get`, `list`, `create`, `update` | `secrets` |
 
-| Target Environment | Authorized Containment Actions | Denied Actions (Hard Block) |
-|---|---|---|
-| **Production** (`prod`) | `ec2:CreateTags` (Tag for review), Suggest recommendations | Terminate, Delete, Modify IAM, Stop instance, Quota cap |
-| **Staging** (`staging`) | `ec2:CreateTags`, Dry-run schedule shutdown, Dry-run quota cap | Terminate, Delete, Modify IAM, Direct instance stopping |
-| **Development** (`dev`) | `ec2:CreateTags`, `ec2:StopInstances` (Scheduled shutdown), Apply pre-defined Quota cap | Terminate, Delete, Modify IAM, Direct data deletion |
-| **Sandbox** (`sandbox`) | `ec2:CreateTags`, `ec2:StopInstances` (Scheduled shutdown), Apply pre-defined Quota cap | Terminate, Delete, Modify IAM, Direct data deletion |
+### 2.3 Cross-account Access
 
-All cross-account API calls are executed with a `correlation_id` passed via session tags to ensure they can be tracked in member account CloudTrail trails.
-
----
+Cross-account access to member account CUR buckets is governed by target account S3 bucket policies allowing read access to the centralized `FinOpsCURPullerRole` using External IDs.
+Containment actions in member accounts are triggered via cross-account IAM Role Assumption (`AssumeRole`). The management account `LambdaContainment` role assumes `FinOpsContainmentWorkerRole` in the target account, executing tag additions or scaling down sandbox ASGs.
 
 ## 3. Secrets Management
-
-Credentials and keys must never be hardcoded or checked into source control.
 
 ### 3.1 Secrets Inventory
 
 The following secrets are stored in AWS Secrets Manager:
 
-| Secret Name | Storage / ARN | Rotation Cadence | Accessed By | Description |
-|---|---|---|---|---|
-| `tf2-finops/ai-engine/api-key` | Secrets Manager | Manual (rotated on key expiration) | `tf2-finops-ai-client-role` | API key to authenticate requests against AIOps AI Engine |
-| `tf2-finops/platform/db-conn` | Secrets Manager | 30 days automatic rotation | Data normalization workers | Metadata or data warehouse credentials (when using external databases) |
-| `tf2-finops/platform/webhook` | Secrets Manager | Manual (annual check) | Alert routing Lambda | Ingress/Egress authentication keys for Slack webhooks and SNS HTTP endpoints |
+| Secret | Storage | Rotation | Accessed by |
+|---|---|---|---|
+| `finops/ai-engine/api-key` | AWS Secrets Manager (KMS CMK encrypted) | 30 days automatic | `ai-engine-api` pod (via External Secrets Operator) |
+| `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | QuickSight dataset engine / Athena crawler |
+| `finops/alerting/slack-webhook` | AWS Secrets Manager | 90 days manual | `LambdaAlertRouting` |
 
-### 3.2 Injection Pattern
+### 3.2 Inject Pattern
 
-For AWS Lambda execution, secrets are retrieved dynamically at runtime using the **AWS Secrets Manager Lambda Layer (Caching Client)**. 
-
-- Lambda code requests secrets from `localhost:2773` to retrieve cached secrets.
-- This reduces API call counts, avoids hitting Secrets Manager throttling limits, and ensures that secrets are only stored in transient container memory.
-- ECS Fargate tasks load secrets via task definition parameters using the `valueFrom` statement, ensuring credentials are never stored in plain text in container images or environment definitions:
-
+We use the **External Secrets Operator (ESO)** in EKS to sync secrets from AWS Secrets Manager into Kubernetes native Secrets. The secrets are mounted as read-only files within tmpfs volumes in the containers.
 ```yaml
-secrets:
-  - name: AI_ENGINE_API_KEY
-    valueFrom: "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:tf2-finops/ai-engine/api-key-abcde:api_key::"
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: ai-engine-api-key
+  namespace: ai-inference
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager-store
+    kind: SecretStore
+  target:
+    name: k8s-ai-api-key
+    creationPolicy: Owner
+  data:
+    - secretKey: api-key
+      remoteRef:
+        key: finops/ai-engine/api-key
+        property: apiKey
 ```
+For Lambda functions, secrets are resolved during function cold-starts, cached in the `/tmp` memory directory, and validated with cache TTL policies to avoid direct API invocation overhead.
 
-### 3.3 Anti-Leak Controls
+### 3.3 Anti-leak Controls
 
-1. **Pre-commit Scan Hook**: Developers must use local pre-commit hooks configured with `Gitleaks` or `TruffleHog` to scan code blocks for passwords, private keys, or API tokens.
-2. **CI Pipeline Secret Scan**: The CI/CD runner scans the repository on every pull request. If a secret is detected, the run immediately fails.
-3. **Application Log Redaction**: CDO logging utilities employ regex patterns to intercept and scrub sensitive data from structured JSON logs before writing them to CloudWatch:
-   - Pattern `Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*` is replaced with `[REDACTED]`.
-   - Pattern `(?i)password|api_key|token\s*:\s*"[^"]*"` is masked.
-
----
+- **CI/CD Scanning**: Gitleaks is integrated into GitHub Actions pipelines, blocking PR merges if plain-text credentials or key headers are detected.
+- **VPC Endpoint Restriction**: Secrets Manager VPC Endpoints enforce policies restricting access to only the CDO management VPC CIDR.
+- **Log Redaction**: Outbound application logs are passed through a regex-based masking filter, replacing API keys, tokens, and authorization headers with `[REDACTED]`.
 
 ## 4. Encryption
 
-All data stored within the CDO platform or moving across the network is protected by industry-standard encryption protocols.
+### 4.1 At Rest
 
-### 4.1 Encryption at Rest
+All platform data is encrypted at rest using Customer Managed Keys (CMKs) in AWS KMS:
 
-The data lakehouse and metadata catalogs use customer managed keys (CMK) configured in KMS rather than default AWS-managed keys.
-
-| Data Component | Storage Medium | KMS Key / Type | Safety Controls |
+| Data | Storage | KMS key | Notes |
 |---|---|---|---|
-| **Audit Logs** | S3 bucket `tf2-finops-audit` | `tf2-finops-audit-cmk` (CMK) | Object Lock enabled (Compliance mode, 90 days retention) |
-| **Cost Raw Zone** | S3 bucket `tf2-finops-lakehouse` | `tf2-finops-data-cmk` (CMK) | SSE-KMS, Bucket policy enforcing encryption |
-| **Cost Curated Zone**| S3 bucket `tf2-finops-lakehouse` | `tf2-finops-data-cmk` (CMK) | SSE-KMS, Bucket policy enforcing encryption |
-| **Operational Metadata**| DynamoDB Tables | `tf2-finops-ddb-cmk` (CMK) | Table-level encryption using CMK |
-| **Lambda Storage** | `/tmp` and Deployment package | AWS-managed key | Default KMS execution key |
+| Raw/Curated Cost Data | S3 | `aws/s3` or custom CMK | S3 Bucket Key enabled to reduce KMS API costs. |
+| Run State & Metadata | DynamoDB | `aws/dynamodb` or custom CMK | Encrypted using KMS. |
+| Secrets Store | Secrets Manager | `finops-secrets-key` | Decryption requires role trust. |
+| Node Disk Volumes | EC2 EBS (EKS Nodes) | `finops-ebs-key` | All node storage volumes are encrypted. |
+| Audit Trail Logs | S3 Object Lock | `finops-audit-key` | Retained for 90 days with compliance lock. |
 
-### 4.2 Encryption in Transit
+### 4.2 In Transit
 
-All data transmissions must use TLS 1.2 or TLS 1.3:
-
-1. **VPC Endpoints**: Connections to KMS, Secrets Manager, S3, and DynamoDB are enforced via VPC gateway and interface routing, meaning traffic never routes through the public internet.
-2. **Outbound to AI Engine**: All HTTP calls from the CDO AI client to the AI Engine endpoint must use HTTPS. Standard TLS verification is enforced; self-signed certificates are rejected.
-3. **Internal Data Services**: Athena data connections and QuickSight dashboard integration enforce HTTPS with the cipher policy `ELBSecurityPolicy-TLS13-1-2-2021-06`.
+- **TLS Requirements**: All ingress and egress traffic requires TLS 1.3 (with TLS 1.2 as a minimum fallback). Weak ciphers are disabled on the internal ALB.
+- **Internal Service Traffic**: EKS pod-to-pod communications for API-to-worker traffic use HTTP/2 with mTLS via Linkerd/App Mesh (or Kubernetes internal ClusterIP services mapped to TLS endpoints).
 
 ### 4.3 Key Management
 
-1. **CMK Rotation**: Automatic rotation is enabled for all custom keys (`tf2-finops-*-cmk`) with a 1-year rotation cycle managed by KMS.
-2. **Least Privilege Key Policies**: Key policies restrict access to the specific execution role of the service. Even administrators are denied key decryption permissions, preventing out-of-band data access.
-3. **KMS CloudTrail Auditing**: CloudTrail data events are enabled for the audit key, tracking every encrypt, decrypt, and key management transaction.
-
----
+- **Rotation**: CMK keys rotate automatically every 365 days.
+- **Access Policies**: Key policies enforce separation of duties, ensuring only the deployment pipelines can modify key settings, and only execution roles (Lambda/EKS) can call decrypt operations.
+- **Audit**: All key usage is monitored and logged in AWS CloudTrail.
 
 ## 5. Audit Logging
 
-A core requirement of the CDO platform is maintaining a complete, tampering-resistant audit trail.
-
 ### 5.1 What to Log
 
-The platform logs two distinct types of data to structured locations:
-
-#### 1. Ingestion and AI Decision Logs
-Every batch run records telemetry payload details, model contract verification, query times, and AI Engine confidence outputs:
-- Timestamp, Run ID, Correlation ID, and Model Version.
-- Normalized dataset reference URI (S3 path).
-- Anomaly classification, Confidence score, and Severity output.
-- CDO action routing decisions (Finance vs Engineering routes).
-
-#### 2. Containment Action Audit Trail
-Every dry-run, suggestion, or approved containment action generates a JSON record containing the following schema fields:
-
+Every action taken by the CDO platform is documented. For containment actions, the following schema is logged to the centralized database and S3:
 ```json
 {
-  "actor": "cdo-platform-containment-worker",
-  "timestamp": "2026-06-22T14:45:00Z",
-  "correlation_id": "run-f19472e3-bc12-4d56-a789-0123456789ab",
-  "idempotency_key": "finops-watch:24h:2026-06-21:2026-06-22:global:v1",
-  "anomaly_id": "anom-987654",
-  "target_resource": "arn:aws:ec2:ap-southeast-1:999999999999:instance/i-0bcd1234ef5678a99",
-  "account_id": "999999999999",
-  "squad_owner": "squad-billing-analytics",
-  "environment": "dev",
+  "actor": "cdo-platform-orchestrator",
+  "timestamp": "2026-06-23T07:20:00Z",
+  "correlation_id": "corr-uuid-4444-5555-6666",
+  "idempotency_key": "123456789012:2026-06-22T00:00:00Z",
+  "anomaly_id": "anom-9988-7766",
+  "resource_owner": "squad-prediction-models",
+  "resource_id": "arn:aws:ec2:ap-southeast-1:123456789012:instance/i-0abcdef123456",
   "before_state": {
-    "instance_state": "running",
+    "instance_type": "g5.4xlarge",
+    "status": "running",
     "tags": {
-      "Environment": "dev",
-      "Owner": "squad-billing-analytics"
+      "Environment": "sandbox"
     }
   },
-  "proposed_action": "stop-instance",
-  "after_state": {
-    "instance_state": "stopping",
+  "proposed_after_state": {
     "tags": {
-      "Environment": "dev",
-      "Owner": "squad-billing-analytics",
-      "FinOpsContainmentAction": "ScheduledShutdown",
-      "FinOpsAnomalyId": "anom-987654"
+      "Environment": "sandbox",
+      "FinOpsWatch": "ReviewRequired",
+      "AnomalyDetected": "true"
     }
   },
-  "execution_mode": "apply",
+  "execution_mode": "dry-run",
   "rollback_path": {
-    "action": "start-instance",
-    "revert_tags": [
-      "FinOpsContainmentAction",
-      "FinOpsAnomalyId"
-    ]
+    "action": "remove_tags",
+    "keys": ["FinOpsWatch", "AnomalyDetected"]
   },
-  "approval_status": "approved_by_policy",
-  "retention_location": "s3://tf2-finops-audit-log/containment/2026/06/",
+  "approval_status": "pending_squad_response",
+  "retention_location": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/",
   "retention_period_days": 90
 }
 ```
 
-### 5.2 Storage & Retention
+### 5.2 Storage + Retention
 
-The following table lists the retention and query patterns for all platform audit data:
+Audit logs are stored securely with immutable controls:
 
-| Log Category | Storage Location | Retention Constraint | Query Interface | Safety Controls |
-|---|---|---|---|---|
-| **Containment Audits** | S3 bucket `tf2-finops-audit-log` | **>=90 days** (90-day S3 Object Lock; transition to Glacier after 90 days) | Athena SQL / QuickSight Audit Tab | Append-only bucket policy, S3 Object Lock in compliance mode |
-| **AI Decision Records** | DynamoDB & S3 | 90 days hot; 1 year cold in S3 | Athena SQL | KMS encryption with separate data CMK |
-| **AWS CloudTrail Logs**| S3 bucket `tf2-finops-cloudtrail` | 1 year | Athena / CloudTrail Lake | Log file integrity validation enabled |
-| **Application Debug Logs**| CloudWatch Logs | 14 days | CloudWatch Logs Insights | Automatic retention expiry policy |
+| Log type | Storage | Retention | Query interface |
+|---|---|---|---|
+| Containment Audits | S3 + Object Lock | 90 days minimum | Athena / DynamoDB |
+| AWS API Calls | CloudTrail (S3 Raw) | 1 year | Athena |
+| EKS Cluster Logs | CloudWatch Logs | 30 days | CloudWatch Logs Insights |
+| App/Lambda Logs | CloudWatch Logs | 14 days | CloudWatch Logs Insights |
 
-### 5.3 PII Handling (Basic)
+### 5.3 Synthetic Data Handling
 
-1. **Strict Whitelisting**: Telemetry data ingested from CUR 2.0 or Cost Explorer is restricted to service names, resource IDs, account IDs, tag key-values, and cost metrics. No user profiles, database payloads, or personal identifiers are ingested.
-2. **Ingress Scrubbing**: Any tag value containing structured patterns resembling email addresses or user credentials is filtered or replaced by `[REDACTED]` during data normalization.
+To prevent mixing synthetic anomaly logs with real account settings during testing:
+- Synthetic cost injections are marked with `source = "synthetic"`.
+- QuickSight dashboard filters allow toggling between real and synthetic data displays.
+- Synthetic containment actions are routed to a mock target endpoint, leaving real AWS resources untouched.
 
----
+## 6. CI Security Controls
 
-## 6. Container & Serverless Security
-
-The CDO platform uses AWS Lambda for short-duration tasks and optional ECS Fargate instances for any future long-running ingestion adapters.
-
-- **ECR Container Image Scanning**: Docker images used for ECS Fargate or containerized Lambda functions are pushed to Amazon ECR. The ECR registry has "Scan on Push" enabled using Amazon Inspector. Any image containing a `HIGH` or `CRITICAL` vulnerability (CVE) is blocked from deployment.
-- **Lambda Environment Isolation**: Lambda functions operate with a read-only root filesystem. The `/tmp` storage is restricted to a maximum of 512 MB, and transient functions are configured with a maximum concurrency limit to prevent resource exhaustion attacks.
-- **Task Runtime Hardening**: ECS Fargate task definitions run without root privileges (`user: nobody` or a non-root Linux user) and run with `readOnlyRootFilesystem: true` to prevent container tampering.
-
----
+- **Image & Dependency Scanning**: Trivy is integrated into the CI/CD pipeline. Build actions fail automatically if container images contain `CRITICAL` or `HIGH` severity CVEs.
+- **Non-Root Execution**: Container configurations enforce running workloads as a non-root user (`securityContext.runAsNonRoot: true`).
+- **Pod Security Standards**: EKS namespaces are configured with Pod Security Admission (PSA) set to `restricted` mode, preventing privileged escalations, host network binding, and unsafe system calls.
+- **Spot Workload Isolation**: Worker pods running batch tasks are scheduled with node selectors, tolerations, and node affinity rules, ensuring they compile and compute exclusively on designated spot node instances, avoiding resource starvation on stable service nodes.
 
 ## 7. Compliance Touchpoints
 
-The controls implemented in the CDO platform directly address industry standard frameworks.
-
-| Compliance Standard | Framework Control ID | Platform Security Control Implementation |
-|---|---|---|
-| **SOC2 Type II** | CC6.1 (Logical Access) | Scoped IAM execution roles, cross-account assume roles, and IAM Permission Boundaries. |
-| **SOC2 Type II** | CC7.2 (System Monitoring) | CloudWatch metrics and alarms triggered by stale dashboards, API throttling, and AI Engine timeouts. |
-| **SOC2 Type II** | CC8.1 (Change Management) | Immutable infrastructure code, plan-on-PR validation, and automated CI scans. |
-| **GDPR** | Article 32 (Security of Processing)| Dual-layer encryption (SSE-KMS + TLS 1.3), data whitelisting, and auto-redaction of PII. |
-| **ISO/IEC 27001** | A.12.4.1 (Event Logging) | Hardened, append-only S3 audit bucket with 90-day Object Lock configuration. |
-
----
+| Standard | Relevant controls (capstone scope) |
+|---|---|
+| **SOC 2 Type II** | Least privilege IAM roles, VPC private network boundaries, Secrets Manager rotation, encrypted S3 buckets. |
+| **ISO 27001** | Weekly access audit reports, immutable containment logs, automatic key rotation. |
+| **HIPAA** | Out of scope (Cost billing data contains no Protected Health Information). |
 
 ## 8. Open Questions
 
-1. **AI Engine Endpoint Authentication Scheme**: Will the AIOps team support client certificate validation (mTLS) or rely on Secrets Manager-managed API keys for API Gateway authentication?
-2. **Emergency Containment Rollback Flow**: Do we need to build a manual rollback UI button for Finance users, or should rollbacks be initiated using CLI triggers run by DevOps operators?
+- [ ] **Cross-Account KMS Strategy**: Should we use a centralized KMS key with cross-account access, or local target account keys for CUR S3 bucket encryption?
+- [ ] **Operator Notification Channels**: When a containment action is denied, should the platform escalate alerts via PagerDuty or direct Slack webhook notifications?
 
----
+## Related documents
 
-## Related Documents
-
-- [02_infra_design.md](file:///E:/code-folder/xbrain_projects/capstone_phase2_main/tf2-finops-docs/docs/tf2-finops/02_infra_design.md) - Infrastructure layout and VPC configuration.
-- [04_deployment_design.md](file:///E:/code-folder/xbrain_projects/capstone_phase2_main/tf2-finops-docs/docs/tf2-finops/04_deployment_design.md) - CI/CD pipeline scans and static code verification.
-- [08_adrs.md](file:///E:/code-folder/xbrain_projects/capstone_phase2_main/tf2-finops-docs/docs/tf2-finops/08_adrs.md) - Architectural decisions regarding containment safety and audit log retention.
+- [`02_infra_design.md`](02_infra_design.md) - Architecture design, VPC layout, and managed node groups.
+- [`04_deployment_design.md`](04_deployment_design.md) - CI/CD pipeline, GitOps orchestration, and secret rotation gates.
