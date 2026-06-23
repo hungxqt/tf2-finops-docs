@@ -8,7 +8,95 @@
 
 The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with an AIOps-owned AI Engine hosted on a managed EKS cluster. The EKS compute tier uses a hybrid configuration of on-demand and spot node groups to optimize execution costs.
 
-To make the architecture easy to digest, it is broken down into a high-level overview followed by three detailed zoom-in views of each sub-system.
+```mermaid
+graph TB
+    subgraph "AWS Member Accounts"
+        MemberS3[CUR S3 Export Buckets]
+        MemberCE[Cost Explorer API Endpoints]
+    end
+
+    subgraph "CDO Management Account VPC (ap-southeast-1)"
+        subgraph "Ingestion & Orchestration"
+            EB[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+            SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
+            SF -->|Evaluate Run| LambdaState[State Lambda]
+            SF -->|Trigger Containment| LambdaCont[Containment Lambda]
+            SF -->|Route Alerts| LambdaAlert[Alert Routing Lambda]
+        end
+
+        subgraph "Data Lakehouse Tier"
+            S3Raw[(S3 Raw Zone)]
+            S3Cur[(S3 Curated Zone)]
+            GlueCat[Glue Data Catalog]
+            Athena[Athena Query Engine]
+        end
+
+        subgraph "Private Subnets (EKS Cluster)"
+            subgraph "EKS Control Plane"
+                ControlPlane[Kubernetes Control Plane]
+            end
+            
+            subgraph "On-Demand Node Group"
+                API_P[ai-engine-api Pods]
+                EXP_P[ai-engine-explainer Pods]
+                ESO_P[External Secrets Pods]
+                Core_P[Core CDO Platform Pods]
+            end
+
+            subgraph "Spot Node Group"
+                WRK_P[ai-engine-worker Pods]
+                Batch_J[Batch Scoring Jobs]
+                Train_J[Model Retraining Jobs]
+            end
+
+            InternalALB[Internal ALB]
+        end
+
+        subgraph "Database Store"
+            DDB[(DynamoDB Run State & Audit)]
+        end
+    end
+
+    subgraph "Alerting & Presentation"
+        Slack[Slack Notification Engine]
+        Email[SES Email Target]
+        QuickSight[QuickSight Finance Dashboard]
+    end
+
+    %% Ingestion flows
+    LambdaPull -->|Fetch Cost Data| MemberCE
+    LambdaPull -->|Pull CUR Files| MemberS3
+    LambdaPull -->|Write raw cost| S3Raw
+
+    %% Transformation flows
+    S3Raw -->|Partition/Schema Validation| S3Cur
+    GlueCat -->|Catalog schemas| S3Cur
+    Athena -->|Query data| S3Cur
+
+    %% Orchestration & Database interactions
+    LambdaState -->|Idempotency key check & write state| DDB
+    LambdaCont -->|Write immutable audit trail| DDB
+    LambdaCont -->|Assume role & tag/suggest/shutdown| MemberAccounts[Member Accounts Resources]
+    LambdaAlert -->|Route alert payload| Slack
+    LambdaAlert -->|Route alert payload| Email
+
+    %% AI Engine Integration
+    SF -->|Detect Request via Internal ALB| InternalALB
+    InternalALB -->|Route Ingress| API_P
+    API_P -->|Coordinate batch scoring| WRK_P
+    WRK_P -->|Process logs| Batch_J
+    Batch_J -->|Read/Write features| S3Cur
+    
+    %% Dashboard presentation
+    QuickSight -->|Direct query without SQL| Athena
+    QuickSight -->|Read materialized runs| DDB
+```
+
+*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR and Cost Explorer data to S3, and catalogs it. The workflow requests anomaly detection from the AIOps-owned AI Engine via the EKS internal ALB. The EKS cluster isolates stable APIs on an on-demand node group and batch-scoring/training tasks on a cost-optimized spot node group. Dashboard views and containment workflows pull clean state from Athena and DynamoDB.*
+
+---
+
+To provide a clearer view of the CDO platform's operations, the overall architecture is broken down into a high-level overview followed by three detailed zoom-in diagrams below:
 
 ### 1.1 High-Level Architecture Overview
 

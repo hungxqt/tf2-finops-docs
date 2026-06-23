@@ -8,7 +8,95 @@
 
 Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) để thu thập và phân tích dữ liệu chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với AI Engine do nhóm AIOps sở hữu được lưu trữ trên cụm EKS được quản lý. Lớp tính toán EKS sử dụng cấu hình lai (hybrid) giữa các nhóm nút on-demand và spot để tối ưu hóa chi phí thực thi.
 
-Để kiến trúc dễ tiếp cận hơn, sơ đồ được chia nhỏ thành một sơ đồ tổng quan mức cao, tiếp nối bởi ba sơ đồ chi tiết đi sâu vào từng phân hệ.
+```mermaid
+graph TB
+    subgraph "AWS Member Accounts"
+        MemberS3[CUR S3 Export Buckets]
+        MemberCE[Cost Explorer API Endpoints]
+    end
+
+    subgraph "CDO Management Account VPC (ap-southeast-1)"
+        subgraph "Ingestion & Orchestration"
+            EB[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+            SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
+            SF -->|Evaluate Run| LambdaState[State Lambda]
+            SF -->|Trigger Containment| LambdaCont[Containment Lambda]
+            SF -->|Route Alerts| LambdaAlert[Alert Routing Lambda]
+        end
+
+        subgraph "Data Lakehouse Tier"
+            S3Raw[(S3 Raw Zone)]
+            S3Cur[(S3 Curated Zone)]
+            GlueCat[Glue Data Catalog]
+            Athena[Athena Query Engine]
+        end
+
+        subgraph "Private Subnets (EKS Cluster)"
+            subgraph "EKS Control Plane"
+                ControlPlane[Kubernetes Control Plane]
+            end
+            
+            subgraph "On-Demand Node Group"
+                API_P[ai-engine-api Pods]
+                EXP_P[ai-engine-explainer Pods]
+                ESO_P[External Secrets Pods]
+                Core_P[Core CDO Platform Pods]
+            end
+
+            subgraph "Spot Node Group"
+                WRK_P[ai-engine-worker Pods]
+                Batch_J[Batch Scoring Jobs]
+                Train_J[Model Retraining Jobs]
+            end
+
+            InternalALB[Internal ALB]
+        end
+
+        subgraph "Database Store"
+            DDB[(DynamoDB Run State & Audit)]
+        end
+    end
+
+    subgraph "Alerting & Presentation"
+        Slack[Slack Notification Engine]
+        Email[SES Email Target]
+        QuickSight[QuickSight Finance Dashboard]
+    end
+
+    %% Ingestion flows
+    LambdaPull -->|Fetch Cost Data| MemberCE
+    LambdaPull -->|Pull CUR Files| MemberS3
+    LambdaPull -->|Write raw cost| S3Raw
+
+    %% Transformation flows
+    S3Raw -->|Partition/Schema Validation| S3Cur
+    GlueCat -->|Catalog schemas| S3Cur
+    Athena -->|Query data| S3Cur
+
+    %% Orchestration & Database interactions
+    LambdaState -->|Idempotency key check & write state| DDB
+    LambdaCont -->|Write immutable audit trail| DDB
+    LambdaCont -->|Assume role & tag/suggest/shutdown| MemberAccounts[Member Accounts Resources]
+    LambdaAlert -->|Route alert payload| Slack
+    LambdaAlert -->|Route alert payload| Email
+
+    %% AI Engine Integration
+    SF -->|Detect Request via Internal ALB| InternalALB
+    InternalALB -->|Route Ingress| API_P
+    API_P -->|Coordinate batch scoring| WRK_P
+    WRK_P -->|Process logs| Batch_J
+    Batch_J -->|Read/Write features| S3Cur
+    
+    %% Dashboard presentation
+    QuickSight -->|Direct query without SQL| Athena
+    QuickSight -->|Read materialized runs| DDB
+```
+
+*Chú thích: Quy trình CDO được kích hoạt hàng ngày bởi EventBridge Scheduler. Luồng Step Functions điều phối việc thu thập dữ liệu từ các tài khoản thành viên (member accounts), ghi dữ liệu CUR và Cost Explorer thô vào S3, rồi thực hiện phân mục (catalog). Luồng này gửi yêu cầu phát hiện bất thường tới AI Engine (do AIOps sở hữu) thông qua internal ALB của EKS. EKS cluster cô lập các API ổn định trên một on-demand node group và các tác vụ tính toán batch scoring hoặc training trên một spot node group tối ưu chi phí. Các chế độ xem bảng điều khiển (dashboard) và luồng xử lý containment lấy trạng thái sạch từ Athena và DynamoDB.*
+
+---
+
+Để kiến trúc dễ tiếp cận hơn, sơ đồ được chia nhỏ thành một sơ đồ tổng quan mức cao, tiếp nối bởi ba sơ đồ chi tiết đi sâu vào từng phân hệ như bên dưới:
 
 ### 1.1 Tổng quan Kiến trúc ở Mức Cao (High-Level Architecture Overview)
 
