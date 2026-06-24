@@ -10,7 +10,7 @@
 
 The CDO platform uses a dual-layer deployment strategy to separate infrastructure provisioning from application workload deployments.
 1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, EKS cluster, node groups, DynamoDB, S3, IAM roles).
-2. **Workload Layer (Kubernetes & Applications)**: Deployed using **Helm (v3)** and **GitOps (ArgoCD)** for application states within EKS, and native zip deployment zip files for Lambda functions.
+2. **Workload Layer (Kubernetes & Applications)**: Deployed using **Helm (v3)** and **GitOps (ArgoCD)** for application states within EKS, and native zip deployment files for Lambda functions.
 
 Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda wrappers, DynamoDB tables, IAM roles, EKS control plane, managed node groups, ECR repositories, IRSA/OIDC foundations, internal load-balancer prerequisites, and secrets plumbing. Runtime Kubernetes desired state is managed through the GitOps layer, so application manifests and Helm values can move independently from infrastructure modules while still depending on Terraform outputs.
 
@@ -42,8 +42,10 @@ The module boundary is intentionally service-oriented rather than team-oriented.
 - **GitOps Ingestion**: Plan outputs are generated on PR (`plan-on-PR`) and apply jobs consume reviewed plan artifacts instead of recomputing unreviewed changes.
 - **State Access**: CI roles can read/write only the state key for the target environment. Developers can run local validation, but staging and prod applies must be executed by CI with OIDC and environment controls.
 
-### 2.1 CI/CD Pipeline
+## 2. CI/CD pipeline
 
+### 2.1 Pipeline stages
+
 The CI/CD pipeline is implemented with **GitHub Actions** as the delivery control plane for the CDO infrastructure. It is not part of the runtime FinOps data path, but it controls how the infrastructure components in this design are validated, provisioned, updated, and verified.
 
 The pipeline manages infrastructure and platform changes for:
@@ -117,7 +119,14 @@ The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 
 A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, EKS workloads become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
 
+### 2.2 Branch strategy
 
+- `feature/*`: Dedicated branches for features. PR target: `develop`; validation only, no cloud apply.
+- `develop`: Sandbox integration branch. Pushes to `develop` can auto-apply to sandbox after checks pass.
+- `main`: Staging branch. Merges from `develop` into `main` trigger staging deployment and full integration validation.
+- `prod`: Production release path. Production apply is never automatic; it uses GitHub environment approval, reviewed plan artifacts, and prod-safe containment settings.
+
+
 ## 3. Deployment gates
 
 ### 3.1 Security scans
