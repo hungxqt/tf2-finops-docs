@@ -4,9 +4,13 @@
      Status: Final (W11 T6 Pack #1) -> Updated (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Ranh giới Bảo mật**: Mọi hành động containment được thực thi bởi hạ tầng này phải tuân thủ nghiêm ngặt ranh giới cứng: **NEVER terminate prod, delete data, hoặc modify IAM**.
+
+
 ## 1. Sơ đồ kiến trúc (Architecture diagram)
 
-Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) để thu thập và phân tích dữ liệu chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với một endpoint AI Engine của Task Force dùng chung được lưu trữ một lần duy nhất trên cụm ECS được quản lý (`tf-2-aiops-cluster`). Lớp tính toán ECS sử dụng cấu hình lai (hybrid) giữa các Fargate always-on capacity provider tasks và Fargate Spot capacity provider tasks để tối ưu hóa chi phí thực thi. Endpoint dùng chung này được truy cập qua `https://ai-engine.tf-2.internal/` với xác thực IAM SigV4.
+Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) để thu thập và phân tích dữ liệu chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với một endpoint AI Engine của Task Force dùng chung bằng cách sử dụng các hình ảnh container AWS Lambda. Lớp tính toán serverless sử dụng các hàm Lambda chạy trong các subnet riêng tư, tích hợp phía sau Private REST API Gateway. Mô hình hàng đợi bất đồng bộ sử dụng SQS/DLQ tách biệt khối lượng công việc suy luận nặng để tránh bị timeout trên API. Endpoint riêng tư được truy cập nội bộ qua `https://ai-engine.tf-2.internal/` (thông qua Private API Gateway với VPC Endpoints) bằng xác thực IAM SigV4.
 
 Kiến trúc này được định cỡ xoay quanh các trách nhiệm lặp lại của nền tảng CDO, chứ không xoay quanh bộ dữ liệu huấn luyện mô hình của AIOps. CDO phải kéo dữ liệu thanh toán một cách đáng tin cậy từ các nguồn AWS được phê duyệt, chuẩn hóa nó thành dạng sẵn sàng cho hợp đồng, gọi AI Engine do AIOps sở hữu và lưu giữ bằng chứng quyết định được trả về. Mọi bộ dữ liệu lịch sử tổng hợp được sử dụng để huấn luyện, nâng cao hoặc backtest mô hình đều thuộc sở hữu của AIOps. Telemetry thu thập để gửi sang AI Engine phát hiện bất thường là dữ liệu chi phí CUR-only (quét phân vùng S3 CUR và API Cost Explorer) và loại bỏ hoàn toàn các metric hiệu năng CloudWatch (CPU, memory, database connections) vốn chỉ dành riêng cho việc giám sát vận hành của CDO (cảnh báo, logging, metrics, dashboard).
 
@@ -33,29 +37,27 @@ graph TB
             Athena[Athena Query Engine]
         end
 
-        subgraph "Private Subnets (ECS Cluster)"
-            subgraph "ECS Cluster Services"
-                ControlPlane[ECS Control Plane]
-            end
+        subgraph "Private Subnets (Serverless API & Queue)"
+            APIGW[Private REST API Gateway]
             
-            subgraph "Fargate Always-On Capacity Provider"
-                API_P[AI Engine API Tasks]
-                EXP_P[ai-engine-explainer Tasks]
-                SecretsMap[ECS Task Definition Secrets Mapping]
-                Core_P[Core CDO Platform Tasks]
+            subgraph "API Lambda Endpoint"
+                AILambdaAPI[AI Engine API Lambda]
             end
 
-            subgraph "Fargate Spot Capacity Provider"
-                WRK_P[AI Engine Worker Tasks]
-                Batch_J[Batch Scoring Tasks]
-                Train_J[Model Retraining Tasks]
+            subgraph "SQS Buffer"
+                SQSQueue[SQS Ingest Queue]
+                SQSDLQ[SQS Dead Letter Queue]
             end
 
-            InternalALB[Internal ALB]
+            subgraph "Worker Lambda Executor"
+                AILambdaWorker[AI Engine Worker Lambda]
+            end
+
+            VPCEndpoints[Private VPC Endpoints: S3, DDB, ECR, KMS, Logs, STS, Secrets]
         end
 
         subgraph "Database Store"
-            DDB[(DynamoDB Run State & Audit)]
+            DDB[(DynamoDB Run State, Audit & Results)]
         end
     end
 
@@ -84,11 +86,17 @@ graph TB
     LambdaAlert -->|Route alert payload| Email
 
     %% AI Engine Integration
-    SF -->|Detect Request via Internal ALB| InternalALB
-    InternalALB -->|Route Ingress| API_P
-    API_P -->|Coordinate batch scoring| WRK_P
-    WRK_P -->|Process logs| Batch_J
-    Batch_J -->|Read/Write features| S3Cur
+    SF -->|1. POST /v1/detect| APIGW
+    APIGW -->|2. Route Ingress| AILambdaAPI
+    AILambdaAPI -->|3. Queue detection job| SQSQueue
+    AILambdaAPI -->|4. Return 202 Accepted| SF
+    SQSQueue -->|5. Trigger worker| AILambdaWorker
+    SQSQueue -.->|Error fallback| SQSDLQ
+    AILambdaWorker -->|6. Read/Write features| S3Cur
+    AILambdaWorker -->|7. Write results| DDB
+    SF -->|8. Poll GET /v1/detect/result/{id}| APIGW
+    APIGW -->|9. Route status request| AILambdaAPI
+    AILambdaAPI -->|10. Query results| DDB
     
     %% Dashboard presentation
     CloudFront -->|Serve Static Files & JSON| FinanceUsers[Finance Users]
@@ -97,7 +105,7 @@ graph TB
     SF -->|Write run summaries| DDB
 ```
 
-*Chú thích: Quy trình CDO được kích hoạt hàng ngày bởi EventBridge Scheduler. Luồng Step Functions điều phối việc thu thập dữ liệu từ các tài khoản thành viên (member accounts), ghi dữ liệu CUR và Cost Explorer thô vào S3, rồi thực hiện phân mục (catalog). Luồng này gửi yêu cầu phát hiện bất thường tới AI Engine (do AIOps sở hữu) thông qua internal ALB của ECS. Cụm ECS cô lập các API ổn định trên các Fargate always-on capacity provider tasks và các tác vụ tính toán batch scoring hoặc training trên các Fargate Spot capacity provider tasks tối ưu chi phí. Các chế độ xem bảng điều khiển (dashboard) và luồng xử lý containment lấy trạng thái sạch từ các bản tóm tắt được tính toán trước trong S3 và DynamoDB.*
+*Chú thích: Quy trình CDO được kích hoạt hàng ngày bởi EventBridge Scheduler. Luồng Step Functions điều phối việc thu thập dữ liệu từ các tài khoản thành viên (member accounts), ghi dữ liệu CUR và Cost Explorer thô vào S3, rồi thực hiện phân mục (catalog). Luồng này gửi yêu cầu phát hiện bất thường tới AI Engine (do AIOps sở hữu) thông qua Private REST API Gateway, định tuyến đến hàm AI Engine API Lambda container. Hàm API Lambda đẩy tác vụ phát hiện vào hàng đợi SQS và trả về trạng thái 202 Accepted cùng audit_id. Hàm AI Engine Worker Lambda container xử lý bất đồng bộ công việc từ hàng đợi SQS, chạy suy luận mô hình và ghi kết quả vào DynamoDB. Luồng Step Functions thực hiện polling kết quả, sau đó kích hoạt cảnh báo và containment. Các chế độ xem bảng điều khiển (dashboard) và luồng xử lý containment lấy trạng thái sạch từ các bản tóm tắt được tính toán trước trong S3 và DynamoDB.*
 
 ---
 
@@ -105,7 +113,7 @@ graph TB
 
 ### 1.1 Tổng quan Kiến trúc ở Mức Cao (High-Level Architecture Overview)
 
-Sơ đồ này thể hiện các tương tác vĩ mô ở mức cao giữa bộ điều phối trung tâm, phân hệ hồ dữ liệu (lakehouse), cụm tính toán ECS và động cơ cảnh báo/containment.
+Sơ đồ này thể hiện các tương tác vĩ mô ở mức cao giữa bộ điều phối trung tâm, phân hệ hồ dữ liệu (lakehouse), Private API Gateway kèm tính toán Lambda Container, và động cơ cảnh báo/containment.
 
 ```mermaid
 graph TD
@@ -116,8 +124,8 @@ graph TD
     subgraph "CDO Management Account"
         SF[Step Functions Orchestrator] -->|1. Pull Data| Lakehouse[(S3 Lakehouse & Athena)]
         Lakehouse -->|2. Ingested Cost Data| SF
-        SF -->|3. Invoke AI Inference| ECS[ECS Cluster: AI Engine]
-        ECS -->|4. Anomaly Decision| SF
+        SF -->|3. Invoke AI Inference| APIGW[Private API Gateway & Lambda Container]
+        APIGW -->|4. Anomaly Decision| SF
         SF -->|5. Contain & Alert| Actions[Alerting & Containment Engine]
     end
 
@@ -125,7 +133,7 @@ graph TD
     Actions -->|7. Publish| Dashboard[Finance Dashboard / Channels]
 ```
 
-*Chú thích: Bộ điều phối trung tâm Step Functions Orchestrator vận hành toàn bộ vòng lặp FinOps: trích xuất dữ liệu vào Lakehouse, gọi ECS-hosted AI Engine để lấy quyết định bất thường và kích hoạt các luồng cảnh báo cũng như containment dựa trên kết quả.*
+*Chú thích: Bộ điều phối trung tâm Step Functions Orchestrator vận hành toàn bộ vòng lặp FinOps: trích xuất dữ liệu vào Lakehouse, gọi AI Engine được lưu trữ dưới dạng Lambda container qua Private API Gateway để lấy quyết định bất thường và kích hoạt các luồng cảnh báo cũng như containment dựa trên kết quả.*
 
 Về mặt vận hành, Step Functions là ranh giới kiểm soát giữa logic CDO mang tính xác định và đầu ra AI mang tính xác suất. Mỗi quá trình chuyển đổi trạng thái đều ghi lại `run_id`, cửa sổ chi phí, phạm vi tài khoản và phiên bản hợp đồng để Finance có thể truy vết một bất thường trên dashboard về đúng lô thu thập dữ liệu và quyết định của AI. Thiết kế này cũng ngăn AI Engine tác động trực tiếp đến các tài khoản thành viên; tất cả các hành động cảnh báo và containment đều được điều phối thông qua các worker chính sách của CDO.
 
@@ -162,9 +170,9 @@ graph TB
 
 Workflow thu thập chuẩn hóa hai dạng dữ liệu thanh toán vận hành trước khi gọi AI Engine. CUR cung cấp các trường ở cấp độ tài nguyên như account ID, product code, resource ID, unblended cost và các thẻ tài nguyên. Cost Explorer cung cấp các trường tổng hợp như linked account, service name, service code, region, unblended cost và trạng thái estimated/final. Lớp curated lưu trữ cả trường mã dịch vụ đã chuẩn hóa và tên hiển thị để CDO có thể chuyển các payload nhất quán tới AIOps và xây dựng các chế độ xem dashboard mà không cần sở hữu dữ liệu huấn luyện mô hình.
 
-### 1.3 Nền tảng Lưu trữ AI Engine trên ECS (AI Engine ECS Hosting Platform)
+### 1.3 Nền tảng Lưu trữ AI Engine trên Lambda Container (AI Engine Lambda Container Hosting Platform)
 
-Sơ đồ này chi tiết về bố cục của cụm ECS, minh họa việc cô lập các tác vụ API ổn định (Always-On) khỏi các tác vụ xử lý theo lô và huấn luyện lại mô hình (Spot).
+Sơ đồ này đi sâu vào kiến trúc AWS Lambda container, mô tả Private REST API Gateway, API Lambda, cơ chế hàng đợi SQS và Worker Lambda thực thi suy luận bất đồng bộ.
 
 ```mermaid
 graph TB
@@ -176,19 +184,24 @@ graph TB
         CuratedS3[(S3 Curated Zone)]
     end
 
-    subgraph "ECS Cluster ap-southeast-1"
-        ALB[Internal ALB]
+    subgraph "Database Store"
+        DDB[(DynamoDB Run State & Results)]
+    end
+
+    subgraph "Private Serverless Compute & Queues"
+        APIGW[Private REST API Gateway]
         
-        subgraph "Fargate Always-On Capacity Provider"
-            API[AI Engine API Tasks]
-            EXP[ai-engine-explainer Tasks]
-            Core[Core Platform Tasks & Secrets Mapping]
+        subgraph "API Ingress & Control"
+            API[AI Engine API Lambda Function]
         end
 
-        subgraph "Fargate Spot Capacity Provider"
-            Worker[AI Engine Worker Tasks]
-            Batch[Batch Scoring Tasks]
-            Train[Model Retraining Tasks]
+        subgraph "Asynchronous Messaging"
+            SQS[SQS Ingest Queue]
+            DLQ[SQS Dead Letter Queue]
+        end
+
+        subgraph "Async Inference Execution"
+            Worker[AI Engine Worker Lambda Function]
         end
     end
     
@@ -198,21 +211,26 @@ graph TB
     end
 
     %% Flow
-    SF -->|1. POST /v1/detect| ALB
-    ALB -->|2. Ingress Route| API
-    API -->|3. Coordinate Job| Worker
-    Worker -->|4. Run Batch/Retrain| Batch
-    Batch -->|5. Read/Write Features| CuratedS3
-    API -->|6. Return Confidence & Explanation| SF
+    SF -->|1. POST /v1/detect| APIGW
+    APIGW -->|2. Route Ingress| API
+    API -->|3. Enqueue Job & return 202| SQS
+    SQS -->|4. Trigger Poll| Worker
+    SQS -.->|Failed retries| DLQ
+    Worker -->|5. Read/Write Features| CuratedS3
+    Worker -->|6. Write inference results| DDB
+    SF -->|7. GET /v1/detect/result/{audit_id}| APIGW
+    APIGW -->|8. Route status request| API
+    API -->|9. Query results| DDB
     
-    Core -->|native ECS Secrets mapping| SM
-    API -.->|Pull Image| ECR
-    Worker -.->|Pull Image| ECR
+    API -.->|Pull Image by Digest| ECR
+    Worker -.->|Pull Image by Digest| ECR
+    API -.->|Access SDK| SM
+    Worker -.->|Access SDK| SM
 ```
 
-*Chú thích: Yêu cầu `/v1/detect` của AI Engine từ bộ điều phối Step Functions được định tuyến qua Internal ALB đến AI Engine API Tasks chạy trên các Fargate always-on capacity provider tasks. Các tác vụ chạy theo lô nặng được điều phối trên các Fargate Spot capacity provider tasks để đọc/ghi các đặc trưng đã được lọc (curated features) từ S3. Thông tin xác thực và cấu hình được đồng bộ hóa từ Secrets Manager bằng cách sử dụng native ECS Task Definition Secrets Manager mapping.*
+*Chú thích: Yêu cầu `/v1/detect` của AI Engine từ bộ điều phối Step Functions được định tuyến qua Private REST API Gateway đến hàm AI Engine API Lambda. Hàm API Lambda xác thực yêu cầu, xếp hàng đợi vào SQS Queue và trả về 202 Accepted. Hàm Worker Lambda được kích hoạt bởi SQS để thăm dò hàng đợi, chạy batch scoring, đọc đặc trưng từ S3 và ghi kết quả trở lại DynamoDB. Bí mật API và thực thi được truy xuất bằng AWS SDK từ Secrets Manager.*
 
-Nền tảng ECS tách biệt độ tin cậy thời gian chạy khỏi việc thực thi hàng loạt (batch) hiệu quả về chi phí. AI Engine API Tasks và `ai-engine-explainer` vẫn chạy dưới dạng Fargate always-on capacity provider tasks vì Step Functions phụ thuộc vào hành vi phản hồi có thể dự đoán được trong suốt lượt chạy hàng ngày. AI Engine Worker Tasks, các tác vụ scoring theo lô, tác vụ kỹ nghệ đặc trưng và tác vụ huấn luyện lại được đặt trên các Fargate Spot capacity provider tasks vì chúng có thể lưu checkpoint vào S3 và thử lại sau khi bị gián đoạn. Sự phân biệt này là bắt buộc đối với cả việc kiểm soát chi phí và khôi phục lỗi chính xác.
+Nền tảng dựa trên Lambda tách biệt việc xử lý yêu cầu API thời gian chạy khỏi việc thực thi hàng loạt bất đồng bộ bằng hàng đợi SQS. Hàm AI Engine API Lambda xử lý việc tiếp nhận API nhanh chóng (chấp nhận các yêu cầu `/v1/detect`, tạo mã audit_id và xếp hàng đợi) và truy xuất trạng thái qua `/v1/detect/result/{audit_id}`. Hàm AI Engine Worker Lambda được kích hoạt bất đồng bộ bởi SQS để thực hiện suy luận mô hình đòi hỏi nhiều tài nguyên, lưu checkpoint tiến trình đặc trưng vào S3 và lưu trữ kết quả cuối cùng trong DynamoDB. Việc phân tách này đảm bảo khả năng phản hồi của API, cô lập mức tiêu thụ tính toán qua các giới hạn Reserved Concurrency và sử dụng tính năng thử lại SQS/DLQ để xử lý các lỗi tạm thời một cách mượt mà.
 
 ### 1.4 Động cơ Cảnh báo & Containment (Alerting & Containment Engine)
 
@@ -269,12 +287,12 @@ Các thành phần hạ tầng sau đây được triển khai tại vùng `ap-s
 | Danh mục siêu dữ liệu (Metadata Catalog) | Glue Data Catalog | Tự động đăng ký các phân vùng bảng và duy trì định nghĩa schema cho Athena. | 1 triệu đối tượng được phân mục đầu tiên là miễn phí; các lượt chạy crawler có chi phí 0,44 USD mỗi DPU-giờ. |
 | Công cụ truy vấn (Query Engine) | Amazon Athena | Cho phép chạy truy vấn SQL serverless trên các tệp S3 để xây dựng các materialized view và cung cấp dữ liệu cho bảng điều khiển. | 5,00 USD trên mỗi TB dữ liệu được quét. |
 | Cơ sở dữ liệu trạng thái & kiểm toán (State & Audit Database) | Amazon DynamoDB | Lưu trữ trạng thái chạy, các khóa idempotency, nhật ký kiểm toán containment và các materialized view của bảng điều khiển. | Dung lượng on-demand: 1,25 USD trên mỗi triệu đơn vị ghi (write unit), 0,25 USD trên mỗi triệu đơn vị đọc (read unit). |
-| Nền tảng lưu trữ AI Engine (AI Engine Hosting) | Amazon ECS | Lưu trữ AI Engine dùng chung do nhóm AIOps cung cấp (dịch vụ `ai-engine` trên cluster `tf-2-aiops-cluster`) với task size 2 vCPU và 4 GB memory, và timeout 300s. | Nền tảng điều phối ECS được AWS quản lý hoàn toàn miễn phí. |
-| Tính toán tác vụ ổn định (Stable Workload Compute) | Fargate always-on capacity provider tasks | Chạy các tác vụ ổn định, luôn bật (AI Engine API Tasks, ai-engine-explainer, giám sát, tích hợp load balancer) trên Fargate always-on capacity provider. Tự động scale qua AWS Application Auto Scaling (min 2 / max 10 tasks, kích hoạt khi CPU >70% hoặc SQS backlog >100). | Giá Fargate On-Demand (tính theo vCPU và memory mỗi giờ tại ap-southeast-1). |
-| Tính toán tác vụ theo lô (Batch Workload Compute) | Fargate Spot capacity provider tasks | Chạy các tác vụ phát hiện theo lô, kỹ nghệ đặc trưng nặng và huấn luyện/huấn luyện lại mô hình (AI Engine Worker Tasks) trên Fargate Spot capacity provider. Các tác vụ Spot có thể bị ngắt quãng, hỗ trợ lưu checkpoint và cơ chế retry/backoff. | Giá Fargate Spot tiết kiệm tới 60-70% so với Fargate on-demand tasks thông thường. |
-| Kho lưu trữ container (Container Registry) | Amazon ECR | Lưu trữ các hình ảnh container Docker được gắn phiên bản cho các mô hình của AIOps. | 0,10 USD mỗi GB/tháng (500 MB đầu tiên miễn phí). |
-| Nhà cung cấp bí mật (Secrets Provider) | Secrets Manager | Quản lý an toàn các khóa API, thông tin xác thực cơ sở dữ liệu và Slack webhook với tính năng tự động xoay vòng bí mật. | 0,40 USD mỗi bí mật/tháng + 0,05 USD cho mỗi 10.000 yêu cầu. |
-| Bộ cân bằng tải (Load Balancer) | Application Load Balancer (Internal) | Công khai dịch vụ ECS AI Engine API trong nội bộ tới các hàm Step Functions/Lambda qua các subnet riêng tư tại `https://ai-engine.tf-2.internal/` (cổng 443 HTTPS, TLS 1.3, SG-to-SG ingress; cổng 8080 `/health` check). | ~0,0225 USD mỗi LCU-giờ. |
+| AI Engine Hosting | AWS Lambda (Container Image) | Lưu trữ AI Engine dùng chung do nhóm AIOps cung cấp (các hàm API và Worker) bằng cách sử dụng các hình ảnh container được đóng gói trong ECR hỗ trợ kích thước lưu trữ lên đến 10 GB. | Chi phí chạy theo mức sử dụng thực tế: ~0,00001667 USD mỗi GB-giây. |
+| Private Ingress Endpoint | Private REST API Gateway | Công khai các endpoint API riêng tư cho các đường dẫn hợp đồng /v1/* nội bộ thông qua VPC Endpoint giao diện, sử dụng IAM SigV4 để xác thực caller. | 3,50 USD trên mỗi triệu lượt gọi API REST + chi phí truyền dữ liệu. |
+| Async Queue Buffer | Amazon SQS & DLQ | Bộ đệm cho các tác vụ detect gửi từ API Gateway để cô lập việc tính toán suy luận, tự động scale Worker Lambda, và quản lý lỗi qua hàng đợi Dead Letter Queue. | 0,40 USD trên mỗi triệu tin nhắn (1 triệu tin nhắn đầu miễn phí). |
+| Kho lưu trữ container (Container Registry) | Amazon ECR | Lưu trữ các hình ảnh container Docker được gắn phiên bản cho các mô hình của AIOps, được tham chiếu trong triển khai bằng mã băm digest hình ảnh không thay đổi. | 0,10 USD mỗi GB/tháng (500 MB đầu tiên miễn phí). |
+| Nhà cung cấp bí mật (Secrets Provider) | Secrets Manager | Quản lý an toàn các khóa API, thông tin xác thực cơ sở dữ liệu và Slack webhook, được truy cập động qua AWS SDK bên trong các hàm Lambda. | 0,40 USD mỗi bí mật/tháng + 0,05 USD cho mỗi 10.000 yêu cầu. |
+| Private VPC Traffic | VPC Endpoints | Cho phép truy cập an toàn, riêng tư vào các dịch vụ AWS (ECR, S3, DynamoDB, KMS, Logs, Secrets Manager) từ bên trong các subnet VPC riêng tư. | ~7,20 USD trên mỗi endpoint/tháng cho mỗi AZ + phí xử lý dữ liệu. |
 | Bảng điều khiển Tài chính (Finance Dashboard) | Amazon S3 + CloudFront | Bảng điều khiển web tĩnh nội bộ nhẹ được lưu trữ dưới dạng tài sản tĩnh trong Amazon S3 và phân phối qua Amazon CloudFront. Bảng điều khiển đọc các bản tóm tắt thân thiện với tài chính được tính toán trước từ các đối tượng S3 JSON hoặc bản ghi DynamoDB. | Chi phí lưu trữ S3 và phí yêu cầu HTTPS/truyền dữ liệu CloudFront (thường dưới 5 USD/tháng). QuickSight được giữ lại như một tùy chọn BI trong tương lai. |
 | Kênh cảnh báo (Alert Channels) | Amazon SNS / Slack API | Cung cấp các đường định tuyến riêng biệt cho cảnh báo (cảnh báo Tài chính qua Slack/Email, cảnh báo Kỹ thuật qua Slack/Jira). | SNS miễn phí tới 100 nghìn thông báo email/tháng; Slack API miễn phí. |
 | Tác nhân thực thi containment (Containment Worker) | AWS Lambda | Giả lập vai trò (assume role) trong các tài khoản thành viên để áp dụng nhãn (tag) hoặc tắt các tài nguyên dev/sandbox, thực thi nghiêm ngặt trong các chế độ dry-run hoặc apply. | Thanh toán theo mức sử dụng. |
@@ -287,7 +305,7 @@ Mô hình thành phần bản đồ trực tiếp tới ba hợp đồng dữ li
 | Hợp đồng | Thành phần CDO chịu trách nhiệm | Bằng chứng tối thiểu được lưu giữ |
 |---|---|---|
 | Hợp đồng kéo dữ liệu chi phí | EventBridge Scheduler, Step Functions, Ingestion Lambda, S3, Glue, Athena | URI đối tượng nguồn, cửa sổ chi phí, tài khoản, dịch vụ, vùng, tag chủ sở hữu, chi phí chưa pha trộn (unblended cost), cờ estimated/final. |
-| Hợp đồng đầu ra quyết định của AI | Internal ALB, AI Engine API Tasks, Step Functions, DynamoDB | Phiên bản mô hình, mã bất thường (anomaly ID), độ tin cậy (confidence), mức độ nghiêm trọng (severity), chi tiêu dự kiến so với thực tế, cửa sổ bằng chứng, giải thích, định tuyến được khuyến nghị. |
+| Hợp đồng đầu ra quyết định của AI | Private API Gateway, các hàm AI Engine API & Worker Lambda, Step Functions, DynamoDB | Phiên bản mô hình, mã bất thường (anomaly ID), độ tin cậy (confidence), mức độ nghiêm trọng (severity), chi tiêu dự kiến so với thực tế, cửa sổ bằng chứng, giải thích, định tuyến được khuyến nghị. |
 | Hợp đồng cảnh báo và containment | Alert Lambda, Containment Lambda, DynamoDB, nhật ký kiểm toán S3 | Mục tiêu định tuyến, yêu cầu phê duyệt, chế độ thực thi, trạng thái trước/sau, đường dẫn rollback, ID bản ghi kiểm toán. |
 
 ---
@@ -296,32 +314,32 @@ Mô hình thành phần bản đồ trực tiếp tới ba hợp đồng dữ li
 
 ### 3.1 Tại sao chọn hướng đi này? (Why this angle?)
 
-Nền tảng CDO triển khai một **kiến trúc FinOps control plane theo mô hình lakehouse-centric kết hợp điều phối serverless và hạ tầng ECS Fargate Hybrid để lưu trữ AI Engine**.
+Nền tảng CDO triển khai một **kiến trúc FinOps control plane theo mô hình lakehouse-centric kết hợp điều phối serverless và hosting hình ảnh container AWS Lambda cho AI Engine**.
 1. **Sự phù hợp của mô hình Lakehouse**: Môi trường FinOps trong sản xuất vận hành theo chu kỳ tự nhiên 24 giờ dựa trên tần suất xuất tệp CUR của AWS. Mô hình lakehouse (S3 + Glue + Athena) giúp tránh được chi phí cố định cao của các kho dữ liệu luôn bật (như Redshift) hoặc các cơ sở dữ liệu quan hệ, trong khi vẫn giữ dữ liệu chi phí lịch sử có cấu trúc đầy đủ, sẵn sàng cho việc kiểm toán và được truy vấn hiệu quả theo phân vùng.
 2. **Điều phối Serverless**: EventBridge Scheduler và Step Functions quản lý luồng xử lý theo mô hình serverless-first, giữ cho chi phí vận hành của bộ điều phối pipeline gần như bằng không.
-3. **Tính toán ECS Fargate Hybrid cho AI**: AI Engine do nhóm AIOps cung cấp chứa hai khối lượng công việc riêng biệt:
-   - Các endpoint suy luận ổn định (AI Engine API Tasks, `ai-engine-explainer`) đòi hỏi độ khả dụng cao và độ trễ thấp.
-   - Các tác vụ chạy theo lô nặng (AI Engine Worker Tasks phục vụ kỹ nghệ đặc trưng, chấm điểm theo lô và huấn luyện lại mô hình) tiêu tốn nhiều tài nguyên tính toán nhưng có thể bị ngắt quãng.
-   Việc lưu trữ AI Engine trên ECS cho phép CDO đặt các API ổn định trên các **Fargate always-on capacity provider tasks** để đảm bảo các cam kết SLO, và các worker chạy theo lô trên các **Fargate Spot capacity provider tasks**. Thiết kế này giúp giảm 60-70% chi phí tính toán cho AI. Trong môi trường ECS Fargate, chúng tôi cấu hình Capacity Providers để phân bổ công việc tự động giữa Fargate (always-on) và Fargate Spot, đạt hiệu quả tối ưu chi phí và tự động quản lý vòng đời tác vụ mà không cần quản lý hạ tầng EC2 thủ công.
+3. **Hosting Container Lambda của AWS cho AI**: AI Engine do nhóm AIOps cung cấp chia tách các tác vụ runtime thành:
+   - Các tác vụ API đồng bộ và xác minh trạng thái (được xử lý bởi API Lambda) được hiển thị qua Private REST API Gateway, đòi hỏi độ trễ thấp và thực thi nhanh chóng.
+   - Các công việc suy luận lô không đồng bộ (được xử lý bởi Worker Lambda) được kích hoạt qua SQS để bỏ qua các giới hạn về thời gian chờ của API Gateway và Lambda.
+   Việc lưu trữ AI Engine trên các hình ảnh container AWS Lambda cho phép tự động co giãn serverless, loại bỏ chi phí tính toán nhàn rỗi (không giống như các container luôn bật) và tận dụng việc ghim digest ECR để triển khai bất biến. Dung lượng tính toán và điều tiết được quản lý thông qua các giới hạn Reserved Concurrency. Việc huấn luyện, huấn luyện lại và phân tích ngoại tuyến nặng của mô hình do AIOps sở hữu vẫn nằm ngoài phạm vi runtime của CDO.
 
-Lý do thực tế điều này quan trọng là tính độc lập vận hành. AIOps có thể lặp lại logic mô hình, kỹ nghệ đặc trưng và xử lý false-positive mà không cần thay đổi workflow của CDO. CDO giữ cho lakehouse, bộ lập lịch, đường dẫn gọi API, định tuyến cảnh báo và chính sách containment luôn ổn định, trong khi AI Engine do ECS host có thể phát triển đằng sau một hợp đồng có phiên bản.
+Lý do thực tế điều này quan trọng là tính độc lập vận hành. AIOps có thể lặp lại logic mô hình, kỹ nghệ đặc trưng và xử lý false-positive mà không cần thay đổi workflow của CDO. CDO giữ cho lakehouse, bộ lập lịch, đường dẫn gọi API, định tuyến cảnh báo và chính sách containment luôn ổn định, trong khi AI Engine do Lambda container host có thể phát triển đằng sau một hợp đồng có phiên bản.
 
 ### 3.2 Các điểm vượt trội (kèm số liệu) (Strengths (with metrics))
 
-Các số liệu dưới đây nêu bật sự đánh đổi của kiến trúc lakehouse-centric và ECS Fargate Hybrid so với các phương pháp tiếp cận CDO khác:
+Các số liệu dưới đây nêu bật sự đánh đổi của kiến trúc lakehouse-centric và Lambda container so với các phương pháp tiếp cận CDO khác:
 
-| Tiêu chí | Phương án lựa chọn (Lakehouse + ECS Fargate Hybrid) | Phương án thay thế A (ECS Cluster trên EC2 + RDS Aurora) | Phương án thay thế B (Nền tảng SaaS bên thứ ba) |
+| Tiêu chí | Phương án lựa chọn (Lakehouse + Lambda Container) | Phương án thay thế A (ECS Cluster trên EC2 + RDS Aurora) | Phương án thay thế B (Nền tảng SaaS bên thứ ba) |
 |---|---|---|---|
 | **Chi phí cho mỗi lượt chạy hàng ngày (Ingest + Query)** | ~0,15 USD (Thanh toán theo lượt truy vấn S3 + Athena) | ~5,00 USD (Chi phí cố định hàng ngày của thực thể RDS) | N/A (Đã bao gồm trong phí đăng ký thuê bao) |
-| **Chi phí tính toán AI (Lưu trữ/Tháng)** | ~80 USD (ECS Fargate always-on + Fargate Spot tasks) | ~240 USD (Quản lý cụm ECS + Tự động mở rộng phiên bản Spot) | N/A |
-| **Chi phí vận hành (Giờ/Tuần)** | ~2 giờ (Quản lý Terraform ECS, cấu hình task) | ~8 giờ (Quản lý ECS cluster trên EC2 và cập nhật cấu hình Terraform ECS) | ~1 giờ (Cập nhật kết nối SaaS) |
+| **Chi phí tính toán AI (Lưu trữ/Tháng)** | ~40 USD (Thanh toán theo mức sử dụng Lambda + hàng đợi SQS) | ~240 USD (Quản lý cụm ECS + Tự động mở rộng phiên bản Spot) | N/A |
+| **Chi phí vận hành (Giờ/Tuần)** | ~1 giờ (Quản lý Terraform Lambda và API Gateway) | ~8 giờ (Quản lý ECS cluster trên EC2 và cập nhật cấu hình Terraform ECS) | ~1 giờ (Cập nhật kết nối SaaS) |
 | **Thời gian onboard tài khoản mới** | < 10 phút (Triển khai stack IAM cross-account bằng Terraform) | ~25 phút (Thiết lập schema DB thủ công + VPC peering) | > 60 phút (Thiết lập thủ công + cấu hình IAM) |
-| **Khả năng mở rộng cho huấn luyện lại** | Rất tốt (Fargate Spot task pools được scale bằng AWS Application Auto Scaling) | Rất tốt (ECS Spot task pools được scale bằng AWS Application Auto Scaling) | Kém (Không thể chạy mô hình của AIOps trên hạ tầng local) |
+| **Khả năng mở rộng cho huấn luyện lại** | N/A (Ngoại tuyến; việc huấn luyện nằm ngoài phạm vi chạy/do AIOps quản lý) | Rất tốt (ECS Spot task pools được scale bằng AWS Application Auto Scaling) | Kém (Không thể chạy mô hình của AIOps trên hạ tầng local) |
 
 ### 3.3 Các điểm yếu chấp nhận (Accepted weaknesses)
 
-- **Rủi ro gián đoạn của ECS Fargate Spot**: Việc thực thi các tác vụ huấn luyện và scoring theo lô lớn trên các Fargate Spot capacity provider tasks có rủi ro bị thu hồi tác vụ. Điều này được chấp nhận vì ECS Fargate tự động xử lý việc lập lịch lại tác vụ, và AIOps worker hỗ trợ lưu checkpoint vào S3 giúp giảm thiểu khối lượng công việc bị mất, đồng thời mang lại mức tiết kiệm chi phí 60-70%.
-- **Chi phí cho VPC Endpoints**: Định tuyến riêng tư tất cả lưu lượng trong VPC yêu cầu sử dụng các interface endpoint (Secrets Manager, ECR, CloudWatch), gây ra chi phí cố định khoảng ~7,20 USD/endpoint/tháng. Điều này được chấp nhận nhằm đáp ứng yêu cầu bảo mật nghiêm ngặt là không truyền dữ liệu chi phí và kiểm toán qua mạng internet công cộng.
+- **Lambda Cold Start và Giới hạn Concurrency**: Chạy khối lượng công việc suy luận trên các hình ảnh Lambda container có thể gây ra độ trễ khởi động lạnh (khi kéo hình ảnh container trong lần đầu khởi tạo) và rủi ro hết tài nguyên concurrency dùng chung của tài khoản. Điều này được chấp nhận vì quá trình phát hiện chạy theo lô hàng ngày (không phải thời gian thực), và concurrency của API được cô lập qua các ràng buộc Reserved Concurrency.
+- **Chi phí cho VPC Endpoints**: Định tuyến riêng tư tất cả lưu lượng trong VPC yêu cầu sử dụng các interface endpoint (ECR, S3, DynamoDB, KMS, Logs, Secrets Manager), gây ra chi phí cố định khoảng ~7,20 USD/endpoint/tháng cho mỗi AZ. Điều này được chấp nhận nhằm đáp ứng yêu cầu bảo mật nghiêm ngặt là không truyền dữ liệu chi phí và kiểm toán qua mạng internet công cộng.
 - **Độ trễ thu thập dữ liệu CUR**: Các bản xuất CUR của AWS bị trễ từ 8 đến 24 giờ. Độ trễ này được chấp nhận vì hệ thống vận hành theo chu kỳ 24 giờ, nghĩa là không yêu cầu truyền phát dữ liệu thời gian thực (real-time streaming) cho việc phát hiện bất thường hàng ngày.
 
 ---
@@ -352,12 +370,12 @@ Khi thực hiện onboard một tài khoản AWS hoặc squad mới vào nền t
 1. Add account ID and owner mapping to the Terraform 'accounts.tfvars' configuration.
 2. Terraform execution applies IAM Stack:
    - Provisions 'FinOpsCrossAccountAccessRole' in the target member account.
-   - Configures trust policy allowing the central CDO Lambda and ECS task roles to assume it.
+   - Configures trust policy allowing the central CDO Lambda and the AI Engine Lambda execution roles to assume it.
    - Updates target account CUR export configuration to deliver data to S3.
 3. Glue crawler is triggered to update partitions in the Glue Data Catalog.
 4. E2E Validation run:
    - Ingestion Lambda makes a test API call to target account Cost Explorer.
-   - Verifies connectivity to ECS internal service endpoint.
+   - Verifies connectivity to Private REST API Gateway endpoint.
 5. Account status marked as 'ACTIVE' in the DynamoDB registry.
 ```
 
@@ -373,7 +391,7 @@ Nhằm ngăn chặn việc chạy trùng lặp cho cùng một kỳ chi phí (đ
 
 Để bảo vệ AWS Cost Explorer API khỏi việc vượt quá giới hạn tần suất nghiêm ngặt **5 requests/second**, nền tảng CDO triển khai chiến lược cache dựa trên DynamoDB như mô tả trong hợp đồng telemetry:
 - **Lưu trữ Cache CDO**: Lambda Ingestion thực hiện truy vấn các chỉ số Cost Explorer hàng ngày và cache payload kết quả vào một bảng DynamoDB chuyên dụng (`cdo-cost-cache-table`) với khóa chính là `AccountID:DateRange`.
-- **AI Engine đọc dữ liệu offline**: Khi AI Engine do đội AIOps vận hành thực thi và yêu cầu dữ liệu chi phí baseline lịch sử (chẳng hạn như dữ liệu chi phí 7 ngày hoặc 30 ngày qua để trích xuất đặc trưng và phân tích bất thường), nó sẽ đọc trực tiếp các bản ghi chi phí đã cache từ DynamoDB của CDO thông qua ranh giới ALB nội bộ.
+- **AI Engine đọc dữ liệu offline**: Khi AI Engine do đội AIOps vận hành thực thi và yêu cầu dữ liệu chi phí baseline lịch sử (chẳng hạn như dữ liệu chi phí 7 ngày hoặc 30 ngày qua để trích xuất đặc trưng và phân tích bất thường), nó sẽ đọc trực tiếp các bản ghi chi phí đã cache từ DynamoDB của CDO thông qua Private REST API Gateway.
 - **Lợi ích**: Thiết kế này ngăn việc AI Engine và nhiều Lambda của nền tảng thực hiện gọi trực tiếp Cost Explorer API đồng thời, đảm bảo hệ thống luôn hoạt động dưới ngưỡng 5 requests/second và loại bỏ hoàn toàn khả năng bị AWS throttling.
 
 ### 4.6 Tuân thủ & Xác thực Thu thập Telemetry (Telemetry Ingestion Compliance & Validation)
@@ -402,9 +420,9 @@ Nền tảng CDO thực thi tất cả các kiểm soát bảo mật và xác th
 - **Phương án A**: Apache Airflow trên AWS (MWAA).
   - *Ưu điểm*: Tích hợp Python tuyệt vời, hỗ trợ cây phụ thuộc phức tạp gốc, giao diện trực quan hóa tác vụ chi tiết.
   - *Nhược điểm*: Chi phí cố định cao (tối thiểu ~350 USD/tháng), thời gian khởi động lâu (trên 20 phút), cấu hình hạ tầng phức tạp.
-- **Phương án B**: Các tác vụ theo lịch trình của ECS (ECS Scheduled Tasks).
-  - *Ưu điểm*: Chạy tự động trong cụm ECS sử dụng trình lập lịch EventBridge Scheduler.
-  - *Nhược điểm*: Khó khăn trong việc thiết lập và điều phối các workflow cross-account nhiều bước phức tạp, quản lý trạng thái chuyển giao trung gian và thực hiện các bộ xử lý lỗi so với AWS Step Functions.
+- **Phương án B**: Kích hoạt Lambda trực tiếp bằng Cron (Lambda Direct Cron Trigger).
+  - *Ưu điểm*: Đơn giản, chạy trực tiếp dưới dạng mục tiêu của EventBridge cron gọi một hàm Lambda duy nhất.
+  - *Nhược điểm*: Khó khăn trong việc thiết lập và điều phối các workflow cross-account nhiều bước phức tạp, quản lý trạng thái chuyển giao trung gian, xử lý các giới hạn timeout 15 phút của Lambda và thực hiện các bộ xử lý lỗi so với AWS Step Functions.
 - **Lựa chọn**: EventBridge Scheduler + Step Functions Standard.
   - *Lý do*: 100% serverless, không phát sinh chi phí khi không chạy, tích hợp sẵn có với AWS Lambda và DynamoDB, cùng bộ xử lý thử lại lỗi cực kỳ mạnh mẽ.
 
@@ -425,12 +443,12 @@ Nền tảng CDO thực thi tất cả các kiểm soát bảo mật và xác th
 
 Nền tảng CDO tự động mở rộng linh hoạt để xử lý lưu lượng dữ liệu và yêu cầu tính toán gia tăng:
 
-- **Tự động mở rộng ECS Task (ECS Task Autoscaling)**: Các dịch vụ AI Engine API Tasks và `ai-engine-explainer` sử dụng tính năng ECS Service Auto Scaling (sử dụng CPU target tracking 70%) để tự động scale-out nếu yêu cầu đồng thời tăng đột biến.
-- **Mở rộng năng lực ECS qua Capacity Providers**: ECS cluster sử dụng AWS Application Auto Scaling và Fargate Capacity Providers. Hệ thống tự động cấp phát và giải phóng các Fargate tasks, lập lịch đưa các tác vụ batch AI Engine Worker Tasks vào Fargate Spot capacity provider tasks và các API tasks ổn định vào Fargate always-on capacity provider tasks.
+- **Giới hạn Concurrency của Lambda**: API và Worker Lambda sử dụng các giới hạn AWS Lambda Reserved Concurrency để kiểm soát năng lực thực thi. Thiết kế này ngăn việc các cuộc gọi API runaway tiêu tốn toàn bộ tài nguyên concurrency của tài khoản, trong khi Provisioned Concurrency có thể được bật như một giải pháp tối ưu hóa sản xuất để loại bỏ độ trễ khởi động lạnh.
+- **Phân tách tải qua hàng đợi SQS (SQS Ingestion Decoupling)**: Thay vì tăng quy mô các tác vụ tính toán đồng thời để xử lý các lô dữ liệu CUR khổng lồ, hàng đợi SQS sẽ lưu trữ các tác vụ bất đồng bộ. Thiết kế này cho phép Worker Lambda xử lý các tin nhắn một cách tuần tự hoặc theo các lô có kiểm soát (ví dụ: batch size là 10), giúp tránh quá tải cơ sở dữ liệu như DynamoDB hoặc các API bên ngoài.
 - **Tối ưu hóa truy vấn Athena**: S3 bucket được phân vùng theo `account_id`, `year` và `month`. Các truy vấn Athena giới hạn quét dữ liệu trong các phân vùng cụ thể, giúp tránh nghẽn khi thực thi.
 - **Mở rộng DynamoDB**: Bảng `cdo-run-state-table` được cấu hình ở chế độ dung lượng **On-Demand Capacity Mode**, cho phép mở rộng tức thì từ không lên hàng nghìn yêu cầu đọc/ghi mà không cần can thiệp thủ công.
 
-Giả định mở rộng quy mô trong production là số lượng dòng chi tiết chi phí tăng nhanh hơn số lượng tài khoản. Do đó, phân vùng S3, giới hạn quét Athena và tự động mở rộng AI batch worker quan trọng hơn việc tăng tính đồng thời của Lambda. Kích thước bộ dữ liệu huấn luyện mô hình hoặc backtest do AIOps xử lý; CDO mở rộng quy mô thu thập vận hành, cuộc gọi API, dashboard và đường dẫn kiểm toán.
+Giả định mở rộng quy mô trong production là số lượng dòng chi tiết chi phí tăng nhanh hơn số lượng tài khoản. Do đó, phân vùng S3, giới hạn quét Athena và khả năng mở rộng quy mô của AI batch Lambda worker quan trọng hơn việc tăng tính đồng thời của Lambda. Kích thước bộ dữ liệu huấn luyện mô hình hoặc backtest do AIOps xử lý; CDO mở rộng quy mô thu thập vận hành, cuộc gọi API, dashboard và đường dẫn kiểm toán.
 
 ---
 
@@ -449,15 +467,15 @@ Bảng dưới đây trình bày các chế độ lỗi, cơ chế phát hiện 
 | **Dữ liệu bảng điều khiển bị cũ** | CloudWatch Alarm kích hoạt nếu mốc thời gian phân vùng curated mới nhất cũ hơn 26 giờ. | Cảnh báo cho kỹ sư để kiểm tra log của pipeline và kích hoạt thủ công chạy lại lượt thu thập dữ liệu hàng ngày. | 1 giờ | 24 giờ |
 | **Lỗi gửi cảnh báo** | `LambdaAlertRouting` bắt được lỗi hết thời gian kết nối hoặc mã lỗi HTTP 5xx từ Slack API. | Hàm Lambda gửi payload cảnh báo vào hàng đợi SQS Dead Letter Queue (DLQ) và thử gửi qua kênh dự phòng email SES. | 10 phút | 0 |
 | **Từ chối hành động Containment** | Việc giả lập vai trò cross-account tại tài khoản thành viên trả về lỗi `AccessDeniedException`. | **CDO fail closed**: Sự cố được ghi nhận vào bảng kiểm toán DynamoDB dưới trạng thái `DENIED`, đồng thời một cảnh báo khẩn cấp được gửi tới kênh bảo mật. | 1 giờ | 0 |
-| **Sai lệch phiên bản hợp đồng AI** | Xác thực trước khi chạy phát hiện phiên bản hợp đồng AI Engine API Tasks được triển khai khác với schema mong đợi của Step Functions. | Block lượt chạy trước khi phát hiện, đánh dấu lượt chạy là `FAILED_CONTRACT_CHECK`, thông báo cho CDO và AIOps, và không thực thi containment. | 2 giờ | 24 giờ |
-| **Gián đoạn Spot Worker** | Tác vụ ECS Task nhận được tín hiệu thu hồi hoặc ngắt quãng tác vụ Fargate Spot. | Thử lại batch job từ checkpoint S3 mới nhất trên tác vụ Fargate Spot khỏe mạnh hoặc Fargate on-demand dự phòng nếu hết cửa sổ thử lại. | 1 giờ | 0 cho công việc đã lưu checkpoint |
+| **Sai lệch phiên bản hợp đồng AI** | Xác thực trước khi chạy phát hiện phiên bản hợp đồng AI Engine API Lambda được triển khai khác với schema mong đợi của Step Functions. | Block lượt chạy trước khi phát hiện, đánh dấu lượt chạy là `FAILED_CONTRACT_CHECK`, thông báo cho CDO và AIOps, và không thực thi containment. | 2 giờ | 24 giờ |
+| **Lỗi Hàm SQS Worker Lambda** | Xử lý tin nhắn SQS thất bại, hoặc hàm worker Lambda thực thi bị timeout (giới hạn 15 phút) hoặc crash. | Hàng đợi SQS tự động thử lại dựa trên redrive policy. Nếu số lần thử lại cạn kiệt, tin nhắn được chuyển đến SQS DLQ và hệ thống gửi cảnh báo đến kỹ sư vận hành. | 1 giờ | 0 cho công việc đã lưu checkpoint |
 
 ---
 
 ## Các tài liệu liên quan (Related documents)
 
 - [`01_requirements_analysis_vi.md`](01_requirements_analysis_vi.md) - Bối cảnh doanh nghiệp, chỉ tiêu NFR và ranh giới CDO/AIOps.
-- [`03_security_design_vi.md`](03_security_design_vi.md) - Các vai trò IAM, Security Groups, các vai trò ECS Task Roles, và khóa mã hóa KMS.
+- [`03_security_design_vi.md`](03_security_design_vi.md) - Các vai trò IAM, Security Groups, các vai trò Lambda execution roles, và khóa mã hóa KMS.
 - [`04_deployment_design_vi.md`](04_deployment_design_vi.md) - Cấu hình Terraform IaC dạng mô-đun, các pipeline triển khai GitHub Actions (CI/CD).
 - [`05_cost_analysis_vi.md`](05_cost_analysis_vi.md) - Dự toán ngân sách vận hành pipeline và so sánh chu kỳ chạy.
-- [`08_adrs.md`](08_adrs.md) - Các quyết định kiến trúc liên quan đến chu kỳ chạy 24 giờ và lựa chọn ECS Fargate capacity provider.
+- [`08_adrs.md`](08_adrs.md) - Các quyết định kiến trúc liên quan đến chu kỳ chạy 24 giờ, các hình ảnh Lambda container và Private API Gateway.

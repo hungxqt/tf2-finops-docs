@@ -4,6 +4,10 @@
      Status: Refined (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: All verification procedures and test validations must confirm that the platform respects the absolute hard boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 ## 1. Test coverage
 
 The verification of the FinOps Watch CDO platform is conducted across multiple testing levels to ensure operational integrity, compliance with the AIOps-provided AI Engine contract, and safe containment behaviors.
@@ -38,14 +42,14 @@ Compliance with the contract-mandated limits from `ai-api-contract.md` §6 is me
 | Ingestion Latency (P99) | < 50 ms | POST `/v1/detect` response latency | Evidence needed: pending API integration telemetry |
 | Result Query Latency (P99) | < 10 ms | GET `/v1/detect/result/{audit_id}` response latency | Evidence needed: pending API integration telemetry |
 | LLM Inference SLA | < 30 seconds | Async inference logic run time | Evidence needed: pending API integration telemetry |
-| System Availability | >=99.5% | ALB API health check success rate | Evidence needed: pending ALB uptime statistics |
+| System Availability | >=99.5% | API Gateway health check success rate | Evidence needed: pending API Gateway uptime statistics |
 | Error Rate | < 0.5% | HTTP 5xx responses / total requests | Evidence needed: pending API integration telemetry |
 
 ### 2.2 SLO breach analysis
 
 In the event of an SLO breach, the following escalation and remediation protocols are triggered:
 - **Cost Explorer Throttling**: If the Cost Explorer API limits are exceeded, the ingestion Lambda catches the exception and retries using an exponential backoff strategy. If the run exceeds the 24-hour SLA window, the operational team is alerted via PagerDuty.
-- **AI Engine Container Startup Timeouts**: If the Fargate Spot container tasks fail to start or experience long provisioning delays during peak scaling events, the platform dynamically delegates request processing to the always-on Fargate capacity provider tasks to maintain latency SLOs.
+- **AI Engine Lambda Startup Timeouts / Cold Starts**: If the Lambda container functions fail to start or experience long cold-start delays during peak scaling events, the platform triggers alerts for Provisioned Concurrency optimizations or delegates requests back to SQS retry buffers to maintain latency SLOs.
 - **S3 / CloudFront Invalidation Delays**: If dashboard JSON updates fail to propagate due to CloudFront cache behavior, the invalidation API is automatically retried by the static site deployment pipeline.
 
 ---
@@ -78,7 +82,7 @@ The pipeline runs on a scheduled cadence (ADR-001) triggered by EventBridge Sche
 ### 4.1 AI contract
 
 The contract-based interface between the CDO platform and the AIOps-provided AI Engine is validated for strict schema adherence:
-- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` to the shared endpoint (`https://ai-engine.tf-2.internal/`) using IAM SigV4 authentication. The test verifies that the request payload is strictly CUR-only (either `RAW_JSON` or `S3_POINTER` types) and contains no CloudWatch utilization metrics.
+- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` to the Private REST API Gateway endpoint using IAM SigV4 authentication. The test verifies that the request payload is strictly CUR-only (either `RAW_JSON` or `S3_POINTER` types) and contains no CloudWatch utilization metrics.
 - **Response Format Verification**: The test validates that the AI Engine returns a response containing the required parameters: `audit_id`, `status` (`completed` | `processing` | `failed`), `anomalies_list` (containing `anomaly_metadata`, `finance_dashboard_data`, and `engineering_dashboard_data`), and `pagination` controls (`next_token` and `limit`).
 
 ### 4.2 AI Engine timeout
@@ -89,32 +93,33 @@ The contract-based interface between the CDO platform and the AIOps-provided AI 
 
 ### 4.3 Unavailable-AI fallback
 
-If the AI Engine is completely unreachable (e.g., HTTP 503 error, ALB gateway timeout, or Fargate cluster exhaustion):
+If the AI Engine is completely unreachable (e.g., HTTP 503 error, API Gateway gateway/integration timeout, or Lambda execution concurrency exhaustion):
 - **Fail Closed Behavior**: The CDO platform immediately aborts any scheduled containment action triggers. No automated policy is applied.
 - **Operator Alert**: A critical incident ticket and PagerDuty alert are routed to the central CDO engineering and finance teams.
 - **Audit Logging**: A failure record is written to the audit bucket, detailing the AI Engine's unavailability.
 
-### 4.4 ECS task configuration/placement
+### 4.4 Lambda container image pull and cold-start
 
-- **Capacity Provider Placement**: Validation scripts inspect the active ECS task deployment configuration in the target environment.
-- **Always-on Services**: Confirms that API servers, monitoring tasks, and the internal ALB are placed on always-on Fargate capacity providers to handle real-time traffic.
-- **Batch Services**: Confirms that batch processing, feature engineering, and model training tasks are assigned to Fargate Spot capacity providers.
+- **Image Pull Verification**: Validation scripts inspect the Lambda configuration to verify container image digest pinning (`image@sha256:...`) and ECR image pull permissions.
+- **Cold-Start Performance**: Measures response times during container initialization to verify they remain within the acceptable execution window.
+- **Provisioned Concurrency Test (Optional)**: If enabled, verifies that pre-warmed Lambda execution environments are allocated and successfully route requests without cold-start latency.
 
-### 4.5 Fargate Spot interruption/retry
+### 4.5 SQS/DLQ retry and redrive
 
-- **Interruption Mocking**: A simulated ECS Task Interruption Event is sent to the ECS Cluster.
-- **SQS Queue Durability**: Validates that the active batch request is not lost and is returned to the SQS queue.
-- **Task Retry**: Verifies that the task scheduler launches a replacement container and resumes processing from the last checkpoint stored in S3.
+- **Interruption Mocking**: Simulates a Lambda execution failure or timeout during worker execution.
+- **SQS Durability**: Verifies that SQS retains the message, increments the receive count, and triggers a retry worker Lambda invocation after the visibility timeout expires.
+- **DLQ Redrive**: Simulates maximum retries exhaustion and verifies that the message is safely moved to the Dead Letter Queue (DLQ) for operator analysis, writing a failure audit record.
 
-### 4.6 API availability
+### 4.6 API Gateway private endpoint connectivity
 
-- **ALB Ingress Verification**: Probes the internal ALB endpoint (`/health`) from within the private subnet.
-- **Metrics**: Response time must remain below 100 milliseconds for simple health check calls.
+- **VPC Endpoint Ingress**: Probes the Private REST API Gateway endpoint connectivity from within the private VPC subnets.
+- **Metrics & Authentication**: Response time for basic health checks must remain below 50 milliseconds using IAM SigV4 signatures.
 
-### 4.7 Autoscaling
+### 4.7 Autoscaling and concurrency controls
 
-- **Load Simulation**: High concurrency traffic is directed to the explainer endpoint.
-- **AWS Application Auto Scaling**: Verifies that CPU utilization triggers the addition of tasks up to the configured limit, and decreases task counts when the traffic load subsides.
+- **Concurrency Load Simulation**: Simulates a burst of concurrent `/v1/detect` requests.
+- **Reserved Concurrency Guardrail**: Verifies that the Lambda function respects its configured Reserved Concurrency limit to prevent throttling other critical platform services, returning proper HTTP `429` (Too Many Requests) or buffering correctly in SQS.
+- **Application Auto Scaling (Optional)**: If Provisioned Concurrency autoscaling is configured, verifies that metrics trigger the scaling of warmed executions.
 
 ### 4.8 API Result Polling & Pagination Tests
 
@@ -179,8 +184,8 @@ The containment engine must generate an audit log entry for every action attempt
 The End-to-End demo demonstrates the entire ingestion, detection, alerting, and containment sequence:
 - **Step 1 - Injection**: Synthetic unmanaged cost records (e.g., $500 spend on EC2 g5.4xlarge instances) are written to the CUR S3 bucket.
 - **Step 2 - Trigger**: EventBridge triggers the Step Functions ingestion workflow.
-- **Step 3 - API Invocation**: The ingestion workflow extracts the cost records, calls the internal ALB endpoint of the AI Engine API, and receives an anomaly classification response.
-- **Step 4 - Task Execution**: The AI Engine container task processes the features, records the anomaly in DynamoDB, and saves the detailed reasoning.
+- **Step 3 - API Invocation**: The ingestion workflow extracts the cost records, calls the Private REST API Gateway endpoint of the AI Engine API, which enqueues the request in SQS and returns a `202 Accepted` response.
+- **Step 4 - Task Execution**: The Worker Lambda container function is triggered by SQS, processes the features, records the anomaly/audit results in DynamoDB, and saves the detailed reasoning evidence.
 - **Step 5 - Dashboard Update**: Lambda aggregates the results, writes the updated JSON files to the dashboard S3 bucket, and triggers a CloudFront invalidation.
 - **Step 6 - Alert Routing**: The Alert Routing Lambda is invoked, sending a Slack notification to the `squad-prediction-models` channel and an email notification to the Finance team via SNS/SES.
 - **Step 7 - Dry-run Containment**: The CDO containment engine triggers a dry-run tag update (`FinOpsWatch: ReviewRequired`) and saves the audit record containing the rollback steps to S3.
@@ -193,12 +198,12 @@ The End-to-End demo demonstrates the entire ingestion, detection, alerting, and 
 ### 7.1 Penetration touch points
 
 - **S3 Bucket Access Control**: Probes verify that the CUR S3 bucket and the audit log S3 bucket reject all requests originating from outside the VPC endpoint policies and designated IAM roles.
-- **ECS Network Isolation**: Verifies that direct ingress requests to the AI Engine tasks from the public subnets or internet gateways are blocked by security group rules.
-- **Containment IAM Restrictions**: Verifies that the Lambda/ECS task roles used for containment actions are blocked from modifying IAM policies, deleting S3 data, or shutting down critical production workloads.
+- **API Gateway Resource Policy Isolation**: Verifies that direct ingress requests to the Private REST API Gateway from outside the VPC endpoint are blocked by resource policies and security group rules.
+- **Containment IAM Restrictions**: Verifies that the Lambda execution roles used for containment actions are blocked from modifying IAM policies, deleting S3 data, or shutting down critical production workloads.
 
 ### 7.2 Vulnerability scan
 
-- **ECR Container Scanning**: The container images are scanned during the CI/CD pipeline using AWS native scanning.
+- **ECR Container Scanning**: The Lambda container images are scanned in ECR during the CI/CD pipeline using AWS native scanning.
 - **Remediation**: The deployment is blocked if any CRITICAL or HIGH vulnerabilities are detected in the container runtime or dependencies.
 - **Audit Trails**: Security scanning logs are archived alongside the deployment pipeline history.
 
@@ -213,14 +218,14 @@ The following table summarizes the failures resolved during the testing phases:
 | No. | Failure Encountered | Root Cause | Fix / Resolution | Time to Fix (Hours) |
 |---|---|---|---|---|
 | 1 | CUR Schema Mismatch | AWS updated the billing CUR export structure, adding new columns. | Modified the Glue schema parsing config to handle dynamic schemas. | 6 |
-| 2 | ALB Health Check Timeout | AI Engine container initialization took longer than health check thresholds. | Adjusted the target group health check grace period from 30s to 90s. | 3 |
+| 2 | Lambda Cold Start Timeout | AI Engine Lambda container initialization took longer than the API Gateway timeout limit. | Configured SQS buffer to handle requests asynchronously, preventing gateway timeouts. | 3 |
 | 3 | Slack Webhook Rate Limit | Multiple duplicate anomaly alerts triggered Slack rate limiting. | Implemented alert grouping and batching in the routing Lambda. | 8 |
 
 ### 8.2 Test gaps acknowledged
 
 Due to environment constraints, the following test scenarios have not been verified with real production infrastructure:
 - **Cross-Account Ingestion Scale**: Ingestion of cost data across more than 50 concurrent AWS accounts. (Evidence needed: pending multi-account staging environment setup)
-- **Fargate Spot AWS Interruption Event Frequency**: Verification of actual Fargate Spot reclaim events under high cluster load. (Evidence needed: pending AWS Spot reclaim simulation data)
+- **Lambda Concurrency Exhaustion under Peak Load**: Verification of Lambda concurrency limits under high parallel tenant execution load. (Evidence needed: pending concurrency simulator tests)
 - **Production Containment Policy Impact**: Execution of apply-mode policy actions in a live production environment. (Evidence needed: pending compliance board approval)
 
 ---
@@ -229,4 +234,4 @@ Due to environment constraints, the following test scenarios have not been verif
 
 - [`02_infra_design.md`](02_infra_design.md) - Contains the component tables, overall architecture diagram, and network security layouts.
 - [`03_security_design.md`](03_security_design.md) - Details IAM service roles, encryption at rest, encryption in transit, and detailed audit log configurations.
-- [`08_adrs.md`](08_adrs.md) - Explains architectural decisions including 24h cadence, dry-run-first containment, and ECS hosting choices.
+- [`08_adrs.md`](08_adrs.md) - Explains architectural decisions including 24h cadence, dry-run-first containment, and Private API Gateway and Lambda hosting choices.

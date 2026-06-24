@@ -10,30 +10,29 @@
 
 CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API và các cuộc gọi API bên ngoài đều được định tuyến nội bộ qua AWS VPC Endpoints.
 
-Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Endpoint AI Engine dùng chung do AIOps cung cấp trên ECS Fargate (cluster 'tf-2-aiops-cluster') được expose nội bộ tới các nền tảng CDO (cả CDO-01 và CDO-02) dưới dạng một endpoint dịch vụ dùng chung duy nhất được truy cập tại `https://ai-engine.tf-2.internal/` thông qua xác thực IAM SigV4. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
+Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Endpoint AI Engine dùng chung do AIOps cung cấp được expose nội bộ tới các nền tảng CDO (cả CDO-01 và CDO-02) qua một Private REST API Gateway, được truy cập tại `https://ai-engine.tf-2.internal/` thông qua xác thực IAM SigV4. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
 
 ```mermaid
 graph TD
     subgraph "CDO Management Account VPC (ap-southeast-1)"
-        subgraph "Private Subnets (ECS & Core Logic)"
-            subgraph "ECS Cluster"
-                API_P[AI Engine API Tasks]
-                WRK_P[AI Engine Worker Tasks]
-            end
+        subgraph "Private Subnets (Serverless API & Queue)"
+            APIGW[Private REST API Gateway]
+            AILambdaAPI[AI Engine API Lambda]
+            AILambdaWorker[AI Engine Worker Lambda]
+            SQSQueue[SQS Queue]
             L_Pull[Ingestion Lambda]
             L_Cont[Containment Lambda]
-            ALB[Internal Application Load Balancer]
         end
 
         subgraph "VPC Endpoint Subnet"
-            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR]
+            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR, KMS, Logs, STS, Lambda, API Gateway]
         end
     end
 
     subgraph "External Cloud Environment"
         S3Raw[(S3 Raw Zone)]
         S3Cur[(S3 Curated Zone)]
-        DDB[(DynamoDB Run State)]
+        DDB[(DynamoDB Run State & Results)]
         SM[Secrets Manager]
     end
 
@@ -43,14 +42,16 @@ graph TD
     L_Cont -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| DDB
     
-    %% ECS traffic
-    ALB -->|HTTPS Port 443| API_P
-    API_P -->|gRPC/REST| WRK_P
-    API_P -->|Fetch secrets via VPCE| VPCE
-    VPCE -->|Fetch API Key| SM
+    %% Serverless traffic
+    APIGW -->|IAM SigV4 / Ingress| AILambdaAPI
+    AILambdaAPI -->|Enqueue| SQSQueue
+    SQSQueue -->|Trigger| AILambdaWorker
+    AILambdaAPI -->|Fetch secrets via SDK| VPCE
+    AILambdaWorker -->|Fetch secrets via SDK| VPCE
+    VPCE -->|Private link| SM
 ```
 
-*Caption: Cụm ECS, internal ALB, và các hàm Lambda điều phối được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (Privatelink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng. Endpoint AI Engine dùng chung trên ECS được truy cập qua `https://ai-engine.tf-2.internal/` bằng xác thực IAM SigV4.*
+*Caption: Private REST API Gateway, các hàm AI Engine API & Worker Lambda, và các hàm Lambda điều phối được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (PrivateLink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng. Endpoint AI Engine dùng chung được expose riêng tư qua API Gateway và truy cập qua `https://ai-engine.tf-2.internal/` bằng xác thực IAM SigV4.*
 
 ### 1.2 Security Groups
 
@@ -58,10 +59,9 @@ Luồng traffic giữa các thành phần compute được kiểm soát thông q
 
 | SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `alb-sg` | TCP 443 (từ Step Functions / Lambda Client) | TCP 80/443 (đến `ecs-tasks-sg`) | internal ALB |
-| `ecs-tasks-sg` | TCP 80/443 (từ `alb-sg`), TCP/UDP 53 (DNS) | TCP 443 (đến `vpce-sg`), TCP/UDP 53 | ECS Fargate tasks (always-on & Spot) |
-| `lambda-sg` | None | TCP 443 (đến `vpce-sg`), TCP 443 (đến `alb-sg`) | Lambda functions |
-| `vpce-sg` | TCP 443 (từ `ecs-tasks-sg` và `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr) |
+| `apigw-vpce-sg` | TCP 443 (từ VPC CIDR / Step Functions client) | TCP 443 (đến `lambda-sg`) | VPC endpoint cho API Gateway |
+| `lambda-sg` | TCP 443 (từ `apigw-vpce-sg`) | TCP 443 (đến `vpce-sg`) | Các hàm AI Engine API & Worker Lambda |
+| `vpce-sg` | TCP 443 (từ `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr, KMS, Logs, STS, Lambda) |
 
 ### 1.3 Network ACL / VPC Endpoint
 
@@ -72,8 +72,12 @@ Các VPC interface endpoints được cấu hình bật tính năng Private DNS,
 - `com.amazonaws.ap-southeast-1.ecr.api` (Interface Endpoint)
 - `com.amazonaws.ap-southeast-1.ecr.dkr` (Interface Endpoint)
 - `com.amazonaws.ap-southeast-1.logs` (Interface Endpoint - CloudWatch logs)
+- `com.amazonaws.ap-southeast-1.kms` (Interface Endpoint - Key Management Service)
+- `com.amazonaws.ap-southeast-1.sts` (Interface Endpoint - Security Token Service)
+- `com.amazonaws.ap-southeast-1.lambda` (Interface Endpoint - Lambda execution)
+- `com.amazonaws.ap-southeast-1.execute-api` (Interface Endpoint - API Gateway endpoint access)
 
-Security groups được triển khai trong cụm ECS để giới hạn kết nối giữa các task (ví dụ: chặn các task AI Engine Worker Tasks trên các Fargate Spot tasks khởi tạo kết nối đến bất kỳ tài nguyên nào ngoại trừ internal ALB hoặc các endpoint dịch vụ trực tiếp).
+Security groups và resource policies được triển khai để giới hạn kết nối (ví dụ: Private REST API Gateway áp dụng một resource policy chỉ cho phép truy cập từ các CDO VPC endpoints, và API Lambda chỉ chấp nhận traffic được định tuyến qua API Gateway).
 
 Các chính sách endpoint được thu hẹp phạm vi vào tập hợp hành động thực tế nhỏ nhất. S3 gateway endpoint cho phép đọc từ các tiền tố xuất CUR đã phê duyệt và chỉ ghi vào các bucket raw/curated của CDO. DynamoDB endpoint chỉ cho phép truy cập vào các bảng run-state, idempotency, kiểm toán và bảng materialized hiển thị của dashboard. Các interface endpoint dành cho Secrets Manager, ECR và CloudWatch Logs bị giới hạn trong các security group của VPC CDO và các role thực thi. Các Network ACL duy trì tính đơn giản và không trạng thái (stateless), với lượt truy cập công cộng bị từ chối và lưu lượng phản hồi tạm thời chỉ được phép trong phạm vi private subnet.
 
@@ -85,38 +89,36 @@ Các IAM service roles trong AWS thực thi sự phân tách trách nhiệm nghi
 
 | Role | Used by | Permissions |
 |---|---|---|
-| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
+| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction`, `execute-api:Invoke` (để gọi Private API Gateway) |
 | `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (trên CUR S3 bucket của tài khoản đích), `s3:PutObject` (trên raw S3 bucket), `ce:GetCostAndUsage` |
-| `FinOpsTaskExecutionRole` | ECS Agent | `ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage`, `secretsmanager:GetSecretValue` (để map container secret) |
-| `FinOpsAiApiIamRole` | AI Engine API task role | Đọc cấu hình mô hình, đọc đầu vào đặc trưng curated, ghi các chỉ số sức khỏe lệnh gọi; không có quyền truy cập tài khoản thành viên. |
-| `FinOpsAiWorkerIamRole` | AI Engine Worker task role | Đọc đầu vào đặc trưng curated và ghi đầu ra batch/checkpoint; không có thay đổi IAM và không có quyền containment trực tiếp. |
+| `FinOpsAiApiExecutionRole` | AI Engine API Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `sqs:SendMessage` (để xếp hàng các yêu cầu detect), `dynamodb:GetItem` / `dynamodb:Query` (để lấy trạng thái kết quả) |
+| `FinOpsAiWorkerExecutionRole` | AI Engine Worker Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `sqs:ReceiveMessage` / `sqs:DeleteMessage` (để thăm dò hàng đợi), `s3:GetObject` / `s3:PutObject` (đọc dữ liệu chi phí và ghi checkpoint/features), `dynamodb:PutItem` (để lưu trữ kết quả suy luận) |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Cấu hình explicit deny cho các quyền `iam:*`, `s3:Delete*`, và xóa tài nguyên prod. |
 
 > [!IMPORTANT]
 > **Ranh giới Bảo mật Cứng**: Mọi role thực thi của CDO đều đi kèm một Service Control Policy (SCP) để đảm bảo hệ thống **NEVER terminate prod, delete data, hoặc modify IAM**. Các tác vụ containment trên production chỉ giới hạn ở mức tag, suggest, hoặc dry-run kiểm toán.
 
-### 2.2 ECS Task Role & ECS Task Execution Role
+### 2.2 Lambda Execution Roles
 
-Các tác vụ ECS Fargate sử dụng hai loại IAM role riêng biệt để thực thi nguyên tắc đặc quyền tối thiểu:
-1. **ECS Task Execution Role** (`FinOpsTaskExecutionRole`): Được sử dụng bởi ECS container agent để xác thực với ECR để kéo Docker images và truy vấn Secrets Manager để phân giải các ánh xạ secret trong task definition.
-2. **ECS Task Role** (`FinOpsAiApiIamRole`, `FinOpsAiWorkerIamRole`): Được sử dụng bởi mã ứng dụng chạy trong container để thực hiện các cuộc gọi AWS API, chẳng hạn như đọc từ S3 hoặc viết số liệu vào CloudWatch, cô lập các đặc quyền container. Đội ngũ CDO sở hữu việc triển khai hạ tầng host, task execution role và task IAM role, trong khi đội AIOps cung cấp các container image được gắn phiên bản.
+Các hàm AWS Lambda sử dụng các Role thực thi (Execution Roles) để áp dụng nguyên tắc đặc quyền tối thiểu:
+1. **Lambda Execution Role** (`FinOpsAiApiExecutionRole`, `FinOpsAiWorkerExecutionRole`): Được dịch vụ Lambda sử dụng để chạy mã hàm, kéo hình ảnh container từ ECR và ghi log thực thi vào CloudWatch.
+2. **Cô lập quyền truy cập**: Mã ứng dụng chạy bên trong các hàm Lambda sử dụng các role này để truy vấn Secrets Manager (qua SDK), đọc/ghi vào dữ liệu chi phí curated trong S3, thăm dò từ hàng đợi SQS, hoặc ghi kết quả vào DynamoDB. Đội ngũ CDO sở hữu các role thực thi này như một phần của nền tảng host, trong khi đội AIOps cung cấp các container image được gắn phiên bản.
 
-Workloads không kế thừa quyền IAM từ các thực thể máy chủ EC2. Mỗi task của dịch vụ được liên kết rõ ràng với task role tương ứng trong ECS task definition.
+Workloads không kế thừa quyền từ host. Mỗi hàm Lambda được liên kết rõ ràng với role thực thi tương ứng trong cấu hình hàm.
 
-- **ECS Task Mappings**:
+- **Lambda Function Role Mappings**:
 
-| Service/Task Name | Task Execution Role | Task Role | Managed Policies / Custom Scoped Policies |
-|---|---|---|---|
-| AI Engine API Tasks | `FinOpsTaskExecutionRole` | `FinOpsAiApiIamRole` | Quyền đọc S3 (model artifacts), CloudWatch ghi metric. |
-| `ai-engine-explainer` | `FinOpsTaskExecutionRole` | `FinOpsAiApiIamRole` | Quyền đọc S3, CloudWatch ghi metric. |
-| AI Engine Worker Tasks | `FinOpsTaskExecutionRole` | `FinOpsAiWorkerIamRole` | Quyền đọc-ghi S3 (checkpoint & features), SQS đọc/ghi. |
+| Tên Hàm | IAM Execution Role | Managed Policies / Custom Scoped Policies |
+|---|---|---|
+| AI Engine API Lambda | `FinOpsAiApiExecutionRole` | Quyền đọc Secrets Manager (contract và API keys), SQS gửi tin nhắn, DynamoDB truy vấn trạng thái chạy, CloudWatch Logs ghi log. |
+| AI Engine Worker Lambda | `FinOpsAiWorkerExecutionRole` | Quyền đọc-ghi S3 (cost files & checkpoints), SQS thăm dò tin nhắn, DynamoDB ghi kết quả, CloudWatch Logs ghi log. |
 
 ### 2.3 Cross-account Access
 
 Quyền truy cập chéo tài khoản (cross-account) tới các CUR buckets của tài khoản thành viên được quản lý bởi S3 bucket policies tại tài khoản đích, cho phép quyền đọc đối với `FinOpsCURPullerRole` tập trung thông qua External IDs.
 Các hành động containment tại các tài khoản thành viên được kích hoạt thông qua cơ chế Assume IAM Role chéo tài khoản (`AssumeRole`). Role `LambdaContainment` tại tài khoản quản trị (management account) sẽ assume role `FinOpsContainmentWorkerRole` tại tài khoản đích, thực hiện gắn thẻ tag hoặc scale down các sandbox ASGs.
 
-Mỗi chính sách tin cậy role chéo tài khoản đều bao gồm một ID bên ngoài (external ID), điều kiện tài khoản nguồn và yêu cầu gắn thẻ session để nhật ký kiểm toán có thể ánh xạ từng hành động trở lại lượt chạy CDO. Các role trên production bao gồm các tuyên bố từ chối rõ ràng (explicit deny) đối với việc kết thúc tài nguyên, các hoạt động lưu trữ có tính chất phá hủy và thay đổi IAM. Các role trên non-production có thể cho phép các hành động containment hạn chế chỉ khi yêu cầu gửi đến bao gồm một `execution_mode` đã được phê duyệt, tag môi trường, mã bất thường (anomaly ID) và ID quyết định chính sách. Nếu bất kỳ trường nào trong số đó bị thiếu, containment worker sẽ ghi lại một sự kiện kiểm toán bị từ chối và thoát ra mà không thử lại.
+Mỗi chính sách tin cậy role chéo tài khoản đều bao gồm một ID bên ngoài (external ID), điều kiện tài khoản nguồn và yêu cầu gắn thẻ session để nhật ký kiểm toán có thể ánh xạ từng hành động trở lại lượt chạy CDO. Các role trên production bao gồm các lệnh deny rõ ràng đối với việc chấm dứt tài nguyên, các hoạt động lưu trữ mang tính phá hủy và đột biến IAM. Các role trên non-production có thể cho phép các hành động containment hạn chế chỉ khi yêu cầu đi vào bao gồm một `execution_mode` được phê duyệt, tag môi trường, ID bất thường và ID quyết định chính sách. Nếu bất kỳ trường nào trong số đó bị thiếu, containment worker sẽ ghi lại sự kiện kiểm toán bị từ chối và thoát ra mà không thử lại.
 
 ## 3. Secrets Management
 
@@ -124,38 +126,31 @@ Mỗi chính sách tin cậy role chéo tài khoản đều bao gồm một ID b
 
 Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
-| Secret | Storage | Rotation | Accessed by |
+| Secret | Nơi lưu trữ | Chu kỳ xoay vòng | Được truy cập bởi |
 |---|---|---|---|
-| `finops/ai-engine/api-key` | AWS Secrets Manager (mã hóa qua KMS CMK) | Tự động mỗi 30 ngày | ECS Task Agent (qua native task definition Secrets mapping) |
+| `finops/ai-engine/api-key` | AWS Secrets Manager (mã hóa bằng KMS CMK) | Tự động mỗi 30 ngày | AI Engine API Lambda (qua SDK khi khởi động lạnh) |
 | `finops/dashboard/db-creds` | AWS Secrets Manager | Tự động mỗi 60 ngày | Athena crawler / QuickSight dataset engine trong tương lai |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | Thủ công mỗi 90 ngày | `LambdaAlertRouting` |
-| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | Tự động mỗi 90 ngày | Hàm Lambda xác thực của Step Functions và AI Engine API Tasks |
-| `finops/containment/external-id-seed` | AWS Secrets Manager | Xoay vòng thủ công khi có sự cố | Quy trình cung cấp role containment |
+| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | Tự động mỗi 90 ngày | Hàm Lambda xác thực của Step Functions và AI Engine API Lambda |
+| `finops/containment/external-id-seed` | AWS Secrets Manager | Xoay vòng thủ công khi xảy ra sự cố | Quy trình cung cấp vai trò containment |
 
 ### 3.2 Inject Pattern
 
-Chúng tôi sử dụng native ECS Task Definition Secrets Manager mapping để inject secrets từ AWS Secrets Manager vào container environment variables khi runtime. Secrets được fetch bởi ECS agent bằng Task Execution Role khi khởi động task, tránh lộ plaintext trong state files hay code.
+Chúng tôi sử dụng SDK AWS Secrets Manager để lấy các secret trong các hàm Lambda khi runtime, thay vì truyền chúng dưới dạng các biến môi trường plaintext. Secrets được phân giải trong quá trình function cold-start, cache trong ngữ cảnh thực thi toàn cục của hàm, và được kiểm tra hợp lệ theo các chính sách TTL cache (ví dụ: 5 phút) để tránh gọi API trực tiếp quá nhiều ở các yêu cầu tiếp theo.
 
-```json
-{
-  "containerDefinitions": [
-    {
-      "name": "fargate-api-tasks",
-      "image": "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/fargate-api-tasks:latest",
-      "secrets": [
-        {
-          "name": "AI_ENGINE_API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:finops/ai-engine/api-key:apiKey::"
-        }
-      ]
-    }
-  ]
-}
+Ví dụ, hàm container Lambda truy xuất API key của nó một cách động bằng SDK AWS:
+```python
+import boto3
+import os
+
+def get_api_key():
+    secret_name = os.environ["API_KEY_SECRET_ARN"]
+    client = boto3.client("secretsmanager")
+    response = client.get_secret_value(SecretId=secret_name)
+    return response["SecretString"]
 ```
 
-Đối với các hàm Lambda, các secrets được truy xuất và phân giải trong quá trình cold-start, cache lại trong thư mục bộ nhớ tạm `/tmp` của function, và được kiểm tra hợp lệ theo các chính sách TTL cache để tránh gọi API trực tiếp quá nhiều.
-
-Đường dẫn inject cố ý khác nhau theo thời gian chạy. Các hàm Lambda đọc trực tiếp secrets thông qua Secrets Manager SDK vì chúng là các adapter ngắn hạn. ECS workloads nhận secrets thông qua native ECS task definition mappings để các file triển khai không bao giờ chứa giá trị văn bản thuần túy (plaintext). Terraform tạo các secret container và quyền IAM, nhưng nó không lưu trữ giá trị bí mật trong `.tfvars`, Terraform state, hay các cấu hình build.
+Đường dẫn inject sử dụng truy xuất an toàn khi runtime. Các hàm Lambda đọc trực tiếp secrets thông qua Secrets Manager SDK vì chúng là các tác vụ container ngắn hạn. Terraform tạo các secret container và quyền IAM, nhưng nó không lưu trữ giá trị bí mật trong `.tfvars`, Terraform state, hay các cấu hình build.
 
 ### 3.3 Anti-leak Controls
 
@@ -163,7 +158,7 @@ Chúng tôi sử dụng native ECS Task Definition Secrets Manager mapping để
 - **VPC Endpoint Restriction**: Các chính sách (policies) trên Secrets Manager VPC Endpoints giới hạn quyền truy cập chỉ cho phép từ dải mạng CIDR của VPC quản trị CDO.
 - **Log Redaction**: Toàn bộ nhật ký hoạt động đầu ra của ứng dụng được chạy qua bộ lọc regex để che giấu các thông tin nhạy cảm, thay thế các API keys, tokens, và các header authorization bằng nhãn `[REDACTED]`.
 - **Kiểm soát state của Terraform (Terraform State Control)**: State của Terraform được mã hóa, kiểm soát quyền truy cập và được xem xét kỹ lưỡng để các giá trị nhạy cảm được mô hình hóa dưới dạng tham chiếu bí mật (secret reference) thay vị đầu ra văn bản thuần túy.
-- **Ranh giới container (Container Boundary)**: Workloads ECS chạy với tư cách là người dùng non-root, mount bộ nhớ tạm thời dưới dạng chỉ đọc và tránh ghi tài liệu bí mật vào các persistent volume hoặc checkpoint.
+- **Ranh giới container (Container Boundary)**: Workloads Lambda chạy bên trong các môi trường thực thi an toàn dưới danh nghĩa người dùng non-root, mount bộ nhớ tạm `/tmp` (được mã hóa) dưới dạng chỉ đọc theo mặc định ngoại trừ các thư mục nháp tạm thời, và tránh ghi tài liệu bí mật vào các persistent volume.
 - **Phản ứng sự cố (Incident Response)**: Nghi ngờ lộ bí mật sẽ kích hoạt xoay vòng bí mật, xem lại lịch sử Git, tra cứu CloudTrail cho `GetSecretValue` và tạm dừng các thông tin xác thực triển khai bị ảnh hưởng.
 
 ## 4. Encryption
@@ -177,22 +172,22 @@ Toàn bộ dữ liệu của hệ thống được mã hóa tại chỗ (at rest
 | Dữ liệu chi phí Raw/Curated | S3 | `aws/s3` hoặc CMK tùy chỉnh | Bật tính năng S3 Bucket Key để giảm thiểu chi phí gọi KMS API. |
 | Run State & Metadata | DynamoDB | `aws/dynamodb` hoặc CMK tùy chỉnh | Mã hóa sử dụng KMS. |
 | Secrets Store | Secrets Manager | `finops-secrets-key` | Việc giải mã yêu cầu chính sách role trust rõ ràng. |
-| Lưu trữ tác vụ (Task Storage) | Fargate Ephemeral Storage | `aws/ecs` hoặc CMK tùy chỉnh | Toàn bộ dung lượng lưu trữ ephemeral task được mã hóa mặc định. |
+| Lưu trữ tạm thời / Container Lambda | Bộ lưu trữ Lambda | `aws/lambda` hoặc CMK tùy chỉnh | Toàn bộ dung lượng lưu trữ tạm thời của hàm (bao gồm /tmp lên đến 10 GB) được mã hóa mặc định. |
 | Nhật ký kiểm toán (Audit Logs) | S3 Object Lock | `finops-audit-key` | Lưu trữ tối thiểu 90 ngày với compliance lock. |
 
 ### 4.2 In Transit
 
-- **Yêu cầu TLS**: Tất cả traffic đi vào và đi ra đều yêu cầu mã hóa TLS 1.3 (với TLS 1.2 là phiên bản tối thiểu được chấp nhận). Các cipher suites yếu đều bị vô hiệu hóa trên internal ALB.
-- **Traffic nội bộ**: Giao tiếp task-to-task trong ECS cho lưu lượng API-to-worker sử dụng tích hợp App Mesh riêng tư hoặc định tuyến DNS nội bộ trực tiếp với mã hóa TLS.
-- **Các cuộc gọi AI Engine**: Step Functions và Lambda gọi endpoint AI Engine nội bộ chỉ qua mạng riêng tư. Yêu cầu bao gồm một phiên bản hợp đồng và ID tương quan, và phản hồi sẽ bị từ chối nếu chữ ký, schema hoặc các trường bắt buộc không hợp lệ.
+- **Yêu cầu TLS**: Tất cả traffic đi vào và đi ra đều yêu cầu mã hóa TLS 1.3 (với TLS 1.2 là phiên bản tối thiểu được chấp nhận). Các cipher suites yếu đều bị vô hiệu hóa trên Private API Gateway.
+- **Traffic nội bộ**: Giao tiếp function-to-function và tin nhắn SQS được mã hóa hoàn toàn khi truyền tải natively bởi các dịch vụ AWS sử dụng TLS.
+- **Các cuộc gọi AI Engine**: Step Functions và Lambda gọi endpoint AI Engine nội bộ qua Private REST API Gateway chỉ qua mạng riêng tư VPC endpoints. Yêu cầu bao gồm một phiên bản hợp đồng và ID tương quan, và phản hồi sẽ bị từ chối nếu chữ ký, schema hoặc các trường bắt buộc không hợp lệ.
 - **Alert Webhook**: Tích hợp Slack hoặc email được gọi từ Lambda cảnh báo sau khi giảm thiểu payload. Dữ liệu chi phí nhạy cảm được liên kết thông qua các tham chiếu dashboard/audit nội bộ thay vì được nhúng trực tiếp vào các tin nhắn bên ngoài.
 
 ### 4.3 Key Management
 
 - **Chu kỳ xoay vòng (Rotation)**: Các khóa CMK tự động xoay vòng mỗi 365 ngày.
-- **Access Policies**: Các key policies thực thi phân tách nhiệm vụ, đảm bảo chỉ có các pipeline CI/CD mới có quyền thay đổi cấu hình key, và chỉ có các role thực thi (Lambda/ECS) mới có quyền gọi các hàm giải mã (decrypt).
+- **Access Policies**: Các key policies thực thi phân tách nhiệm vụ, đảm bảo chỉ có các pipeline CI/CD mới có quyền thay đổi cấu hình key, và chỉ có các role thực thi (Lambda container và các hàm nền tảng) mới có quyền gọi các hàm giải mã (decrypt).
 - **Kiểm toán (Audit)**: Toàn bộ lịch sử sử dụng key được theo dõi và ghi lại qua AWS CloudTrail.
-- **Kiểm soát bán kính ảnh hưởng (Blast-radius control)**: Ưu tiên sử dụng các KMS CMK riêng biệt cho dữ liệu chi phí, hồ sơ kiểm toán, secrets và task storage ECS, trừ khi bộ phận Finance và Security phê duyệt hợp nhất vì lý do chi phí.
+- **Kiểm soát bán kính ảnh hưởng (Blast-radius control)**: Ưu tiên sử dụng các KMS CMK riêng biệt cho dữ liệu chi phí, hồ sơ kiểm toán, secrets và bộ nhớ tạm thời của Lambda, trừ khi bộ phận Finance và Security phê duyệt hợp nhất vì lý do chi phí.
 - **Truy cập Break-glass**: Quyền giải mã thủ công không được cấp cho các nhà phát triển hàng ngày. Truy cập tạm thời yêu cầu phê duyệt sự cố, tham chiếu ticket, thời gian hết hạn và xem xét sau khi sử dụng.
 
 ## 5. Audit Logging
@@ -249,7 +244,7 @@ Nhật ký kiểm toán được lưu trữ bảo mật với các cấu hình c
 |---|---|---|---|
 | Containment Audits | S3 + Object Lock | Tối thiểu 90 ngày | Athena / DynamoDB |
 | AWS API Calls | CloudTrail (S3 Raw) | 1 năm | Athena |
-| ECS Container Logs | CloudWatch Logs | 30 ngày | CloudWatch Logs Insights |
+| AI Engine Lambda Logs | CloudWatch Logs | 30 ngày | CloudWatch Logs Insights |
 | App/Lambda Logs | CloudWatch Logs | 14 ngày | CloudWatch Logs Insights |
 
 Kho lưu trữ kiểm toán containment được thiết kế dưới dạng append-only. DynamoDB hỗ trợ tra cứu dashboard với độ trễ thấp, trong khi S3 với Object Lock là kho lưu trữ bằng chứng bền vững. Bảng điều khiển nên liên kết đến ID bản ghi kiểm toán thay vì sao chép trạng thái trước/sau nhạy cảm trong các tin nhắn cảnh báo. Thời gian lưu giữ ngắn hơn 90 ngày không được phép đối với các bản ghi containment, ngay cả trong sandbox, vì yêu cầu của capstone đo lường khả năng truy vết của các quyết định tự động.
@@ -264,10 +259,9 @@ Kho lưu trữ kiểm toán containment được thiết kế dưới dạng app
 
 ## 6. CI Security Controls
 
-- **Quét Image & Dependency**: Trivy được tích hợp trực tiếp vào pipeline CI/CD. Tác vụ build sẽ tự động dừng nếu container image chứa các mã lỗi bảo mật CVE mức độ `CRITICAL` hoặc `HIGH`.
-- **Chạy quyền Non-Root**: Cấu hình container bắt buộc chạy ứng dụng dưới quyền user non-root (ví dụ: `"user": "1000"` trong ECS Task Definition).
-- **Task Security Standards**: Cấu hình ECS Task Definition thực thi host network isolation (`awsvpc` network mode) và giới hạn quyền thực thi (`readonlyRootFilesystem: true`, `privileged: false`).
-- **Cô lập Spot Workload**: Các task chạy tác vụ batch được cấu hình với ECS Fargate Spot capacity providers, đảm bảo chúng chạy riêng biệt trên các Spot instances, tránh gây thiếu hụt tài nguyên cho các task API chạy ổn định trên các always-on service tasks.
+- **Chạy quyền Non-Root**: Cấu hình container bắt buộc chạy ứng dụng dưới quyền user non-root (ví dụ: chạy dưới user `1000` in Dockerfile).
+- **Cô Lập Hàm Lambda**: Các hàm Lambda container chạy trong các môi trường sandbox độc lập, chỉ đọc (ngoại trừ thư mục `/tmp`) và thực thi với các đặc quyền tối thiểu bằng các execution role riêng biệt.
+- **Giới Hạn Tài Nguyên**: Các giới hạn concurrency (Reserved Concurrency) được cấu hình trên các hàm Lambda để ngăn chặn các cuộc tấn công từ chối dịch vụ hoặc cạn kiệt tài nguyên của tài khoản.
 
 ## 7. Compliance Touchpoints
 
@@ -288,5 +282,5 @@ Kho lưu trữ kiểm toán containment được thiết kế dưới dạng app
 
 ## Related documents
 
-- [`02_infra_design_vi.md`](02_infra_design_vi.md) - Thiết kế hạ tầng, bố cục VPC và ECS Capacity Providers.
+- [`02_infra_design_vi.md`](02_infra_design_vi.md) - Thiết kế hạ tầng, bố cục VPC và tích hợp tính toán serverless.
 - [`04_deployment_design_vi.md`](04_deployment_design_vi.md) - Pipeline CI/CD, các pipeline triển khai GitHub Actions, và chu kỳ xoay Secrets.

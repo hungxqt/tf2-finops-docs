@@ -4,6 +4,10 @@
      Status: Refined (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: The demo environment and all presentation scenarios must strictly demonstrate conformance to the absolute safety boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 ## 1. Demo script
 
 This script guides presenters through demonstrating the end-to-end FinOps Watch CDO platform capabilities, simulating a real-world synthetic cost anomaly detection and mitigation workflow.
@@ -21,7 +25,7 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
 
 ### Step 3 - Invoke shared AI Engine endpoint (POST /v1/detect)
 - **Action**: Monitor the ingestion Step Functions workflow as it reaches the AI scoring state.
-- **Internal Action**: The worker Lambda queries the raw partitioned cost data and performs an HTTP POST request to the single shared Task Force AI Engine endpoint via `https://ai-engine.tf-2.internal/v1/detect` using IAM SigV4 authentication.
+- **Internal Action**: The CDO orchestration workflow performs an HTTP POST request to the Private REST API Gateway endpoint for the AI Engine `/v1/detect` using IAM SigV4 authentication.
 - **Request Headers**:
   - `X-Tenant-Id`: Identifies the tenant (e.g., `CDO-01`).
   - `X-Idempotency-Key`: Composite key format `tenant_id:YYYY-MM-DD` (e.g., `CDO-01:2026-06-24`).
@@ -39,8 +43,8 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
   - `retry_after_seconds`: `30`
 
 ### Step 4 - Poll results (GET /v1/detect/result/{audit_id}) & Execute AI Engine task
-- **Action**: Poll the AI Engine result endpoint `GET /v1/detect/result/{audit_id}` periodically every 30 seconds.
-- **Internal Action**: The AI Engine running on ECS Fargate (task size: 2 vCPU, 4 GB; cluster: `tf-2-aiops-cluster`) processes the ingestion payload. The container image (owned by AIOps) executes the AI model scoring, evaluates anomaly confidence, and compiles RCA details. Upon completion, the polling request returns HTTP `200 OK`.
+- **Action**: Poll the AI Engine result endpoint `GET /v1/detect/result/{audit_id}` via Private API Gateway periodically every 30 seconds.
+- **Internal Action**: The AI Engine running on AWS Lambda container functions processes the ingestion payload. SQS buffers the request; the Worker Lambda container executes the AI model scoring, evaluates anomaly confidence, and compiles RCA details, writing results to DynamoDB. Upon completion, the polling request returns HTTP `200 OK`.
 - **Response Payload**:
   - `audit_id`: Matching execution UUID.
   - `anomalies_list`: Array of detected anomalies with confidence scores and explanations.
@@ -80,7 +84,7 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
 This checklist outlines the specific log files, database tables, and communication logs required to verify the successful execution of the CDO platform pipeline during audits.
 
 - **CUR logs in S3**: Ingestion files stored under `s3://cdo-raw-cost-bucket/exports/` confirming raw data format compatibility.
-- **VPC Flow Logs & IAM SigV4 Verification**: Logs showing internal HTTP traffic routed safely to `https://ai-engine.tf-2.internal/` with SigV4 request signatures and no internet egress.
+- **VPC Flow Logs & IAM SigV4 Verification**: Logs showing Private REST API Gateway execution logs and VPC Endpoint traffic with SigV4 request signatures and no internet egress.
 - **DynamoDB records**:
   - Anomalies table: Record containing `anomaly_id`, `confidence_score`, and `explanation` from the AI Engine, with pagination parameters.
   - Audit trail table: Record containing all 14 containment action fields, verifying `correlation_id` matches the Step Functions execution, and containing a cryptographic audit trail chain block calculated as `sha256(current_payload + previous_hash)`.
@@ -97,7 +101,7 @@ This checklist outlines the specific log files, database tables, and communicati
 Key selling points of the serverless lakehouse-centric FinOps control plane architecture:
 
 - **Serverless cost savings**: By selecting S3, Glue, and Athena for the data lakehouse, the platform runs at a fraction of the cost of traditional always-on databases (RDS/Redshift). Compute costs are only incurred during the query execution window, resulting in up to 90% savings for daily batch operations.
-- **Shared AI hosting optimization**: Deploying a single shared AI Engine endpoint (`https://ai-engine.tf-2.internal/`) hosted on ECS Fargate (cluster `tf-2-aiops-cluster` using Fargate Spot for batch workloads) optimizes compute footprint across multiple CDO platforms while keeping tenant workloads isolated via the `X-Tenant-Id` header.
+- **Shared AI hosting optimization**: Deploying the shared AI Engine endpoints behind a Private REST API Gateway hosted on AWS Lambda container functions optimizes compute footprint across multiple CDO platforms (eliminating ECS/ALB idle compute costs) while keeping tenant workloads isolated via the `X-Tenant-Id` header and API Gateway Resource Policies.
 - **Complete compliance**: The dual-layer audit trail (DynamoDB for UI speed and S3 with Object Lock for immutability) guarantees that all automated and proposed actions are preserved for at least 90 days, meeting financial audit regulations. Every audit trail entry is cryptographically chained via `sha256(current_payload + previous_hash)` for tamper-proofing.
 - **Risk-free operation**: Strict dry-run defaults in production and staging environments prevent accidental service outages. Automation is safely restricted to non-production/sandbox environments where policies are strictly enforced.
 - **Multi-tenant isolation**: Structural S3 prefixes and Glue partitioning separate cost data by account and squad. Cross-account access relies on read-only IAM assume-role policies, preventing unauthorized lateral movements.
@@ -120,8 +124,8 @@ Architectural justifications for common challenging questions:
   - *Response*: The static dashboard assets are updated immediately at the end of each pipeline run. A CloudFront invalidation is triggered programmatically to clear edge caches. A manual "Sync Now" button is also provided on the interface to query DynamoDB records directly.
 - **How is rollback security enforced to prevent unauthorized resource changes?**
   - *Response*: Rollback execution invokes the `POST /v1/action/rollback` API endpoint. It requires identical IAM permissions and MFA verification. Every rollback request must be tied to a valid incident ID or change ticket, and the action is fully logged to the WORM audit trail in S3.
-- **Who owns the ECS Fargate deployment and operational lifecycle of the shared AI Engine?**
-  - *Response*: CDO owns the hosting infrastructure deployment (VPC, subnets, internal ALB, DNS, task sizing, autoscaling, security groups, task IAM roles, queues, and DynamoDB state stores) to guarantee platform availability, security, and SigV4 authentication. AIOps owns the AI model logic, RCA/recommendation logic, local fallback rules engine execution, internal API contract enforcement, and container image builds.
+- **Who owns the Lambda container deployment and operational lifecycle of the shared AI Engine?**
+  - *Response*: CDO owns the hosting infrastructure deployment (VPC, subnets, Private REST API Gateway, concurrency limits, execution roles, queues, and DynamoDB state stores) to guarantee platform availability, security, and SigV4 authentication. AIOps owns the AI model logic, RCA/recommendation logic, local fallback rules engine execution, internal API contract enforcement, and container image builds.
 - **What happens if the AI Engine fails, times out, or receives duplicate requests?**
   - *Response*: If the AI Engine detects duplicate idempotency keys, it returns HTTP `409` with a `Retry-After: 30` header, or `400` with `ERR_IDEMPOTENCY_MISMATCH` if payloads differ. If Bedrock times out (45s Bedrock hard limit, returning `ERR_LLM_TIMEOUT`) or the service is down (`ERR_SERVICE_DOWN`), the CDO pipeline immediately falls back to a static rules engine and triggers SRE alerts, ensuring a fail-safe containment posture.
 

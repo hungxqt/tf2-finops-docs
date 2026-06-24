@@ -4,6 +4,10 @@
      Status: Ongoing log W11-W12
      Format: 1 ADR per major decision. Append-only - do not delete old ADRs. -->
 
+> [!IMPORTANT]
+> **Ranh giới Bảo mật**: Mọi quyết định thiết kế và mô hình kiến trúc phải tuân thủ nghiêm ngặt ranh giới cứng: **NEVER terminate prod, delete data, hoặc modify IAM**.
+
+
 > **ADR là gì (What is an ADR)**: Nhật ký ghi lại mỗi quyết định kiến trúc quan trọng và lý do tại sao chọn phương án đó (thay vì các phương án khác). Mục đích là để đảm bảo các nhà phát triển trong tương lai hiểu rõ tại sao một hướng đi cụ thể lại được chọn thay vì các phương án thay thế.
 >
 > **Khi nào viết ADR (When to write an ADR)**:
@@ -56,7 +60,7 @@
 - **Trạng thái (Status)**: Accepted
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Cần phân chia công việc rõ ràng giữa nhóm CDO (vận hành nền tảng và pipeline) và nhóm AIOps (phát triển AI engine) để ngăn ngừa các nỗ lực trùng lặp, thiết lập quyền sở hữu và xác định các SLA vận hành.
-- **Quyết định (Decision)**: Thiết lập tích hợp dựa trên hợp đồng nghiêm ngặt. CDO sở hữu việc thu thập dữ liệu chi phí, các luồng công việc theo lịch trình, cảnh báo, thực thi containment và hạ tầng nền tảng lưu trữ (ECS cluster, capacity providers, networking) cho AI Engine. AIOps sở hữu logic AI Engine, container image, các tham số mô hình, tính toán điểm độ tin cậy và các chỉ số backtesting.
+- **Quyết định (Decision)**: Thiết lập tích hợp dựa trên hợp đồng nghiêm ngặt. CDO sở hữu việc thu thập dữ liệu chi phí, các luồng công việc theo lịch trình, cảnh báo, thực thi containment và hạ tầng nền tảng lưu trữ (Private API Gateway, các hàm container Lambda, networking) cho AI Engine. AIOps sở hữu logic AI Engine, container image, các tham số mô hình, tính toán điểm độ tin cậy và các chỉ số backtesting.
 - **Hệ quả (Consequence)**:
   - Pro: Các chu kỳ phát hành độc lập và cách ly trách nhiệm. Quyền sở hữu rõ ràng để xử lý sự cố.
   - Pro: Hợp đồng chuẩn hóa ngăn ngừa các thay đổi gây phá vỡ khi mô hình AI được cập nhật.
@@ -118,7 +122,7 @@
 
 ## ADR-007 - Sử dụng ECS Fargate để host AI Engine (ECS Fargate for AI Engine hosting)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-010
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: AI Engine do nhóm AIOps cung cấp được đóng gói dưới dạng một ứng dụng python container hóa yêu cầu sự linh hoạt về CPU/memory, thực thi cô lập và bảo mật mạng.
 - **Quyết định (Decision)**: Triển khai và host các khối lượng công việc container AI Engine trên AWS ECS (Elastic Container Service) với Fargate.
@@ -134,7 +138,7 @@
 
 ## ADR-008 - Tách biệt giữa capacity provider Fargate luôn hoạt động và Fargate Spot (Fargate always-on vs Fargate Spot capacity providers separation)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-010
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: AI Engine thực thi cả các tác vụ API độ trễ thấp (health checks, giải thích bất thường cho bảng điều khiển) và các khối lượng công việc hàng loạt (batch workloads) có thể bị gián đoạn và đòi hỏi nhiều tài nguyên tính toán (chạy chấm điểm bất thường hàng ngày, huấn luyện lại mô hình).
 - **Quyết định (Decision)**: Tách biệt việc thực thi tác vụ ECS trên các capacity provider Fargate. Sử dụng Fargate tiêu chuẩn luôn hoạt động (always-on) cho các tác vụ API explainer, và Fargate Spot cho các tác vụ phân tích hàng loạt, huấn luyện lại và feature engineering.
@@ -150,7 +154,7 @@
 
 ## ADR-009 - Điểm cuối AI Engine dùng chung cho Task Force (Shared Task Force AI Engine endpoint)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-011
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Task Force 2 vận hành hai nền tảng FinOps CDO độc lập (CDO-01 và CDO-02) đại diện cho các đơn vị kinh doanh khác nhau. Để giảm thiểu chi phí vận hành và đơn giản hóa việc quản lý mô hình, chúng tôi cần một kiến trúc triển khai cho AIOps AI Engine để host một lần duy nhất nhưng vẫn phục vụ cả hai nền tảng CDO một cách an toàn và hiệu quả.
 - **Quyết định (Decision)**: Triển khai một điểm cuối AI Engine dùng chung duy nhất được host trên ECS Fargate trong một VPC dùng chung, có thể truy cập nội bộ thông qua `https://ai-engine.tf-2.internal/` với xác thực IAM SigV4. Sự cô lập đa người thuê (multi-tenant) được duy trì thông qua header `X-Tenant-Id` của yêu cầu để phân vùng dữ liệu và các yêu cầu.
@@ -165,3 +169,42 @@
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
   - Mỗi nền tảng CDO có một AI Engine riêng biệt (Separate AI Engine per CDO Platform): Bị từ chối do chi phí tài nguyên trùng lặp và chi phí bảo trì cao cho việc quản lý phiên bản mô hình và triển khai container.
   - Điểm cuối HTTP công cộng với API Gateway: Bị từ chối vì xác thực dựa trên IAM SigV4 qua bộ cân bằng tải nội bộ riêng tư mang lại bảo mật truyền tải mạnh mẽ hơn và độ trễ thấp hơn mà không để lộ điểm cuối ra internet.
+
+---
+
+## ADR-010 - Host thời gian chạy suy luận AI Engine trên AWS Lambda container (AWS Lambda container image hosting for AI Engine inference)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-24
+- **Bối cảnh (Context)**: AI Engine do nhóm AIOps cung cấp được đóng gói dưới dạng ứng dụng python container hóa, yêu cầu sự linh hoạt về CPU/memory, thực thi độc lập, và bảo mật mạng. Quyết định trước đó sử dụng ECS Fargate (ADR-007) và capacity provider Fargate Spot (ADR-008) phát sinh chi phí nền tảng cố định dùng chung (máy chủ chạy nhàn rỗi, bộ cân bằng tải) và tăng độ phức tạp vận hành (ghi nhận checkpoint, gián đoạn Spot).
+- **Quyết định (Decision)**: Triển khai và host các workload container của AI Engine trên hạ tầng AWS Lambda container image. Triển khai bằng cách ghim mã băm container image ECR bất biến.
+- **Hệ quả (Consequence)**:
+  - Pro: Giá serverless thực sự trả tiền theo từng yêu cầu (pay-per-request), loại bỏ chi phí chạy nhàn rỗi cố định của ECS Fargate always-on.
+  - Pro: Khả năng tự động mở rộng và tính sẵn sàng cao do AWS quản lý một cách tự nhiên.
+  - Pro: Loại bỏ độ phức tạp của việc lưu checkpoint và thử lại do gián đoạn Spot đối với suy luận. SQS đóng vai trò bộ đệm các yêu cầu không đồng bộ một cách mềm dẻo.
+  - Trade-off: Có khả năng xảy ra độ trễ khởi động nguội (cold start) đối với container image (giảm thiểu bằng Provisioned Concurrency nếu vi phạm ngưỡng SLA độ trễ trong sản xuất).
+  - Trade-off: Các artifact mô hình và dependency phải nằm trong giới hạn dung lượng image của Lambda (10 GB). Quy trình huấn luyện và tái huấn luyện mô hình nặng ngoại tuyến nằm ngoài phạm vi thời gian chạy này.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - ECS Fargate always-on + Spot: Bị từ chối vì chi phí chạy nhàn rỗi cao và yêu cầu checkpoint/retry phức tạp.
+  - Gói zip AWS Lambda tiêu chuẩn: Bị từ chối vì kích thước thư viện mô hình AI (như pandas, scikit-learn, PyTorch) vượt quá giới hạn 250MB (khi giải nén) của gói zip Lambda.
+
+---
+
+## ADR-011 - Sử dụng Private REST API Gateway thay thế cho internal ALB (Private REST API Gateway over internal ALB)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-24
+- **Bối cảnh (Context)**: API của AI Engine phải được truy cập một cách an toàn và riêng tư bởi nhiều nền tảng CDO trong mạng nội bộ. Quyết định trước đó sử dụng một internal ALB (ADR-009). Tuy nhiên, khi chuyển sang host trên AWS Lambda container, việc sử dụng REST API Gateway với tích hợp Lambda là lựa chọn tự nhiên và an toàn hơn cho việc công khai API nội bộ.
+- **Quyết định (Decision)**: Công khai endpoint AI Engine dùng chung qua Private REST API Gateway sử dụng xác thực IAM SigV4 và tích hợp Lambda proxy/container. Sự cô lập đa người thuê (multi-tenant) được duy trì thông qua header `X-Tenant-Id` của yêu cầu để phân vùng dữ liệu và các yêu cầu.
+- **Phân chia trách nhiệm (Responsibility Split)**:
+  - **CDO** sở hữu hạ tầng host: Mạng VPC, tài nguyên Private REST API Gateway, tham số stage/deployment, role execution IAM, các hàng đợi xử lý SQS, và DynamoDB lưu trạng thái chạy/idempotency.
+  - **AIOps** sở hữu logic ứng dụng bên trong Lambda container: Mã nguồn mô hình AI, quy trình đóng gói/phát hành container image (ECR image payload), logic Phân tích Nguyên nhân Gốc rễ (RCA) và khuyến nghị khắc phục, thực thi rules engine dự phòng cục bộ, tuân thủ hợp đồng API nội bộ, và theo dõi baseline đánh giá.
+- **Hệ quả (Consequence)**:
+  - Pro: Kết nối API nội bộ an toàn qua VPC endpoint, tránh được chi phí thuê hàng giờ của ALB.
+  - Pro: Tích hợp sẵn IAM SigV4 cho việc xác thực mạnh mẽ.
+  - Pro: Hỗ trợ sẵn các tính năng throttling API, biến môi trường của stage, và định tuyến.
+  - Pro: Tích hợp tự nhiên với API Gateway Resource Policies để thực thi cô lập multi-tenant.
+  - Trade-off: Private API Gateway yêu cầu cấp phát VPC Endpoint riêng, tuy nhiên các endpoint này có thể chia sẻ dùng chung với các dịch vụ khác của nền tảng.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Định tuyến qua Internal ALB: Bị từ chối vì API Gateway cung cấp khả năng quản lý endpoint, rate limiting tốt hơn và tích hợp proxy Lambda gốc tối ưu cho serverless runtime.
+  - Endpoint HTTP công cộng với API Gateway: Bị từ chối vì xác thực SigV4 qua private endpoint đảm bảo lưu lượng không đi qua internet công cộng, đáp ứng NFR về bảo mật.

@@ -10,7 +10,7 @@ Task Force 2 is building the **FinOps Watch** platform for the CFO of a mid-size
 
 The CFO wants a continuous **FinOps Watch** system running on a defined cadence that pulls cost data (CUR and Cost Explorer API), detects anomalies with measurable precision and false-positive rates, routes alerts to the correct teams (Finance vs. Engineering), and triggers safe, automated containment actions for obvious waste patterns (e.g., idle resources, mis-tagged spend, runaway training clusters).
 
-The CDO team is responsible for the FinOps control plane, building a lakehouse-centric architecture to ingest and process cost data (S3 CUR partition pulls and Cost Explorer API calls), orchestration workflows, operational state management, dashboard views, alert routing, containment guardrails, and audit logs. The CDO team also deploys and operates the ECS hosting infrastructure (VPC, subnets, ALB, tasks sizing, auto scaling, security groups, task IAM roles, queues, and DynamoDB state stores) for a single shared Task Force AI Engine endpoint on ECS Fargate (cluster 'tf-2-aiops-cluster'), reached by both CDO-01 and CDO-02 via `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication. Workloads are divided between Fargate always-on capacity provider tasks and Fargate Spot capacity provider tasks. AIOps owns the AI model logic, RCA/recommendation logic, fallback logic, contract management, container image build, and evaluation baseline.
+The CDO team is responsible for the FinOps control plane, building a lakehouse-centric architecture to ingest and process cost data (S3 CUR partition pulls and Cost Explorer API calls), orchestration workflows, operational state management, dashboard views, alert routing, containment guardrails, and audit logs. The CDO team also deploys and operates the Lambda container hosting infrastructure (VPC, subnets, Private REST API Gateway with IAM SigV4, Lambda functions, execution roles, reserved concurrency, SQS/DLQ async queues, and DynamoDB state stores) for a single shared Task Force AI Engine endpoint, reached securely via the Private API Gateway endpoint using IAM SigV4 authentication. Workloads are run as serverless container image executions on AWS Lambda, optimized with SQS for async processing. AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics.
 
 The AIOps team owns any synthetic historical dataset used to train, enhance, calibrate, or backtest the anomaly model. The CDO documentation treats that dataset as upstream model-quality input, not as a CDO platform sizing source or operational data source. CDO consumes the model through a signed API contract, sends strictly CUR-only cost data (excluding CloudWatch utilization signals like CPUUtilization, DatabaseConnections, or memory_mib which are reserved only for platform operational observability), persists the returned decision evidence, and proves that alerting and containment policy are applied safely.
 
@@ -28,7 +28,7 @@ The CDO platform must meet the following non-functional requirements (NFRs) to e
 | Dashboard readability | Finance-friendly UI, zero SQL knowledge required | CFO's team must understand cost anomalies without technical queries. |
 | Cost per run | Minimize; tracked with `Evidence needed: CDO pipeline run costs` | Ensures the platform itself is cost-effective. |
 | Security baseline | IAM least-privilege, multi-account read-only access | Core boundary: NEVER terminate prod, delete data, or modify IAM. |
-| AI Engine hosting uptime | ≥99.5% availability for the hosted model API | CDO hosted AI Engine API on ECS must be reliable for synchronous inference. |
+| AI Engine hosting uptime | ≥99.5% availability for the hosted model API | CDO hosted AI Engine API via Private API Gateway must be reliable for execution. |
 | Cost data contract coverage | CUR-only cost data (account, service, region, resource, tag, cost period, USD amount, estimated/final flag); excludes CloudWatch utilization metrics (CPU, memory, database connections) for anomaly detection | Ensures CDO sends enough operational context to the AIOps AI Engine without owning model training data. Performance metrics are used ONLY for platform operational observability (alerts, logging, metrics, dashboard). |
 | Idempotency | One accepted run per account and cost window | Prevents duplicate alerts, duplicate AI Engine calls, and double-counted dashboard materializations. |
 | Alert explainability | Every anomaly alert includes confidence, severity, evidence window, owner route, and explanation | Finance and Engineering must be able to decide whether the alert is valid and what to do next. |
@@ -38,9 +38,9 @@ The NFRs are intentionally written as operational targets, not only architecture
 
 ## 3. Differentiation angle (KEY)
 
-- **Angle chosen**: Lakehouse-centric FinOps control plane with serverless orchestration and CDO-hosted AI Engine on AWS ECS (specifically within the ECS cluster 'tf-2-aiops-cluster').
-- **Why this angle**: Production FinOps follows a natural 24h cadence based on CUR data export intervals. Ingesting CUR and Cost Explorer API data into a lakehouse (S3 + Glue + Athena) allows for structured historical query access, auditability, and finance-friendly materialized views. The AI Engine is deployed on a dedicated ECS cluster (tf-2-aiops-cluster), utilizing Fargate Capacity Providers to optimize costs: stable APIs (inference/explainer) run on Fargate always-on capacity provider tasks, while heavy batch workloads (batch scoring, feature engineering, model retraining) run on Fargate Spot capacity provider tasks. This hybrid design minimizes idle compute costs and guarantees platform scalability.
-- **Trade-off accepted**: Operational complexity of running ECS and Terraform ECS configuration and GitHub Actions (CI/CD) deployment pipelines, compared to a pure serverless container setup. This is accepted because ECS provides granular control over workload placement (always-on vs. Spot capacity provider allocation), network isolation (security groups), and scales efficiently for large batch/training jobs.
+- **Angle chosen**: Lakehouse-centric FinOps control plane with serverless orchestration and CDO-hosted AI Engine on AWS Lambda container images.
+- **Why this angle**: Production FinOps follows a natural 24h cadence based on CUR data export intervals. Ingesting CUR and Cost Explorer API data into a lakehouse (S3 + Glue + Athena) allows for structured historical query access, auditability, and finance-friendly materialized views. The AI Engine is hosted as a Lambda container image deployed via ECR and exposed via Private REST API Gateway. To optimize costs and operational overhead, the platform uses serverless compute (no idle cluster costs), SQS/DLQ queues for asynchronous worker tasks, and Lambda reserved concurrency as the default guardrail (with Provisioned Concurrency as an optional production optimization). This serverless container image approach minimizes fixed runtime costs.
+- **Trade-off accepted**: Cold-start latency of Lambda container image functions (typically 1-5 seconds during container pull and initialization), compared to always-on VMs. This is accepted because the 24h cadence does not require sub-second synchronous API response times, and asynchronous SQS integration allows `/v1/detect` to return `202 Accepted` quickly while worker Lambda tasks write results to DynamoDB.
 - **Lock date**: 2026-06-23 (enforcing W11 design lock).
 
 The differentiation is not "use AI for FinOps"; that ownership belongs to AIOps. The CDO differentiation is the control plane around the AI decision: repeatable data pulls, queryable historical evidence, versioned model invocation, safe routing, policy-enforced containment, and finance-readable reporting. A purely dashboard-centric approach would show spend but not close the loop. A purely automation-centric approach would act too aggressively without enough evidence. The chosen angle keeps the daily FinOps loop measurable and reversible.
@@ -61,10 +61,10 @@ The responsibility boundary between the CDO and AIOps teams is defined as follow
 | Finance-friendly dashboard views (S3 + CloudFront dashboard backed by Athena/DynamoDB summaries) | Owns | |
 | Alert routing (Finance vs. Engineering channels) | Owns | |
 | Safe containment guardrails & audit log trail | Owns | |
-| ECS Cluster Hosting Platform (Cluster lifecycle, ECS Task Role, ECS Task Execution Role, VPC networking) | Owns | |
-| ECS Fargate Capacity Providers (always-on/Spot configurations) | Owns | |
-| Deployment pipelines (Terraform ECS configuration, GitHub Actions (CI/CD) deployment pipelines, IaC) for AI workloads | Owns | |
-| Runtime monitoring & autoscaling (ECS Service Auto Scaling (using CPU target tracking 70% and SQS step scaling)) | Owns | |
+| Private API Gateway & Lambda Container Platform (Gateway configuration, VPC integration, Execution Roles) | Owns | |
+| Lambda concurrency controls (Reserved / Provisioned Concurrency, SQS/DLQ configuration) | Owns | |
+| Deployment pipelines (ECR image digest pinning, Lambda alias routing, IaC) for AI workloads | Owns | |
+| Runtime monitoring & concurrency control (Lambda reserved concurrency, CloudWatch logs, and X-Ray) | Owns | |
 | AI Engine model internals, logic & code | | Owns |
 | Model training, retraining & hyperparameter selection | | Owns |
 | Confidence scoring & anomaly classification logic | | Owns |
@@ -73,7 +73,9 @@ The responsibility boundary between the CDO and AIOps teams is defined as follow
 | AI model backtest performance and metrics | | Owns |
 | Versioned container artifacts (images, weights, configs) | | Provides |
 
-*Note: The CDO team consumes the AI Engine through a single shared Task Force AI Engine endpoint on ECS Fargate, reached by both CDO-01 and CDO-02 via `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication. The responsibility split is defined such that CDO owns the hosting infrastructure (VPC, subnets, ALB, task sizing, auto scaling, security groups, task IAM roles, queues, and DynamoDB state stores), while AIOps owns the AI model logic, RCA/recommendation logic, fallback logic, contract management, container image build, and evaluation baseline. Detection telemetry is strictly CUR-only (S3 CUR partition pulls and Cost Explorer API calls) and does NOT include CloudWatch utilization metrics (CPU, memory, database connections), which are used ONLY for platform operational observability (alerts, logging, metrics, dashboard).*
+*Note: The CDO team consumes the AI Engine through a single shared Private API Gateway endpoint, reached securely using IAM SigV4 authentication and Lambda proxy/container integration. The responsibility split is defined such that CDO owns the hosting infrastructure (VPC, subnets, Private REST API Gateway, Lambda functions, execution roles, reserved concurrency, SQS/DLQ async queues, and DynamoDB/S3 stores), while AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics. Detection telemetry is strictly CUR-only (S3 CUR partition pulls and Cost Explorer API calls) and does NOT include CloudWatch utilization metrics (CPU, memory, database connections), which are used ONLY for platform operational observability (alerts, logging, metrics, dashboard).*
+
+*Note on Contract Wording*: The signed API contract (`ai-api-contract.md`) was established under the baseline assumption of ECS/ALB hosting. Since the platform architecture has migrated to serverless Lambda container hosting, any outdated ECS or ALB wording in the signed contract document itself requires a formal contract change request if/when that contract is later updated. For now, the contract document remains unchanged.
 
 The boundary is enforced at runtime as well as in documentation. CDO validates the `/v1/detect` request and response schema before each compatible release, records the model version returned by AIOps, persists the evidence URI for every anomaly, and fails closed when the AI Engine is unavailable or returns an invalid payload. AIOps remains accountable for model quality metrics such as precision, recall, confidence calibration, and explanation logic, while CDO remains accountable for whether those outputs are used safely in alerting, dashboarding, and containment workflows.
 
@@ -88,7 +90,7 @@ The CDO platform consumes the AI Engine API according to the Service Level Objec
 | **Ingestion Latency (P99)** | < 50 ms | Roundtrip processing time of POST `/v1/detect` requests. |
 | **Result Query Latency (P99)** | < 10 ms | Time to retrieve records from the DynamoDB Store. |
 | **LLM Inference SLA** | < 30 seconds | Amazon Bedrock (Nova LLM) execution window and database write. |
-| **System Availability** | >=99.5% | Total uptime of the internal ALB/API Gateway exposed to CDO. |
+| **System Availability** | >=99.5% | Total uptime of the Private API Gateway exposed to CDO. |
 | **Error Rate** | < 0.5% | System error responses (HTTP 5xx) relative to total requests. |
 
 Any violation of these SLA parameters triggers the fallback runbook (SRE alerting, static rules, or failing closed for containment decisions).
@@ -118,9 +120,9 @@ These constraints define what the CDO platform must not do. The system is allowe
 - [ ] **Tagging compliance baseline**: What percentage of existing resources are properly tagged with `owner` and `squad` keys?
 - [ ] **Escalation SLA**: How long should a containment action wait in `dry-run` or approval state before being escalated to manual engineering review?
 - [ ] **AIOps API contract freeze**: Has the payload structure for the `/v1/detect` API been finalized and frozen?
-- [ ] **Budget ceiling**: What is the budget limit for the CDO ECS hosting platform (control plane + Fargate capacity provider tasks) during the capstone period?
+- [ ] **Budget ceiling**: What is the budget limit for the CDO Lambda container hosting platform (Private API Gateway, Lambda execution duration, SQS/DLQ queues, and Provisioned Concurrency options) during the capstone period?
 - [ ] **Identity management**: Will the S3 + CloudFront dashboard access be integrated with the client's corporate Identity Provider (IdP) (e.g., via CloudFront + Cognito or OIDC), and when should QuickSight be introduced as a future BI integration?
-- [ ] **Spot reclamation strategy**: Is there a pre-defined checkpoint bucket and format for AIOps batch training jobs to handle Fargate Spot task interruptions?
+- [ ] **Model retraining deployment**: How often does AIOps retrain the model, and how are new image digests communicated to CDO for deployment in ECR and Lambda digest pinning?
 - [ ] **False-positive approval calendar**: Can Finance provide known migration, load-test, and flash-sale windows to AIOps for model calibration and to CDO for alert annotation?
 - [ ] **Dashboard decision owner**: Which Finance role signs off on severity labels, budget thresholds, and escalation wording used in executive-facing views?
 - [ ] **Containment approval owner**: For non-prod apply-mode actions, does approval come from the squad owner, platform owner, or Finance owner?

@@ -4,15 +4,19 @@
      Status: Final (W11 T6 Pack #1) -> Updated (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: All deployment and infrastructure operations must conform to the absolute hard boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 ## 1. IaC strategy
 
 ### 1.1 Tool choice
 
 The CDO platform uses a dual-layer deployment strategy to separate infrastructure provisioning from application workload deployments.
-1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, ECS cluster, Fargate capacity providers, DynamoDB, S3, IAM roles).
-2. **Workload Layer (ECS Services & Tasks)**: Deployed using **Terraform ECS configuration** and **GitHub Actions (CI/CD) deployment pipelines**, and native zip deployment files for Lambda functions.
+1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, API Gateway, Lambda functions, ECR, DynamoDB, S3, IAM roles).
+2. **Workload Layer (Lambda Container Functions & API Gateway)**: Deployed using **Terraform Lambda configuration** and **GitHub Actions (CI/CD) deployment pipelines** by pinning ECR container image digests.
 
-Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda wrappers, DynamoDB tables, IAM roles, ECS control plane, Fargate capacity providers, ECR repositories, ECS Task/Task Execution roles, internal load-balancer prerequisites, and secrets plumbing. CDO owns the ECS hosting infrastructure deployment (VPC, subnets, ALB, tasks sizing, auto scaling, security groups, task IAM roles, queues, and DynamoDB state stores), while AIOps owns the container image builds, contract management, and model logic. Runtime ECS desired state is managed through the Terraform ECS configuration and GitHub Actions (CI/CD) deployment pipelines, so application task definitions can move independently from infrastructure modules while still depending on Terraform outputs.
+Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda execution roles, ECR repositories, Private REST API Gateway resources, DynamoDB tables, and secrets plumbing. CDO owns the serverless hosting infrastructure deployment (VPC, subnets, API Gateway configuration, reserved concurrency settings, security groups, Lambda execution roles, SQS/DLQ queues, and DynamoDB state stores), while AIOps owns the container image builds, contract management, and model logic. Runtime Lambda desired state is managed through Terraform and GitHub Actions (CI/CD) deployment pipelines, so application image versions can move independently from infrastructure modules while still depending on Terraform outputs.
 
 ### 1.2 Module structure
 
@@ -21,7 +25,7 @@ The repository is organized to separate infrastructure modules from environmenta
 ├── iac/
 │   ├── modules/
 │   │   ├── vpc/                  # Private VPC, subnets, NAT gateways, VPC endpoints
-│   │   ├── ecs/                  # ECS cluster control plane, Fargate Capacity Providers
+│   │   ├── api-gateway/          # Private REST API Gateway and stage configurations
 │   │   ├── s3-lakehouse/         # Raw and curated S3 buckets, lifecycle policies
 │   │   ├── glue-catalog/         # Glue databases and tables
 │   │   ├── step-functions/       # Step Functions workflow definitions
@@ -54,7 +58,7 @@ The pipeline manages infrastructure and platform changes for:
 * Lambda functions for ingestion, state handling, alert routing, and containment.
 * S3 raw/curated zones, Glue Data Catalog, Athena query resources.
 * DynamoDB run state and audit tables.
-* ECS cluster, Fargate tasks, Internal ALB, ECR, and ECS workloads.
+* Private API Gateway, API/Worker Lambda container functions, ECR, SQS queues, and Lambda execution roles.
 * IAM roles and environment-specific configuration required by the CDO platform.
 
 ```mermaid
@@ -66,12 +70,12 @@ graph LR
     Review --> Apply[Terraform Apply]
     Apply --> AWS[AWS Infrastructure]
     Apply --> ECR[Build and Push Image to ECR]
-    ECR --> ECS[ECS AI Engine Workloads]
+    ECR --> Lambda[Lambda Container Workloads]
     AWS --> Smoke[Smoke Test]
-    ECS --> Smoke
+    Lambda --> Smoke
 ```
 
-*Caption: GitHub Actions validates every infrastructure change, generates a Terraform plan, applies approved changes to AWS, publishes container images to ECR, updates ECS workloads, and runs a smoke test to verify that the CDO platform can execute the FinOps workflow.*
+*Caption: GitHub Actions validates every infrastructure change, generates a Terraform plan, applies approved changes to AWS, publishes container images to ECR, updates Lambda container workloads, and runs a smoke test to verify that the CDO platform can execute the FinOps workflow.*
 
 The pipeline follows a simple environment flow:
 
@@ -88,21 +92,21 @@ For Pull Requests, the pipeline runs only validation steps:
 * `tflint`
 * Secret scanning
 * IaC security scanning
-* ECS task definition validation
+* Lambda function and container image contract validation
 * Terraform plan generation
 
 Pull Requests do **not** apply changes directly to AWS. The generated Terraform plan is reviewed before merge so the team can see which resources will be created, updated, replaced, or destroyed.
 
 After merge, the deployment stage provisions or updates the infrastructure using Terraform. GitHub Actions assumes an AWS IAM role through **GitHub OIDC**, so no long-lived AWS access keys are stored in GitHub Secrets. Each environment uses a separate IAM role to limit blast radius.
 
-| Pipeline stage  | Main target                           | Purpose                                                        |
-| --------------- | ------------------------------------- | -------------------------------------------------------------- |
-| Validate        | Terraform, scripts                    | Catch invalid infrastructure code before deployment.           |
-| Plan            | Terraform modules                     | Preview AWS infrastructure changes before apply.               |
-| Apply           | AWS infrastructure                    | Provision or update CDO platform components.                   |
-| Build image     | ECR                                   | Store versioned container images for ECS workloads.            |
-| Deploy workload | ECS                                   | Update AI Engine API/worker workloads behind the Internal ALB. |
-| Smoke test      | Step Functions, Lambda, ECS, DynamoDB | Verify the FinOps workflow after deployment.                   |
+| Pipeline stage  | Main target                                    | Purpose                                                                        |
+| --------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ |
+| Validate        | Terraform, scripts                             | Catch invalid infrastructure code before deployment.                           |
+| Plan            | Terraform modules                              | Preview AWS infrastructure changes before apply.                               |
+| Apply           | AWS infrastructure                             | Provision or update CDO platform components.                                   |
+| Build image     | ECR                                            | Store versioned container images for Lambda workloads.                         |
+| Deploy workload | Lambda (API/Worker)                            | Deploy Lambda container functions by publishing versions and updating aliases. |
+| Smoke test      | Step Functions, Lambda, API Gateway, DynamoDB | Verify the FinOps workflow after deployment.                                   |
 
 The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 
@@ -111,13 +115,14 @@ The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 2. Run the ingestion Lambda against synthetic CUR/Cost Explorer data.
 3. Confirm raw and curated data are written to S3.
 4. Confirm Glue/Athena can query the curated cost dataset.
-5. Call the shared ECS-hosted AI Engine endpoint `https://ai-engine.tf-2.internal/` through the Internal ALB using IAM SigV4 authentication.
-6. Confirm alert routing produces Finance/Engineering payloads.
-7. Confirm containment stays in dry-run mode unless the target is dev/sandbox.
-8. Confirm run state and audit records are written to DynamoDB.
+5. Invoke the AI Engine /v1/detect endpoint through the Private REST API Gateway using IAM SigV4 authentication.
+6. Poll /v1/detect/result/{audit_id} via Private API Gateway until execution completes.
+7. Confirm alert routing produces Finance/Engineering payloads.
+8. Confirm containment stays in dry-run mode unless the target is dev/sandbox.
+9. Confirm run state and audit records are written to DynamoDB.
 ```
 
-A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, ECS workloads become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
+A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, Lambda functions and API Gateway endpoints become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
 
 ### 2.2 Branch strategy
 
@@ -132,20 +137,20 @@ A deployment is accepted only when the workflow passes validation, Terraform app
 
 In addition to static code analysis, ECR repositories are configured with **Scan on Push** enabled. Any image uploaded by AIOps is automatically scanned. Container deployment is blocked if the image contains severe CVEs. CI pipelines authenticate to AWS using **OpenID Connect (OIDC)**, eliminating the need to store static AWS Access Keys in GitHub.
 
-The security gate also checks Terraform plans, ECS task definitions, Lambda dependencies, and container images. Required checks include `terraform fmt`, `terraform validate`, TFLint, Checkov or equivalent IaC scanning, Trivy image scan, Gitleaks secret scan, and policy checks that prevent public AI Engine exposure. Any CRITICAL finding blocks deployment unless a documented capstone exception is approved.
+The security gate also checks Terraform plans, Lambda deployment configurations, Lambda dependencies, and container images. Required checks include `terraform fmt`, `terraform validate`, TFLint, Checkov or equivalent IaC scanning, Trivy image scan, Gitleaks secret scan, and policy checks that prevent public AI Engine exposure. Any CRITICAL finding blocks deployment unless a documented capstone exception is approved.
 
 ### 3.2 Destructive-change review
 
 Any Terraform plan that modifies resource indexes or indicates resource deletion (e.g., S3 bucket recreation or IAM role changes) is flagged in the PR summary. These changes require explicit manual verification and dual approvals from both the CDO and Security Leads.
 
-The destructive-change gate is stricter for stateful resources. S3 buckets, DynamoDB tables, KMS keys, ECS clusters, Fargate tasks, IAM roles, and audit storage require reviewer acknowledgement when replacement or deletion appears in the plan. Production plans must fail if they attempt to terminate prod resources, delete data, or modify IAM outside the approved module set.
+The destructive-change gate is stricter for stateful resources. S3 buckets, DynamoDB tables, KMS keys, Private API Gateways, Lambda functions, IAM roles, and audit storage require reviewer acknowledgement when replacement or deletion appears in the plan. Production plans must fail if they attempt to terminate prod resources, delete data, or modify IAM outside the approved module set.
 
 ### 3.3 AI contract compatibility
 
-Before ECS updates are allowed, a pre-deployment script runs validation checks:
-1. Compares the AIOps model version registry against the current ECS target configuration.
+Before Lambda container image updates are allowed, a pre-deployment script runs validation checks:
+1. Compares the AIOps model version registry against the target ECR image manifest.
 2. Performs JSON schema validation on the AI Engine `/v1/detect` request/response API contracts.
-3. If schemas mismatch, the build fails before applying ECS changes, ensuring deployment compatibility.
+3. If schemas mismatch, the build fails before updating the Lambda function configuration, ensuring deployment compatibility.
 
 The compatibility check does not evaluate model quality or inspect AIOps training data. It verifies only the operational contract CDO depends on: endpoint health, request schema, response schema, required fields, model version field, timeout behavior, and failure modes. If the AI Engine is unavailable or incompatible, CDO deployment can proceed only for infrastructure changes that do not enable containment apply paths.
 
@@ -161,17 +166,17 @@ To ensure secure software delivery and prevent tampering in compliance with the 
 
 ### 4.1 Strategy
 
-- **ECS API Workloads**: Deployed using **ECS Rolling Updates** with a max surge of `25%` and max unavailable of `0%`. This ensures stable tasks (AI Engine API Tasks) have new tasks ready before old ones are terminated.
-- **ECS Batch Workers**: ECS Tasks execute dynamically. Updates to worker configurations affect new task invocations without interrupting active runs.
-- **Lambda Functions**: Deployed using **Weighted Aliases**. Traffic shifts gradually: `10%` canary for 5 minutes, transitioning to `100%` if no errors occur.
-- **Fargate Spot Interruption Handling**: AWS ECS handles Fargate Spot interruptions natively. When a termination signal is received, the task enters a draining state for 120 seconds. If a batch scoring task is interrupted, the CDO orchestrator detects the failure and schedules a retry on Fargate Spot or always-on fallback.
+- **AI Engine Lambda Workloads**: Deployed using **Lambda Weighted Aliases** and **API Gateway Stage Deployment**. Traffic shifts gradually: a `10%` canary window for 5 minutes, transitioning to `100%` if no execution errors occur.
+- **Async SQS Lambda Workers**: Deployed using Lambda versions. Updates to worker configurations affect new SQS message pollers immediately.
+- **Lambda Reserved Concurrency**: Configured with a default reserved concurrency limit to act as a rate-limiting and cost guardrail, avoiding execution spikes.
+- **Lambda Timeout & Execution Retry Handling**: The API and Worker Lambda functions are built with automatic retry handling. SQS acts as a buffer; if a Lambda execution is interrupted (e.g., container recycling or platform issue), the message is returned to the queue for a retry, up to a maximum limit, before being routed to the Dead Letter Queue (DLQ).
 
 ### 4.2 Rollback method
 
-- **Primary Rollback**: Reverting a Git commit to the previous stable release SHA triggers an automatic GitHub Actions deployment pipeline run to redeploy the previous stable task definition to the ECS cluster.
-- **Secondary Rollback**: For Lambda functions, the Step Functions workflow catches invocation errors and immediately shifts the Lambda alias weight back to the previous stable version (RTO < 10 seconds).
-- **Infrastructure Rollback**: Terraform rollback is plan-reviewed rather than automatic. State-bearing resources are preserved, `prevent_destroy` remains enabled where supported, and any ECS infrastructure rollback must account for Fargate tasks, ECS task roles, and internal endpoint dependencies.
-- **Runbook Trigger**: Rollback is triggered by failed smoke tests, AI contract validation failure, elevated Step Functions error rate, unhealthy ECS services, or stale dashboard data after deployment.
+- **Primary Rollback**: Reverting a Git commit to the previous stable release SHA triggers an automatic GitHub Actions deployment pipeline run to redeploy the previous stable container digest and configuration to the Lambda function.
+- **Secondary Rollback**: If the Step Functions workflow or smoke tests catch execution errors, a rollback script shifts the Lambda alias weight back to the previous stable version immediately (RTO < 5 seconds).
+- **Infrastructure Rollback**: Terraform rollback is plan-reviewed rather than automatic. State-bearing resources are preserved, `prevent_destroy` remains enabled where supported, and any API Gateway/Lambda infrastructure rollback must account for VPC settings and SQS configuration.
+- **Runbook Trigger**: Rollback is triggered by failed smoke tests, AI contract validation failure, elevated Step Functions or API Gateway error rates, Lambda cold-start failures/timeouts, or stale dashboard data after deployment.
 
 ### 4.3 Budget Guardrails & SLO Circuit Breakers (Error Budget Lock)
 
@@ -189,7 +194,7 @@ We enforce isolation across three AWS accounts:
 | Env | Purpose | Account | Auto-deploy |
 |---|---|---|---|
 | **Sandbox** | Fast iteration, integration smoke tests, and non-prod containment examples. | `1111-2222-3333` | True, from `develop` after checks pass |
-| **Staging** | Validation of AIOps container artifacts, ECS hosting, and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True, from `main` after reviewed merge |
+| **Staging** | Validation of AIOps container artifacts, Private API Gateway routing, and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True, from `main` after reviewed merge |
 | **Prod** | Production control plane. Monitors approved company accounts. Auto-containment is strictly tag/suggest/dry-run. | `7777-8888-9999` | False, requires GitHub environment approval |
 
 Environment-specific values live only in `environments/*`. Sandbox may enable limited non-prod apply-mode examples; staging validates dry-run and integration behavior; prod must keep containment apply disabled by default.
@@ -199,9 +204,9 @@ Environment-specific values live only in `environments/*`. Sandbox may enable li
 Secrets are never embedded in the code or pipeline variables.
 1. The CI/CD runner assumes an IAM role via OIDC to retrieve short-lived tokens.
 2. Secrets (such as Slack webhooks or database passwords) are stored directly in AWS Secrets Manager.
-3. The ECS agent injects these secrets into ECS tasks using native ECS Secrets mapping during task initialization.
+3. Lambda functions retrieve secrets dynamically from AWS Secrets Manager using the AWS SDK, with caching enabled to minimize retrieve calls.
 
-GitHub secrets are limited to non-cloud metadata needed to bootstrap OIDC, not long-lived AWS keys. Terraform receives secret names and ARNs, not secret values. The deployment pipeline verifies that Terraform ECS configurations and Terraform outputs do not expose API keys, webhook URLs, or AI Engine credentials.
+GitHub secrets are limited to non-cloud metadata needed to bootstrap OIDC, not long-lived AWS keys. Terraform receives secret names and ARNs, not secret values. The deployment pipeline verifies that Terraform Lambda configurations and Terraform outputs do not expose API keys, webhook URLs, or AI Engine credentials.
 
 ## 7. Scheduled batch deployment
 
@@ -223,21 +228,21 @@ The platform's operational health is monitored using a centralized observability
 
 | Component | Tool | Purpose |
 |---|---|---|
-| **Log Aggregator** | CloudWatch Logs / Container Insights | Centralizes application, Lambda, and ECS container stdout logs. |
-| **Trace Analyzer** | AWS X-Ray | Traces requests from Step Functions, through Lambda, to the ECS internal ALB. |
-| **Metrics Collector** | Prometheus / Managed Grafana | Tracks ECS task CPU/Memory usage and Fargate capacity provider allocations. |
+| **Log Aggregator** | CloudWatch Logs | Centralizes application, Lambda container, and API Gateway execution logs. |
+| **Trace Analyzer** | AWS X-Ray | Traces requests from Step Functions, through API Gateway and API Lambda, to SQS and Worker Lambda execution. |
+| **Metrics Collector** | CloudWatch Metrics / X-Ray | Tracks Lambda execution duration, cold starts, concurrency, SQS queue age, and API Gateway latency. |
 | **Alarms Engine** | CloudWatch Alarms | Sends alerts via SNS if Step Functions fail, or if the dashboard data is stale (>26 hours). |
 
-Core deployment alarms cover Step Functions failure, Lambda error rate, AI Engine internal endpoint unavailability, ECS service unhealthy state, excessive pending tasks, spot interruption spikes, audit write failure, and dashboard data freshness. Deployment is not considered complete until these alarms are present and the smoke test writes an audit record.
+Core deployment alarms cover Step Functions failure, Lambda error rate, AI Engine internal endpoint unavailability, API Gateway gateway/integration errors, SQS age of oldest message spikes, Lambda reserved concurrency throttling, audit write failure, and dashboard data freshness. Deployment is not considered complete until these alarms are present and the smoke test writes an audit record. All audit records generated during deployment validation are stored in compliance-ready S3 buckets with Object Lock enabled, adhering to the strict platform requirement of >=90 days audit retention.
 
 ## 9. Open questions
 
-- [ ] **ECS Topology**: Should we manage ECS tasks using a single central pipeline, or deploy environment-specific GitHub Actions runners?
-- [ ] **Grafana Integration**: Should the engineering metrics dashboard be shared with the AIOps team, or kept restricted to the CDO infrastructure team?
+- [ ] **Lambda Warm-up**: Should we deploy pre-warmed Provisioned Concurrency for peak execution times, or is the standard cold-start acceptable for our 24h cadence?
+- [ ] **Metrics Integration**: Should the engineering CloudWatch dashboards be shared with the AIOps team, or kept restricted to the CDO infrastructure team?
 - [ ] **Plan Artifact Retention**: How long should reviewed Terraform plan artifacts be retained for staging and prod audit evidence?
 - [ ] **Prod Release Branching**: Should production releases use a protected `prod` branch or GitHub release tags backed by environment approval?
 
 ## Related documents
 
-- [`02_infra_design.md`](02_infra_design.md) - ECS cluster layout, network subnets, and capacity provider routing.
-- [`03_security_design.md`](03_security_design.md) - ECS Task Role configurations, secrets inventory, and security groups.
+- [`02_infra_design.md`](02_infra_design.md) - Private REST API Gateway, API/Worker Lambda container functions, and SQS/DLQ routing.
+- [`03_security_design.md`](03_security_design.md) - Lambda Execution Role configurations, VPC endpoints, and security groups.

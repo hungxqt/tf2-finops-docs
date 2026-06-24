@@ -2,6 +2,10 @@
 
 <!-- Source: 02_infra_design.md. Scope excludes AI Engine hosting platform. -->
 
+> [!IMPORTANT]
+> **Ranh giới Bảo mật**: Mọi thành phần hạ tầng và kiểm soát truy cập thuộc quyền sở hữu của CDO được mô tả ở đây phải tuân thủ nghiêm ngặt ranh giới cứng: **NEVER terminate prod, delete data, hoặc modify IAM**.
+
+
 Tài liệu này mở rộng các hợp phần AWS được mô tả trong [`02_infra_design.md`](02_infra_design.md) thành các chi tiết về vai trò (role), mục đích (purpose), đầu vào (input) và đầu ra (output).
 
 Phạm vi là phân hệ kiểm soát FinOps (FinOps control plane) do CDO sở hữu:
@@ -14,7 +18,7 @@ Phạm vi là phân hệ kiểm soát FinOps (FinOps control plane) do CDO sở 
 - Chỉ áp dụng các chế độ ngăn chặn an toàn (safe containment modes).
 - Lưu giữ bằng chứng kiểm toán (audit evidence) để xem xét và hiển thị trên dashboard.
 
-Tài liệu này ghi chép các hợp phần thuộc sở hữu của CDO, bao gồm cả hạ tầng hosting ECS Fargate dùng chung (cluster, capacity providers, task definitions, load balancers, và cô lập mạng) được triển khai để host container AI Engine do đội ngũ AIOps cung cấp. Nó loại trừ các phần bên trong mô hình AI (model internals), logic, trọng số (weights) và tập dữ liệu huấn luyện (training datasets) thuộc sở hữu của AIOps.
+Tài liệu này ghi chép các hợp phần thuộc sở hữu của CDO, bao gồm cả Private API Gateway, các hàm container Lambda, triển khai hình ảnh ECR theo digest, vai trò thực thi Lambda và cô lập mạng được triển khai để host container AI Engine do đội ngũ AIOps cung cấp. Nó loại trừ các phần bên trong mô hình AI (model internals), logic, trọng số (weights) và tập dữ liệu huấn luyện (training datasets) thuộc sở hữu của AIOps.
 
 ## Ranh giới Phạm vi
 
@@ -28,7 +32,7 @@ Tài liệu này ghi chép các hợp phần thuộc sở hữu của CDO, bao g
 | Định tuyến cảnh báo | Có | CDO sở hữu việc định tuyến cảnh báo cho Tài chính và Kỹ thuật. |
 | Ngăn chặn an toàn (Safe containment) | Có | CDO sở hữu các đường dẫn ngăn chặn dry-run, gắn thẻ (tag), đề xuất (suggest) và ngăn chặn không chính thức (non-prod) đã được phê duyệt. |
 | Hợp đồng API AI Engine | Có | CDO gọi, xác thực và tuân thủ các hợp đồng API và telemetry được phân bản (versioned API). |
-| Hạ tầng Hosting AI Engine | Có | CDO triển khai và vận hành ECS Fargate cluster, các capacity providers, các tasks, Load Balancer nội bộ (Internal ALB) và cấu hình bảo mật. |
+| Hạ tầng Hosting AI Engine | Có | CDO triển khai và vận hành Private API Gateway, các hàm container Lambda, các vai trò thực thi Lambda và cấu hình bảo mật. |
 | Các phần bên trong mô hình AI & tập dữ liệu | Không | AIOps sở hữu logic mô hình, huấn luyện, trọng số và tập dữ liệu backtest. |
 
 ## Tóm tắt Hợp phần
@@ -60,12 +64,11 @@ Tài liệu này ghi chép các hợp phần thuộc sở hữu của CDO, bao g
 | 23 | Dashboard Tài chính (Finance Dashboard) | Amazon S3 + CloudFront | Trình bày các giao diện tĩnh dựa trên web dễ đọc cho bộ phận Tài chính mà không cần SQL; QuickSight được giữ lại làm tùy chọn BI trong tương lai. |
 | 24 | Các Kênh Cảnh báo (Alert Channels) | Amazon SNS, Slack API, SES | Gửi các thông báo Tài chính, Kỹ thuật, Nền tảng và Bảo mật. |
 | 25 | Giám sát CloudWatch (CloudWatch Monitoring) | CloudWatch Logs, Metrics, Alarms | Quan sát các lỗi của quy trình công việc (workflow), dữ liệu cũ (stale data) và lỗi gửi thông báo. |
-| 26 | Cluster ECS Dùng chung (Shared ECS Cluster) | Amazon ECS Fargate | Nền tảng điều phối container serverless tập trung ('tf-2-aiops-cluster'). |
-| 27 | Dịch vụ và Tác vụ ECS (ECS Service and Tasks) | Các tác vụ của ECS service `ai-engine` | Chạy các tác vụ giải thích API AI (AI API explainer tasks) (luôn chạy - always-on) và tác vụ chạy lô/huấn luyện lại (batch/retraining tasks) (Spot). |
-| 28 | Load Balancer AI nội bộ (Internal AI Load Balancer) | ALB nội bộ cho các dịch vụ ECS | Cung cấp endpoint `https://ai-engine.tf-2.internal/` cho CDO-01/CDO-02. |
-| 29 | Kho lưu trữ hình ảnh ECR (ECR Image Repository) | Amazon ECR | Lưu trữ các artifact hình ảnh container (container image artifacts) của AIOps được triển khai bằng cách ghim mã hash (digest pinning). |
-| 30 | Các Hàng đợi SQS của AI Engine | Amazon SQS | Quản lý các hàng đợi tách rời: hàng đợi chính (primary queue), hàng đợi thư rác (DLQ - Dead Letter Queue), và hàng đợi khôi phục (rollback queue). |
-| 31 | Kho lưu trữ DynamoDB của AI Engine | Amazon DynamoDB | Các bảng trạng thái bền vững cho tính không thay đổi khi chạy lại (idempotency), sổ cái kiểm toán (audit-ledger) và các dữ liệu bất thường (anomalies). |
+| 26 | Các hàm Container Lambda của AI Engine | AWS Lambda | Chạy suy luận API AI và các tác vụ phát hiện bất thường không đồng bộ sử dụng hình ảnh container của AIOps. |
+| 27 | Private API Gateway | Amazon API Gateway | API Gateway REST riêng tư cung cấp các endpoint của AI Engine thông qua VPC interface endpoint. |
+| 28 | Kho lưu trữ ECR (ECR Repository) | Amazon ECR | Lưu trữ các hình ảnh container AI Engine của AIOps được triển khai bằng cách ghim digest (digest pinning). |
+| 29 | Hàng đợi SQS/DLQ của AI Engine | Amazon SQS | Quản lý các hàng đợi tách rời: hàng đợi yêu cầu và hàng đợi thư rác (DLQ). |
+| 30 | Các kho lưu trữ DynamoDB của AI Engine | Amazon DynamoDB | Các bảng trạng thái bền vững cho kết quả thực thi, tính không lặp lại (idempotency) và bất thường. |
 
 ## Các Hợp phần Loại trừ
 
@@ -220,7 +223,7 @@ EventBridge Scheduler kích hoạt quy trình làm việc FinOps theo một chu 
 
 ### Mục đích (Purpose)
 
-Nó khởi động đường dẫn kiểm tra chi phí hàng ngày (daily cost inspection pipeline) mà không cần chạy một bộ lập lịch luôn hoạt động (always-on scheduler) hoặc các tác vụ cron theo lịch trình của ECS task (ECS task scheduled cron workload).
+Nó khởi động đường dẫn kiểm tra chi phí hàng ngày (daily cost inspection pipeline) mà không cần chạy một bộ lập lịch luôn hoạt động (always-on scheduler) hoặc các tác vụ cron container serverless (serverless container cron workload).
 
 ### Đầu vào (Input)
 
@@ -354,7 +357,7 @@ Lambda Client Hợp đồng AI gọi điểm cuối AI Engine dùng chung của 
 
 ### Mục đích (Purpose)
 
-Nó là ranh giới giữa logic phân hệ kiểm soát (control-plane logic) CDO mang tính xác định và việc phát hiện bất thường do AIOps sở hữu. CDO xác thực yêu cầu và phản hồi, đồng thời host hạ tầng ECS dùng chung, nhưng không sở hữu hoặc huấn luyện chính mô hình AI.
+Nó là ranh giới giữa logic phân hệ kiểm soát (control-plane logic) CDO mang tính xác định và việc phát hiện bất thường do AIOps sở hữu. CDO xác thực yêu cầu và phản hồi, đồng thời host nền tảng hosting riêng tư cho các hàm Lambda, nhưng không sở hữu hoặc huấn luyện chính mô hình AI.
 
 ### Đầu vào (Input)
 
@@ -775,124 +778,106 @@ Nó cung cấp khả năng phát hiện vận hành cho các quy trình công vi
 - Cảnh báo cho kỹ sư vận hành (operator alerts).
 - Bằng chứng cho thấy nền tảng đã chạy, bị lỗi, thử lại hoặc đã phục hồi.
 
-## 26. Shared ECS Cluster
+## 26. Các hàm Container Lambda của AI Engine
 
 ### Vai trò (Role)
 
-Nền tảng điều phối container serverless tập trung (`tf-2-aiops-cluster`).
+Chạy các khối lượng công việc của AI Engine được container hóa (thực thi suy luận và phát hiện bất thường không đồng bộ).
 
 ### Mục đích (Purpose)
 
-Triển khai và quản lý các Fargate tasks trong các subnet riêng tư, đảm bảo tính sẵn sàng cao (high availability), cô lập mạng và tự động co giãn (autoscaling).
-
-### Đầu vào (Input)
-
-- Cấu hình khởi chạy cluster (Terraform).
-- VPC ID và danh sách các subnet riêng tư (private subnets).
-- Chính sách vai trò thực thi tác vụ AWS IAM (task execution role policies).
-
-### Đầu ra (Output)
-
-- Tài nguyên tính toán container serverless được cấp phát.
-- Các chỉ số vòng đời tác vụ (task lifecycle metrics) và nhật ký Container Insights.
-
-## 27. ECS Service and Tasks
-
-### Vai trò (Role)
-
-Thực thi khối lượng công việc của AI Engine được container hóa (dịch vụ `ai-engine`).
-
-### Mục đích (Purpose)
-
-Chia nhỏ hoạt động thực thi: các tác vụ giải thích API/ổn định chạy trên các Fargate always-on tasks, trong khi các tác vụ huấn luyện lại tải nặng dạng lô (heavy batch retraining), kỹ thuật đặc trưng (feature engineering) và chấm điểm (scoring) chạy trên các tác vụ Fargate Spot (Fargate Spot capacity provider tasks) để tối ưu chi phí.
+Thực hiện suy luận và phân tích mô hình bên trong một hàm Lambda được khởi tạo từ hình ảnh container do AIOps cung cấp, sử dụng mức concurrency dành riêng (reserved concurrency) làm rào chắn bảo vệ.
 
 ### Đầu vào (Input)
 
 - Hash hình ảnh ECR không thể thay đổi (immutable ECR image digest).
-- Cấu hình tác vụ: 2 vCPU, 4 GB memory, thời gian hết hạn tác vụ 300 giây.
-- Các biến môi trường lấy từ Secrets Manager.
+- ARN vai trò thực thi Lambda.
+- Các biến môi trường chứa cấu hình bảng DB, hàng đợi và tham số.
+- Các tin nhắn SQS hoặc payload gọi trực tiếp.
+- Cấu hình mức concurrency dành riêng (reserved concurrency).
 
 ### Đầu ra (Output)
 
-- Các container đang chạy bên trong các subnet VPC riêng tư.
-- Giao diện các hàng đợi xử lý SQS.
+- Các tác vụ container đã thực thi.
+- Kết quả phát hiện bất thường được ghi vào DynamoDB và nhật ký được gửi tới CloudWatch/X-Ray.
 
-## 28. Internal AI Load Balancer
+## 27. Private API Gateway
 
 ### Vai trò (Role)
 
-Cung cấp dịch vụ AI Engine thông qua Route 53 private DNS.
+Cung cấp dịch vụ AI Engine một cách riêng tư bên trong VPC.
 
 ### Mục đích (Purpose)
 
-Cho phép giao tiếp nội bộ VPC an toàn để CDO-01 và CDO-02 gọi AI Engine dùng chung tại địa chỉ `https://ai-engine.tf-2.internal/` bằng cách sử dụng TLS 1.3 và xác thực IAM SigV4.
+Cung cấp các endpoint `/v1/detect` và `/v1/detect/result/{audit_id}` với xác thực IAM SigV4. Chuyển tiếp các yêu cầu `/v1/detect` đến SQS/API Lambda, trả về mã `202 Accepted` ngay lập tức, và trả về kết quả thực thi từ DynamoDB qua các yêu cầu GET.
 
 ### Đầu vào (Input)
 
-- Ánh xạ target groups tới các cổng tác vụ Fargate always-on.
-- Định nghĩa vùng DNS riêng tư của Route 53.
-- Lưu lượng đầu vào nhóm bảo mật (Security Group ingress): chỉ cho phép lưu lượng từ nhóm bảo mật nền tảng CDO (CDO Platforms SG).
+- Các cấu hình API Gateway REST API.
+- Chính sách tài nguyên (resource policy) giới hạn truy cập cho các VPC interface endpoints cụ thể.
+- Các tích hợp đích (tích hợp trực tiếp với API Lambda, DynamoDB hoặc SQS).
 
 ### Đầu ra (Output)
 
-- Endpoint HTTPS được cân bằng tải nội bộ (internal load balanced HTTPS endpoint).
+- Các endpoint REST riêng tư chỉ có thể truy cập qua VPC endpoint.
+- Xác thực yêu cầu đã ký và định tuyến payload.
 
-## 29. ECR Image Repository
+## 28. Kho lưu trữ ECR (ECR Repository)
 
 ### Vai trò (Role)
 
-Kho lưu trữ hình ảnh container không thể thay đổi (`tf2/finops-ai-engine`).
+Lưu trữ các hình ảnh container AI Engine của AIOps được gắn thẻ phiên bản.
 
 ### Mục đích (Purpose)
 
-Lưu trữ các hình ảnh Docker được gắn thẻ phiên bản và ký số từ AIOps, được quét lỗi bảo mật (CVEs) trước khi triển khai.
+Hoạt động như một kho lưu trữ duy nhất để triển khai. Hình ảnh được ghim bằng mã băm SHA256 (digest pinning) trong cấu hình Lambda.
 
 ### Đầu vào (Input)
 
-- Hình ảnh Docker được build từ quy trình CI pipeline.
-- Các khóa ký số của AWS Signer.
-- Các bộ kích hoạt quét lỗi bảo mật Trivy.
+- Hình ảnh được build từ quy trình CI/CD.
+- Quét lỗi bảo mật CVE và các thẻ xác thực tuân thủ.
 
 ### Đầu ra (Output)
 
-- Các hash hình ảnh không thể thay đổi (`sha256:...`) được kéo bởi ECS Fargate.
+- URI hình ảnh đã ghim (`.dkr.ecr.ap-southeast-1.amazonaws.com/ai-engine@sha256:...`) được kéo bởi AWS Lambda.
 
-## 30. AI Engine SQS Queues
+## 29. Hàng đợi SQS/DLQ của AI Engine
 
 ### Vai trò (Role)
 
-Tách rời tin nhắn dựa trên hàng đợi (queue-based message decoupling) giữa CDO và AI Engine.
+Tách rời tin nhắn dựa trên hàng đợi không đồng bộ giữa CDO gọi và worker AI Engine.
 
 ### Mục đích (Purpose)
 
-Quản lý hàng đợi yêu cầu chính (primary request queue), hàng đợi khôi phục (rollback queue), và hàng đợi thư rác (DLQ - Dead Letter Queue) với ngưỡng lỗi độc hại (poison threshold) là 3 lần thử lại.
+Xử lý các yêu cầu phát hiện đầu vào dưới dạng tin nhắn SQS để cho phép API Gateway phản hồi nhanh chóng (`202 Accepted`) và cho phép Lambda worker tiêu thụ tin nhắn ở tốc độ được kiểm soát, định tuyến các tin nhắn bị lỗi liên tục (poison messages) đến DLQ sau 3 lần thử lại.
 
 ### Đầu vào (Input)
 
-- Payload phát hiện bất thường dạng JSON từ các CDO Lambdas.
-- Tín hiệu hoàn thành khôi phục (rollback complete signals).
+- Payload JSON chứa các mục tiêu phát hiện bất thường.
+- Cấu hình Hàng đợi thư rác (Dead Letter Queue).
 
 ### Đầu ra (Output)
 
-- Các tin nhắn được lấy ra khỏi hàng đợi (de-queued messages) để các tác vụ Fargate tiêu thụ.
+- Các trình kích hoạt hàng đợi (queue triggers) cho Lambda worker của AI Engine.
+- Cảnh báo DLQ khi gửi tin nhắn thất bại.
 
-## 31. AI Engine DynamoDB Stores
+## 30. Các kho lưu trữ DynamoDB của AI Engine
 
 ### Vai trò (Role)
 
-Các cơ sở dữ liệu bền vững (persistent databases) cho trạng thái của AI Engine.
+Các cơ sở dữ liệu bền vững cho trạng thái thực thi, kết quả và tính không lặp lại (idempotency).
 
 ### Mục đích (Purpose)
 
-Lưu tạm (cache) các tóm tắt Cost Explorer, các khóa không thay đổi khi chạy lại (idempotency keys), sổ cái bất thường (anomalies ledger) và các vòng lặp phản hồi học tập chủ động từ con người (human active learning feedback loops).
+Lưu trữ các khóa khóa chạy, bản ghi không lặp lại, kết quả phát hiện bất thường và các kiểm toán thực thi ngăn chặn với thời gian lưu trữ >=90 ngày.
 
 ### Đầu vào (Input)
 
-- Các lệnh ghi từ hoạt động Thu nhận và Tác vụ AI Engine.
+- Các lệnh ghi từ các hàm Lambda Container AI Engine, các Lambda nền tảng CDO.
 
 ### Đầu ra (Output)
 
-- Kết quả truy cập để phục vụ định tuyến cảnh báo và dashboard.
+- Truy vấn độ trễ thấp phục vụ việc thăm dò của Step Functions và dashboard S3 + CloudFront.
 
 ## Luồng Dữ liệu ở Cấp độ Hợp đồng (Contract-Level Data Flows)
 
@@ -909,7 +894,7 @@ Lưu tạm (cache) các tóm tắt Cost Explorer, các khóa không thay đổi 
 
 | Trường | Chi tiết |
 | --- | --- |
-| Các hợp phần CDO chịu trách nhiệm | Step Functions, Lambda Client Hợp đồng AI, DynamoDB, nhật ký kiểm toán S3, ALB nội bộ |
+| Các hợp phần CDO chịu trách nhiệm | Step Functions, Lambda Client Hợp đồng AI, DynamoDB, nhật ký kiểm toán S3, Private API Gateway |
 | Các hợp phần loại trừ | Trọng số mô hình AI Engine, các tác vụ huấn luyện AI, tập dữ liệu huấn luyện mô hình, và logic bên trong mô hình AI |
 | Đầu vào | Khung thời gian chi phí đã chuẩn hóa, ID lượt chạy (run ID), phạm vi tài khoản, phiên bản hợp đồng, khung thời gian bằng chứng (evidence window) |
 | Đầu ra | Phiên bản mô hình, ID bất thường, độ tin cậy, độ nghiêm trọng, chi tiêu kỳ vọng, chi tiêu thực tế, chênh lệch (delta), giải thích, định tuyến được đề xuất, chế độ ngăn chặn được đề xuất, URI bằng chứng |
@@ -942,7 +927,7 @@ Lưu tạm (cache) các tóm tắt Cost Explorer, các khóa không thay đổi 
 | `1.1 High-Level Architecture Overview` | Bộ điều phối, lakehouse, động cơ cảnh báo/ngăn chặn, dashboard/các kênh |
 | `1.2 Ingestion & Data Lakehouse Workflow` | CUR, Cost Explorer, Scheduler, Step Functions, Lambda Thu nhận, S3 Raw, S3 Curated, Glue, Athena |
 | `1.4 Alerting & Containment Engine` | Lambda Cảnh báo, Lambda Ngăn chặn, Lambda Trạng thái, DynamoDB trạng thái/kiểm toán, tài nguyên thành viên, Slack, SES, dashboard S3 + CloudFront |
-| `2. Component table` | EventBridge Scheduler, Step Functions, Lambda, S3, Glue, Athena, DynamoDB, Secrets Manager, dashboard S3 + CloudFront, SNS/Slack, nhân tố Ngăn chặn (Containment Worker), ECS Fargate, ALB, ECR, SQS |
+| `2. Component table` | EventBridge Scheduler, Step Functions, Lambda, S3, Glue, Athena, DynamoDB, Secrets Manager, dashboard S3 + CloudFront, SNS/Slack, nhân tố Ngăn chặn (Containment Worker), Private API Gateway, các hàm container Lambda, ECR, SQS |
 | `4. Multi-account approach` | Các tài khoản thành viên, vai trò liên tài khoản kéo CUR, vai trò liên tài khoản ngăn chặn, quy trình onboarding tài khoản, tính không thay đổi khi chạy lại (idempotency) |
-| `6. Scaling strategy` | Phân vùng Athena, tự động co giãn theo yêu cầu (on-demand scaling) của DynamoDB, tự động co giãn tác vụ ECS (ECS task autoscaling) |
-| `7. Failure modes + recovery` | Trễ CUR, nghẽn API Cost Explorer, lỗi quy trình làm việc (workflow failure), chạy trùng lặp, dữ liệu dashboard cũ, lỗi gửi cảnh báo, bị từ chối ngăn chặn, không khớp hợp đồng AI, gián đoạn tác vụ Spot (Spot task interruption) |
+| `6. Scaling strategy` | Phân vùng Athena, tự động co giãn theo yêu cầu (on-demand scaling) của DynamoDB, tự động co giãn concurrency dành riêng của Lambda (Lambda reserved concurrency scaling) |
+| `7. Failure modes + recovery` | Trễ CUR, nghẽn API Cost Explorer, lỗi quy trình làm việc (workflow failure), chạy trùng lặp, dữ liệu dashboard cũ, lỗi gửi cảnh báo, bị từ chối ngăn chặn, không khớp hợp đồng AI, khởi động lạnh Lambda và hết hạn API Gateway |

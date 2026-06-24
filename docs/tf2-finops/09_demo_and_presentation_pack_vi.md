@@ -4,6 +4,10 @@
      Status: Refined (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Ranh giới Bảo mật**: Môi trường demo và mọi kịch bản thuyết trình phải thể hiện sự tuân thủ nghiêm ngặt ranh giới bảo mật cứng: **NEVER terminate prod, delete data, hoặc modify IAM**.
+
+
 ## 1. Kịch bản demo (Demo script)
 
 Kịch bản này hướng dẫn người thuyết trình cách trình diễn toàn bộ các khả năng của nền tảng FinOps Watch CDO, giả lập luồng công việc phát hiện và giảm thiểu bất thường chi phí thực tế với dữ liệu giả lập.
@@ -21,7 +25,7 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
 
 ### Bước 3 - Gọi endpoint AI Engine dùng chung (Step 3 - Invoke shared AI Engine endpoint - POST /v1/detect)
 - **Hành động (Action)**: Giám sát luồng công việc Step Functions thu thập dữ liệu khi nó đạt đến trạng thái chấm điểm AI (AI scoring state).
-- **Hành động nội bộ (Internal Action)**: Lambda xử lý dữ liệu thực hiện yêu cầu không đồng bộ HTTP POST đến endpoint AI Engine dùng chung duy nhất của Task Force qua `https://ai-engine.tf-2.internal/v1/detect` sử dụng xác thực IAM SigV4.
+- **Hành động nội bộ (Internal Action)**: Luồng công việc Step Functions thực hiện cuộc gọi HTTP POST đến Private REST API Gateway endpoint của AI Engine tại `/v1/detect` sử dụng xác thực IAM SigV4.
 - **Request Headers tiêu chuẩn**:
   - `X-Tenant-Id`: Xác định bên thuê (ví dụ: `CDO-01`).
   - `X-Idempotency-Key`: Khóa kết hợp format `tenant_id:YYYY-MM-DD` (ví dụ: `CDO-01:2026-06-24`).
@@ -39,8 +43,8 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
   - `retry_after_seconds`: `30`
 
 ### Bước 4 - Lấy kết quả bằng Polling (GET /v1/detect/result/{audit_id}) & Thực thi tác vụ container AI Engine (Step 4 - Poll results & Execute AI Engine task)
-- **Hành động (Action)**: Thực hiện gọi định kỳ lấy kết quả (polling) từ endpoint `GET /v1/detect/result/{audit_id}` sau mỗi 30 giây.
-- **Hành động nội bộ (Internal Action)**: AI Engine chạy trên ECS Fargate (kích thước tác vụ: 2 vCPU, 4 GB; cụm: `tf-2-aiops-cluster`) xử lý payload thu thập dữ liệu. Container image (do AIOps sở hữu) thực thi chấm điểm mô hình AI, đánh giá điểm độ tin cậy bất thường và tổng hợp chi tiết RCA. Khi hoàn thành, yêu cầu polling trả về HTTP `200 OK`.
+- **Hành động (Action)**: Thực hiện gọi định kỳ lấy kết quả (polling) từ endpoint `GET /v1/detect/result/{audit_id}` qua Private API Gateway sau mỗi 30 giây.
+- **Hành động nội bộ (Internal Action)**: AI Engine chạy trên hạ tầng AWS Lambda container functions xử lý payload thu thập dữ liệu. SQS lưu đệm các request; hàm Worker Lambda container thực thi chấm điểm mô hình AI, đánh giá điểm độ tin cậy bất thường và tổng hợp chi tiết RCA, ghi nhận kết quả vào DynamoDB. Khi hoàn thành, yêu cầu polling trả về HTTP `200 OK`.
 - **Payload phản hồi**:
   - `audit_id`: Khớp với UUID thực thi.
   - `anomalies_list`: Mảng các bất thường phát hiện được cùng điểm tin cậy và giải thích chi tiết.
@@ -80,7 +84,7 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
 Danh sách này phác thảo các tệp nhật ký, bảng cơ sở dữ liệu và thông tin liên lạc cụ thể cần thiết để xác minh tính thực thi thành công của pipeline nền tảng CDO trong các buổi kiểm toán.
 
 - **Các tệp nhật ký CUR trong S3 (CUR logs in S3)**: Các tệp thu thập dữ liệu được lưu trữ dưới `s3://cdo-raw-cost-bucket/exports/` xác nhận khả năng tương thích định dạng dữ liệu thô.
-- **Xác minh VPC Flow Logs & IAM SigV4**: Các nhật ký cho thấy lưu lượng HTTP nội bộ được định tuyến an toàn tới `https://ai-engine.tf-2.internal/` với chữ ký yêu cầu SigV4 và không có lưu lượng thoát ra internet.
+- **Xác minh VPC Flow Logs & IAM SigV4**: Nhật ký cho thấy log thực thi của Private REST API Gateway và lưu lượng qua VPC Endpoint với chữ ký yêu cầu SigV4 và không có lưu lượng thoát ra internet.
 - **Các bản ghi DynamoDB (DynamoDB records)**:
   - Bảng anomalies: Bản ghi chứa `anomaly_id`, `confidence_score` và `explanation` từ AI Engine, cùng với các tham số phân trang.
   - Bảng audit trail: Bản ghi chứa đầy đủ 14 trường hành động containment, xác minh `correlation_id` khớp với luồng thực thi Step Functions, và chứa một khối liên kết kiểm toán mã hóa tính theo công thức `sha256(current_payload + previous_hash)`.
@@ -97,7 +101,7 @@ Danh sách này phác thảo các tệp nhật ký, bảng cơ sở dữ liệu 
 Các điểm bán hàng chính của kiến trúc data lakehouse tập trung vào hồ dữ liệu serverless cho kiểm soát FinOps:
 
 - **Tiết kiệm chi phí nhờ mô hình Serverless (Serverless cost savings)**: Bằng cách chọn S3, Glue và Athena cho data lakehouse, nền tảng hoạt động với chi phí cực thấp so với các cơ sở dữ liệu luôn chạy truyền thống (RDS/Redshift). Chi phí tính toán chỉ phát sinh trong cửa sổ thực thi truy vấn, mang lại mức tiết kiệm lên tới 90% cho các hoạt động xử lý hàng loạt hàng ngày.
-- **Tối ưu hóa hosting AI dùng chung (Shared AI hosting optimization)**: Việc triển khai một điểm cuối AI Engine dùng chung duy nhất (`https://ai-engine.tf-2.internal/`) được host trên ECS Fargate (cụm `tf-2-aiops-cluster` sử dụng Fargate Spot cho các tác vụ xử lý hàng loạt) giúp tối ưu hóa dung lượng tính toán giữa nhiều nền tảng CDO trong khi vẫn giữ cách ly khối lượng công việc thông qua header `X-Tenant-Id`.
+- **Tối ưu hóa hosting AI dùng chung (Shared AI hosting optimization)**: Việc triển khai các endpoint AI Engine dùng chung phía sau Private REST API Gateway host trên các hàm AWS Lambda container giúp tối ưu hóa dung lượng tính toán giữa nhiều nền tảng CDO (loại bỏ chi phí nhàn rỗi của ECS/ALB) trong khi vẫn giữ cách ly khối lượng công việc thông qua header `X-Tenant-Id` và Resource Policy của API Gateway.
 - **Tuân thủ đầy đủ (Complete compliance)**: Nhật ký kiểm toán hai lớp (DynamoDB cho tốc độ giao diện người dùng và S3 với Object Lock cho tính không thể sửa đổi) đảm bảo rằng tất cả các hành động tự động và được đề xuất được bảo tồn trong ít nhất 90 ngày, đáp ứng các quy định kiểm toán tài chính. Mỗi mục nhật ký kiểm toán được liên kết mã hóa bằng `sha256(current_payload + previous_hash)` để chống giả mạo.
 - **Vận hành không rủi ro (Risk-free operation)**: Các cấu hình mặc định dry-run nghiêm ngặt trong môi trường sản xuất (production) và chạy thử (staging) giúp ngăn ngừa việc gián đoạn dịch vụ ngoài ý muốn. Tự động hóa được giới hạn một cách an sau trong môi trường non-production/sandbox nơi các chính sách được thực thi nghiêm ngặt.
 - **Cách ly đa người thuê (Multi-tenant isolation)**: Các tiền tố S3 có cấu trúc và phân vùng Glue tách biệt dữ liệu chi phí theo tài khoản và squad. Truy cập chéo tài khoản dựa trên các chính sách IAM assume-role chỉ đọc, ngăn chặn các di chuyển ngang không được phép.
@@ -120,8 +124,8 @@ Các lập luận kiến trúc cho các câu hỏi thử thách phổ biến:
   - *Phản hồi*: Các tài nguyên tĩnh của bảng điều khiển được cập nhật ngay lập tức vào cuối mỗi lần chạy pipeline. Một invalidation CloudFront được kích hoạt bằng lập trình để xóa các bộ nhớ đệm ở cạnh. Một nút "Sync Now" cũng được cung cấp trên giao diện để truy vấn trực tiếp các bản ghi DynamoDB.
 - **Bảo mật hoàn tác được thực thi như thế nào để ngăn chặn các thay đổi tài nguyên trái phép? (How is rollback security enforced to prevent unauthorized resource changes?)**
   - *Phản hồi*: Việc thực thi hoàn tác gọi endpoint API `POST /v1/action/rollback`. Nó yêu cầu các quyền IAM và xác minh MFA tương tự. Mỗi yêu cầu rollback phải được gắn với một ID sự cố hoặc change ticket hợp lệ, và hành động này được ghi nhật ký đầy đủ vào nhật ký kiểm toán WORM trong S3.
-- **Ai sở hữu triển khai và vòng đời vận hành ECS Fargate của AI Engine dùng chung? (Who owns the ECS Fargate deployment and operational lifecycle of the shared AI Engine?)**
-  - *Phản hồi*: CDO sở hữu việc triển khai hạ tầng host (VPC, subnets, internal ALB, DNS, task sizing, autoscaling, security groups, task IAM roles, queues, và DynamoDB state stores) để đảm bảo tính sẵn sàng, bảo mật của hệ thống và xác thực SigV4. AIOps sở hữu logic mô hình AI, logic RCA/khuyến nghị, thực thi rules engine dự phòng cục bộ, tuân thủ hợp đồng API nội bộ, và build container image.
+- **Ai sở hữu triển khai và vòng đời vận hành Lambda container của AI Engine dùng chung? (Who owns the Lambda container deployment and operational lifecycle of the shared AI Engine?)**
+  - *Phản hồi*: CDO sở hữu việc triển khai hạ tầng host (VPC, subnets, Private REST API Gateway, giới hạn concurrency, role execution, queues, và DynamoDB state stores) để đảm bảo tính sẵn sàng, bảo mật của hệ thống và xác thực SigV4. AIOps sở hữu logic mô hình AI, logic RCA/khuyến nghị, thực thi rules engine dự phòng cục bộ, tuân thủ hợp đồng API nội bộ, và build container image.
 - **Điều gì xảy ra nếu AI Engine gặp lỗi, quá thời gian phản hồi, hoặc nhận được các yêu cầu trùng lặp? (What happens if the AI Engine fails, times out, or receives duplicate requests?)**
   - *Phản hồi*: Nếu AI Engine phát hiện các khóa idempotency trùng lặp, nó trả về HTTP `409` kèm theo header `Retry-After: 30`, hoặc trả về HTTP `400` với mã lỗi `ERR_IDEMPOTENCY_MISMATCH` nếu các payload khác nhau. Nếu Bedrock bị hết thời gian chờ (giới hạn cứng 45s của Bedrock Bedrock API, trả về `ERR_LLM_TIMEOUT`) hoặc dịch vụ bị lỗi (`ERR_SERVICE_DOWN`), pipeline CDO sẽ lập tức chuyển sang thực thi rules engine tĩnh và kích hoạt cảnh báo SRE, đảm bảo một trạng thái containment an toàn tuyệt đối.
 

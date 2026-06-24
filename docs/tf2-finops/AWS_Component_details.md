@@ -2,6 +2,10 @@
 
 <!-- Source: 02_infra_design.md. Scope excludes AI Engine hosting platform. -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: All CDO-owned infrastructure components and access controls described here must conform to the absolute hard boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 This document expands the AWS components described in [`02_infra_design.md`](02_infra_design.md) into role, purpose, input, and output details.
 
 The scope is the CDO-owned FinOps control plane:
@@ -14,7 +18,7 @@ The scope is the CDO-owned FinOps control plane:
 - Apply only safe containment modes.
 - Preserve audit evidence for review and dashboarding.
 
-This document documents the CDO-owned components, including the shared ECS Fargate hosting infrastructure (cluster, capacity providers, task definitions, load balancers, and network isolation) deployed to host the AI Engine container provided by the AIOps team. It excludes the AIOps-owned AI model internals, logic, weights, and training datasets.
+This document documents the CDO-owned components, including the Private API Gateway, Lambda container functions, ECR image deployment by digest, Lambda execution roles, and network isolation deployed to host the AI Engine container provided by the AIOps team. It excludes the AIOps-owned AI model internals, logic, weights, and training datasets.
 
 ## Scope Boundary
 
@@ -28,7 +32,7 @@ This document documents the CDO-owned components, including the shared ECS Farga
 | Alert routing | Yes | CDO owns Finance and Engineering alert routing. |
 | Safe containment | Yes | CDO owns dry-run, tag, suggest, and approved non-prod containment paths. |
 | AI Engine API Contract | Yes | CDO calls, validates, and adheres to the versioned API and telemetry contracts. |
-| AI Engine Hosting Infrastructure | Yes | CDO deploys and operates the ECS Fargate cluster, capacity providers, tasks, internal ALB, and security configuration. |
+| AI Engine Hosting Infrastructure | Yes | CDO deploys and operates the Private API Gateway, Lambda container functions, Lambda execution roles, and security configuration. |
 | AI model internals & datasets | No | AIOps owns model logic, training, weights, and backtest datasets. |
 
 ## Component Summary
@@ -60,12 +64,11 @@ This document documents the CDO-owned components, including the shared ECS Farga
 | 23 | Finance Dashboard | Amazon S3 + CloudFront | Presents static web-based finance-readable views without SQL; QuickSight is retained as a future BI option. |
 | 24 | Alert Channels | Amazon SNS, Slack API, SES | Sends Finance, Engineering, Platform, and Security notifications. |
 | 25 | CloudWatch Monitoring | CloudWatch Logs, Metrics, Alarms | Observes workflow failures, stale data, and delivery failures. |
-| 26 | Shared ECS Cluster | Amazon ECS Fargate | Centralized container orchestration platform ('tf-2-aiops-cluster'). |
-| 27 | ECS Service and Tasks | ECS service `ai-engine` tasks | Runs AI API explainer tasks (always-on) and batch/retraining tasks (Spot). |
-| 28 | Internal AI Load Balancer | Internal ALB for ECS services | Exposes endpoint `https://ai-engine.tf-2.internal/` to CDO-01/CDO-02. |
-| 29 | ECR Image Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
-| 30 | AI Engine SQS Queues | Amazon SQS | Manages decoupling queues: primary, DLQ, and rollback. |
-| 31 | AI Engine DynamoDB Stores | Amazon DynamoDB | Persistent state tables for idempotency, audit-ledger, and anomalies. |
+| 26 | AI Engine Lambda Container Functions | AWS Lambda | Runs AI API inference and asynchronous detection tasks using AIOps container images. |
+| 27 | Private API Gateway | Amazon API Gateway | Private REST API Gateway exposing the AI Engine endpoints via VPC interface endpoint. |
+| 28 | ECR Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
+| 29 | AI Engine SQS/DLQ | Amazon SQS | Manages decoupling queues: requests queue, DLQ, and retry. |
+| 30 | AI Engine DynamoDB Stores | Amazon DynamoDB | Persistent state tables for execution results, idempotency, and anomalies. |
 
 ## Excluded Components
 
@@ -220,7 +223,7 @@ EventBridge Scheduler triggers the FinOps workflow on a defined cadence.
 
 ### Purpose
 
-It starts the daily cost inspection pipeline without running an always-on scheduler or ECS task scheduled cron workload.
+It starts the daily cost inspection pipeline without running an always-on scheduler or serverless container cron workload.
 
 ### Input
 
@@ -354,7 +357,7 @@ The AI Contract Client Lambda calls the shared Task Force AI Engine endpoint.
 
 ### Purpose
 
-It is the boundary between deterministic CDO control-plane logic and AIOps-owned anomaly detection. CDO validates the request and response and hosts the shared ECS infrastructure, but does not own or train the AI model itself.
+It is the boundary between deterministic CDO control-plane logic and AIOps-owned anomaly detection. CDO validates the request and response and hosts the private hosting platform for the Lambda functions, but does not own or train the AI model itself.
 
 ### Input
 
@@ -775,124 +778,106 @@ It provides operational detection for failed workflows, stale dashboard data, La
 - Operator alerts.
 - Evidence that the platform ran, failed, retried, or recovered.
 
-## 26. Shared ECS Cluster
+## 26. AI Engine Lambda Container Functions
 
 ### Role
 
-Centralized serverless container orchestration platform (`tf-2-aiops-cluster`).
+Runs the containerized AI Engine workloads (inference and asynchronous detection execution).
 
 ### Purpose
 
-Deploys and manages Fargate tasks in private subnets, ensuring high availability, network isolation, and autoscaling.
-
-### Input
-
-- Cluster launch configuration (Terraform).
-- VPC ID and Private Subnet lists.
-- AWS IAM task execution role policies.
-
-### Output
-
-- Provisioned serverless container compute resources.
-- Task lifecycle metrics and Container Insights logs.
-
-## 27. ECS Service and Tasks
-
-### Role
-
-Executes the containerized AI Engine workloads (`ai-engine` service).
-
-### Purpose
-
-Splits executions: stable explainer/API tasks run on Fargate always-on tasks, while heavy batch retraining, feature engineering, and scoring workloads run on cost-effective Fargate Spot tasks.
+Executes model inference and analysis inside a Lambda function initialized from an AIOps-provided container image, utilizing reserved concurrency as a guardrail.
 
 ### Input
 
 - Immutable ECR image digest.
-- Task configuration: 2 vCPU, 4 GB memory, 300s task timeout.
-- Secrets Manager environment variables.
+- Lambda execution role ARN.
+- Environment variables containing DB tables, queues, and configuration.
+- SQS messages or direct invocation payloads.
+- Reserved concurrency configuration.
 
 ### Output
 
-- Running containers inside private VPC subnets.
-- SQS processing queues interface.
+- Executed container tasks.
+- Detection results written to DynamoDB and logs sent to CloudWatch/X-Ray.
 
-## 28. Internal AI Load Balancer
+## 27. Private API Gateway
 
 ### Role
 
-Exposes the AI Engine service via Route 53 private DNS.
+Exposes the AI Engine service privately inside the VPC.
 
 ### Purpose
 
-Enables secure VPC-internal communication for CDO-01 and CDO-02 to invoke the shared AI Engine at `https://ai-engine.tf-2.internal/` using TLS 1.3 and IAM SigV4 authentication.
+Exposes endpoints `/v1/detect` and `/v1/detect/result/{audit_id}` with IAM SigV4 authentication. Forwards `/v1/detect` requests to SQS/API Lambda, returning a `202 Accepted` immediately, and serves execution results from DynamoDB via GET requests.
 
 ### Input
 
-- Target groups mapping to Fargate always-on task ports.
-- Route 53 private DNS zone definitions.
-- Security Group ingress: allow traffic from CDO Platforms SG only.
+- API Gateway REST API configurations.
+- Resource policy restricting access to specific VPC interface endpoints.
+- Target integrations (API Lambda, DynamoDB, or SQS direct integration).
 
 ### Output
 
-- Internal load balanced HTTPS endpoint.
+- Private REST endpoints accessible only via VPC endpoint.
+- Signed request validation and payload routing.
 
-## 29. ECR Image Repository
+## 28. ECR Repository
 
 ### Role
 
-Immutable container image repository (`tf2/finops-ai-engine`).
+Stores version-tagged AIOps AI Engine container image artifacts.
 
 ### Purpose
 
-Stores version-tagged and signed Docker images from AIOps, scanned for CVEs before deployment.
+Acts as the single registry for deployment. Images are pinned by SHA256 digest in Lambda configuration.
 
 ### Input
 
-- Docker build image from CI pipeline.
-- AWS Signer signing keys.
-- Trivy scan triggers.
+- Image builds from CI/CD.
+- CVE scans and compliance verification tags.
 
 ### Output
 
-- Immutable image digests (`sha256:...`) pulled by ECS Fargate.
+- Pinned image URI (`.dkr.ecr.ap-southeast-1.amazonaws.com/ai-engine@sha256:...`) pulled by AWS Lambda.
 
-## 30. AI Engine SQS Queues
+## 29. AI Engine SQS/DLQ
 
 ### Role
 
-Queue-based message decoupling between CDO and AI Engine.
+Queue-based asynchronous decoupling between CDO caller and AI Engine worker.
 
 ### Purpose
 
-Manages the primary request queue, rollback queue, and Dead Letter Queue (DLQ) with a poison threshold of 3 retries.
+Handles incoming detect requests as SQS messages to allow API Gateway to respond quickly (`202 Accepted`) and allows worker Lambda to consume messages at a controlled rate, routing poison messages to DLQ after 3 retries.
 
 ### Input
 
-- JSON detect payloads from CDO Lambdas.
-- Rollback complete signals.
+- JSON payloads containing detection targets.
+- Dead Letter Queue configuration.
 
 ### Output
 
-- De-queued messages consumed by Fargate tasks.
+- Queue triggers for AI Engine worker Lambda.
+- DLQ alerts on message delivery failures.
 
-## 31. AI Engine DynamoDB Stores
+## 30. AI Engine DynamoDB Stores
 
 ### Role
 
-Persistent databases for the AI Engine state.
+Persistent databases for execution status, results, and idempotency.
 
 ### Purpose
 
-Caches Cost Explorer summaries, idempotency keys, anomalies ledger, and human active learning feedback loops.
+Stores the run locks, idempotency records, anomaly detection outputs, and containment execution audits with >=90 days retention.
 
 ### Input
 
-- Writes from Ingestion and AI Engine Tasks.
+- Writes from AI Engine Lambda Container Functions, CDO platform Lambdas.
 
 ### Output
 
-- Query results for dashboard and alert routing.
+- Low-latency lookups for Step Functions polling and the S3 + CloudFront dashboard.
 
 ## Contract-Level Data Flows
 
@@ -909,7 +894,7 @@ Caches Cost Explorer summaries, idempotency keys, anomalies ledger, and human ac
 
 | Field | Detail |
 | --- | --- |
-| Responsible CDO components | Step Functions, AI Contract Client Lambda, DynamoDB, S3 audit trail, Internal ALB |
+| Responsible CDO components | Step Functions, AI Contract Client Lambda, DynamoDB, S3 audit trail, Private API Gateway |
 | Excluded components | AI Engine model weights, AI training jobs, model training datasets, and AI model internal logic |
 | Input | Normalized cost window, run ID, account scope, contract version, evidence window |
 | Output | Model version, anomaly ID, confidence, severity, expected spend, actual spend, delta, explanation, recommended route, recommended containment mode, evidence URI |
@@ -942,7 +927,7 @@ Caches Cost Explorer summaries, idempotency keys, anomalies ledger, and human ac
 | `1.1 High-Level Architecture Overview` | Orchestrator, lakehouse, alerting/containment engine, dashboard/channels |
 | `1.2 Ingestion & Data Lakehouse Workflow` | CUR, Cost Explorer, Scheduler, Step Functions, Ingestion Lambda, S3 Raw, S3 Curated, Glue, Athena |
 | `1.4 Alerting & Containment Engine` | Alert Lambda, Containment Lambda, State Lambda, DynamoDB state/audit, member resources, Slack, SES, S3 + CloudFront dashboard |
-| `2. Component table` | EventBridge Scheduler, Step Functions, Lambda, S3, Glue, Athena, DynamoDB, Secrets Manager, S3 + CloudFront dashboard, SNS/Slack, Containment Worker, ECS Fargate, ALB, ECR, SQS |
+| `2. Component table` | EventBridge Scheduler, Step Functions, Lambda, S3, Glue, Athena, DynamoDB, Secrets Manager, S3 + CloudFront dashboard, SNS/Slack, Containment Worker, Private API Gateway, Lambda container functions, ECR, SQS |
 | `4. Multi-account approach` | Member accounts, cross-account CUR puller role, cross-account containment role, account onboarding, idempotency |
-| `6. Scaling strategy` | Athena partitioning, DynamoDB on-demand scaling, ECS task autoscaling |
-| `7. Failure modes + recovery` | CUR delay, Cost Explorer throttling, workflow failure, duplicate run, stale dashboard, alert delivery failure, containment denial, AI contract mismatch, Spot task interruption |
+| `6. Scaling strategy` | Athena partitioning, DynamoDB on-demand scaling, Lambda reserved concurrency scaling |
+| `7. Failure modes + recovery` | CUR delay, Cost Explorer throttling, workflow failure, duplicate run, stale dashboard, alert delivery failure, containment denial, AI contract mismatch, Lambda cold starts and API Gateway timeouts |

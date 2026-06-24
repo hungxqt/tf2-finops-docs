@@ -4,6 +4,10 @@
      Status: Refined (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: All dashboard visual states and containment action controls must respect the absolute hard boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 ## 1. Dashboard overview
 
 The Finance Dashboard provides visual, SQL-free access to cost trends, anomaly detections, and containment audit trails for the company's AWS environments. 
@@ -54,7 +58,19 @@ An interactive audit panel listing all automated and proposed policy actions:
 - **Active Containment Actions**: Table showing resource ID, account, squad owner, action type (e.g., Tagging, Sandbox Shutdown, Quota Cap), and execution timestamp.
 - **Execution Mode**: Explicitly labels actions as `dry-run` (simulated containment or suggestion only) or `apply` (automated policy enforcement on non-production).
 - **Audit Record Link**: A direct, clickable link to the immutable audit record stored as an S3 JSON object. Each link references the unique Correlation ID and Idempotency Key of the run.
-- **Rollback Interface**: A button for administrators to view the pre-defined rollback path (e.g., restoring original tag state or restarting a non-production instance).
+- **Contract-Backed Countdown & Status Fields**: The UI exposes key parameters returned from the `/v1/detect/result/{audit_id}` endpoint:
+  - `audit_id`: Unique audit run identifier.
+  - `enforcement_countdown.time_lock_seconds`: Initial countdown duration (typically 14400 seconds / 4 hours on Staging).
+  - `fallback_action`: Automated policy enforced if countdown expires (e.g., `schedule-shutdown`).
+  - **Current Expiration Time**: Dynamic timestamp indicating when the action will execute.
+  - **Control Availability Flags**: Toggles showing whether Extend/Rollback is supported for the current resource state and environment.
+- **Extend/Snooze Behavior**: Enables engineers to delay the countdown by calling the contract API endpoint `POST /v1/action/extend`.
+  - *Request parameters*: `audit_id`, `extend_seconds`, and `reason` (justification for snooze).
+  - *Expected response/UI state*: Transition status to `extended` and updates the countdown to show the `new_expiration_time`.
+- **Rollback/Restore Behavior**: Allows engineers to revert a containment action by calling the contract API endpoint `POST /v1/action/rollback` (rendered as a **Revert** or **Restore** button).
+  - *Request parameters*: `audit_id`, `requested_by_user` (operator email), and `justification_on_rollback`.
+  - *Expected response/UI state*: Transition status to `rollback_initiated`, displaying the `rollback_payload.action_type` and the `original_resource_id`.
+- **Access Control Restriction**: Raw rollback commands and execution scripts (e.g., `rollback_script_encapsulated`) are strictly restricted and are only visible and executable to authorized CDO/Engineering operators under IAM permission isolation and Cognito groups. Finance users interact solely with high-level visual status fields and never see or execute CLI scripts.
 
 ---
 
@@ -65,24 +81,36 @@ The Alert Routing Lambda processes the AI decision contract output and routes no
 ### 3.1 Finance alerts
 High-severity anomalies or events that exceed specific budget thresholds (e.g., cost delta >$100/day) are routed to the Finance notification channel.
 - **Delivery Channel**: Amazon SES (Email) or Amazon SNS (SMS/Pager).
-- **Content Focus**: Financial impact (USD delta), account ownership, AI model confidence, proposed containment action, and S3/CloudFront dashboard link.
+- **Content Focus**: Financial impact (USD delta), current containment action status, S3/CloudFront audit link, and metadata indicating whether rollback/extend capabilities exist for the anomaly.
+- **Security Constraint**: No direct action buttons or CLI commands are included in public Finance alerts.
 - **Frequency**: Batch daily notifications, with immediate escalations for critical spend spikes.
 
 ### 3.2 Engineering alerts
 All detected anomalies are routed directly to the squads responsible for the target resources.
 - **Delivery Channel**: Slack Webhook (Dedicated squad channels) or Jira API (automatic ticket creation).
-- **Content Focus**: Technical resource ID (ARN), service type, environment (Dev/Sandbox/Prod), tag compliance status, proposed rollback path, and a link to approve or snooze the containment action.
+- **Content Focus**: Technical resource ID (ARN), service type, environment (Dev/Sandbox/Prod), tag compliance status, and the proposed rollback path.
+- **Action Control**: Includes authenticated, short-lived Extend/Snooze and Rollback/Restore action links (direct URLs executing against `POST /v1/action/extend` and `POST /v1/action/rollback` via API Gateway) where policy and environment settings allow.
 - **Frequency**: Near real-time (within 30 minutes of pipeline completion).
 
 *Note on telemetry data*: The telemetry data processed for detection strictly excludes performance utilization metrics (CPU, Memory, connections). CloudWatch metrics are used solely for CDO platform operational health monitoring and dashboard rendering.
 
-### 3.3 Example alert payload
+### 3.3 API contract error handling
+When operators trigger action controls, the dashboard and alerting systems handle the following contract errors:
+- **`ERR_ROLLBACK_NOT_SUPPORTED`** (HTTP 422): Occurs when attempting to rollback a resource that does not support undo operations (e.g., a production resource where containment was only tag/suggest). The UI disables the revert button and instructs the operator to contact SRE for manual review.
+- **`ERR_ALREADY_ROLLED_BACK`** (HTTP 422): Triggered if the rollback action was already executed. The UI updates the resource status to "Restored" and disables further clicks to prevent state mismatch.
+- **`ERR_RESOURCE_NOT_FOUND`** (HTTP 422): Occurs when the target resource has been deleted externally from AWS. The dashboard clears the countdown timer and displays "Resource Deleted Externally".
+- **`ERR_STATE_CONFLICT`** (HTTP 422): Triggered by concurrent operator actions on the same resource (e.g., double-clicking or two engineers attempting rollback simultaneously). The UI prompts a page reload to sync the latest DynamoDB state.
+- **`ERR_CROSS_TENANT_DENIED`** (HTTP 403): Raised if the operator's tenant context (`X-Tenant-Id`) does not match the anomaly owner. The UI blocks execution and logs a security incident alert.
+
+### 3.4 Example alert payload
 The Alert Routing Lambda uses a structured JSON contract. The schema below represents a typical alert payload sent to notification channels:
 
 ```json
 {
   "alert_id": "alert-uuid-7777-8888-9999",
   "anomaly_id": "anom-9988-7766",
+  "tenant_id": "tenant-uuid-1111-2222-3333",
+  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
   "correlation_id": "corr-uuid-4444-5555-6666",
   "timestamp": "2026-06-23T07:30:00Z",
   "routing_target": "squad-prediction-models",
@@ -107,11 +135,30 @@ The Alert Routing Lambda uses a structured JSON contract. The schema below repre
   "containment": {
     "proposed_action": "stop_instance",
     "execution_mode": "dry-run",
-    "idempotency_key": "tenant_id:2026-06-22",
-    "audit_record_uri": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
+    "idempotency_key": "tenant-uuid-1111-2222-3333:2026-06-22",
+    "audit_record_uri": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json",
+    "enforcement_countdown": {
+      "time_lock_seconds": 14400,
+      "fallback_action": "schedule-shutdown",
+      "can_extend": true,
+      "extend_endpoint": "/v1/action/extend"
+    },
+    "rollback": {
+      "supported": true,
+      "endpoint": "/v1/action/rollback",
+      "required_fields": [
+        "audit_id",
+        "requested_by_user",
+        "justification_on_rollback"
+      ],
+      "status": "pending",
+      "rollback_action_type": "start_instance"
+    }
   }
 }
 ```
+
+*Data Separation Note*: Technical and administrative fields such as `audit_trail_context.pre_action_state`, `audit_trail_context.post_action_state`, and `audit_trail_context.rollback_script_encapsulated` are treated strictly as audit and admin metadata stored securely in DynamoDB and the S3 Audit Trail. These details are completely excluded from public-facing alert payloads and Finance channels to preserve readability and enforce the security boundary.
 
 ---
 
@@ -137,4 +184,4 @@ To ensure the CDO platform remains fully finance-readable and requires no SQL kn
 ## Related documents
 
 - [`01_requirements_analysis.md`](01_requirements_analysis.md) - Business requirements, finance NFRs, and CDO/AIOps responsibilities.
-- [`02_infra_design.md`](02_infra_design.md) - Macro architecture showing ingestion, ECS AI Engine hosting, lakehouse storage, and the S3 + CloudFront dashboard layer.
+- [`02_infra_design.md`](02_infra_design.md) - Macro architecture showing ingestion, Lambda container-hosted AI Engine, lakehouse storage, and the S3 + CloudFront dashboard layer.

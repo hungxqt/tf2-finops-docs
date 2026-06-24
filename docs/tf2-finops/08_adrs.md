@@ -4,6 +4,10 @@
      Status: Ongoing log W11-W12
      Format: 1 ADR per major decision. Append-only - do not delete old ADRs. -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: All architectural decisions and system design patterns must uphold the absolute safety boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 > **What is an ADR**: An Architecture Decision Record (ADR) is a log of important architectural decisions made along with the context and rationale behind them. The goal is to ensure that future developers understand why a particular path was chosen over alternatives.
 >
 > **When to write an ADR**:
@@ -56,7 +60,7 @@
 - **Status**: Accepted
 - **Date**: 2026-06-24
 - **Context**: Clear division of labor is needed between the CDO team (platform and pipeline operators) and the AIOps team (AI engine developers) to prevent duplicate efforts, establish ownership, and define operational SLAs.
-- **Decision**: Establish a strict contract-based integration. CDO owns cost data ingestion, scheduled workflows, alerting, containment enforcement, and the hosting platform infrastructure (ECS cluster, capacity providers, networking) for the AI Engine. AIOps owns the AI Engine logic, container image software, model parameters, confidence scoring, and backtesting metrics.
+- **Decision**: Establish a strict contract-based integration. CDO owns cost data ingestion, scheduled workflows, alerting, containment enforcement, and the hosting platform infrastructure (Private API Gateway, Lambda container functions, networking) for the AI Engine. AIOps owns the AI Engine logic, container image software, model parameters, confidence scoring, and backtesting metrics.
 - **Consequence**:
   - Pro: Independent release cycles and isolation of responsibilities. Clear ownership for incident triage.
   - Pro: Standardized contract prevents breaking changes when the AI model is updated.
@@ -118,7 +122,7 @@
 
 ## ADR-007 - ECS Fargate for AI Engine hosting
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-010
 - **Date**: 2026-06-24
 - **Context**: The AI Engine provided by the AIOps team is packaged as a containerized python application requiring CPU/memory flexibility, isolated execution, and network security.
 - **Decision**: Deploy and host the AI Engine container workloads on AWS ECS (Elastic Container Service) with Fargate.
@@ -134,7 +138,7 @@
 
 ## ADR-008 - Fargate always-on vs Fargate Spot capacity providers separation
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-010
 - **Date**: 2026-06-24
 - **Context**: The AI Engine executes both low-latency API tasks (health checks, explaining anomalies for dashboards) and interruptible, computationally intensive batch workloads (daily anomaly scoring, model retraining).
 - **Decision**: Separate the ECS task execution across Fargate capacity providers. Use standard Fargate always-on for the API explainer tasks, and Fargate Spot capacity providers for batch analysis, retraining, and feature engineering tasks.
@@ -150,7 +154,7 @@
 
 ## ADR-009 - Shared Task Force AI Engine endpoint
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-011
 - **Date**: 2026-06-24
 - **Context**: Task Force 2 runs two separate FinOps CDO platforms (CDO-01 and CDO-02) representing different business units. To minimize operational costs and simplify model management, we need a deployment architecture for the AIOps AI Engine that hosts it once while serving both CDO platforms securely and efficiently.
 - **Decision**: Deploy a single, shared Task Force AI Engine endpoint hosted on ECS Fargate within a shared VPC, accessible internally via `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication. Multi-tenant isolation is maintained using the `X-Tenant-Id` request header to partition data and requests.
@@ -165,3 +169,42 @@
 - **Alternatives considered**:
   - Separate AI Engine per CDO Platform: Rejected due to duplicate resource costs and high maintenance overhead for model versioning and container deployments.
   - Public HTTP Endpoint with API Gateway: Rejected because IAM SigV4-based authentication over private internal load balancers provides stronger transport security and lower latency without exposing endpoints to the internet.
+
+---
+
+## ADR-010 - AWS Lambda container image hosting for AI Engine inference
+
+- **Status**: Accepted
+- **Date**: 2026-06-24
+- **Context**: The AI Engine provided by the AIOps team is packaged as a containerized python application requiring CPU/memory flexibility, isolated execution, and network security. The previous decision to use ECS Fargate (ADR-007) and Fargate Spot capacity providers (ADR-008) introduced shared fixed platform costs (idle compute, load balancing) and operational complexity (checkpointing, Spot interruptions).
+- **Decision**: Deploy and host the AI Engine container workloads on AWS Lambda container image hosting. Deployed by pinning immutable ECR image digests.
+- **Consequence**:
+  - Pro: True serverless pay-per-request pricing, eliminating ECS Fargate always-on idle compute costs.
+  - Pro: Simpler scaling and high availability handled natively by AWS.
+  - Pro: No need for Spot interruption checkpointing/retry complexity. SQS buffers async requests gracefully.
+  - Trade-off: Introduces potential cold start latency for container images (mitigated by Provisioned Concurrency if latency thresholds are breached in production).
+  - Trade-off: Model artifacts and dependencies must fit within the Lambda container image limit (10 GB). Heavy offline model training and retraining remain outside this runtime scope.
+- **Alternatives considered**:
+  - ECS Fargate always-on + Spot: Rejected due to high idle compute cost and complex checkpoint/retry requirements.
+  - Standard AWS Lambda zip packages: Rejected because the AI model libraries (e.g. pandas, scikit-learn, PyTorch) exceed the 250MB unzipped Lambda deployment package size limit.
+
+---
+
+## ADR-011 - Private REST API Gateway over internal ALB
+
+- **Status**: Accepted
+- **Date**: 2026-06-24
+- **Context**: The AI Engine API must be accessed securely and privately by multiple CDO platforms within the private network. The previous decision used an internal ALB (ADR-009). However, migrating to AWS Lambda container hosting makes REST API Gateway with Lambda integrations a more natural and secure choice for private API exposure.
+- **Decision**: Expose the shared AI Engine endpoints using a Private REST API Gateway with IAM SigV4 authentication and Lambda proxy/container integrations. Multi-tenant isolation is maintained using the `X-Tenant-Id` request header to partition data and requests.
+- **Responsibility Split**:
+  - **CDO** owns the hosting infrastructure deployment: VPC networking, Private REST API Gateway resources, staging/deployment parameters, IAM execution roles, SQS processing queues, and DynamoDB execution/idempotency state stores.
+  - **AIOps** owns the application logic inside the Lambda container: the AI model code, container image build and publishing (ECR image payload), Root Cause Analysis (RCA) and remediation recommendation logic, local fallback rules engine execution, internal API contract enforcement, and evaluation baseline tracking.
+- **Consequence**:
+  - Pro: Secure private endpoint communication via VPC endpoints, avoiding ALB hourly compute costs.
+  - Pro: Native IAM SigV4 integration for robust authentication.
+  - Pro: Out-of-the-box support for API throttling, stage deployment variables, and routing.
+  - Pro: Integrates natively with API Gateway Resource Policies to enforce multi-tenant isolation.
+  - Trade-off: Private API Gateway requires VPC Endpoint provisioning, but these endpoints are shared across other platform services.
+- **Alternatives considered**:
+  - Internal ALB routing: Rejected because API Gateway provides superior endpoint management, rate limiting, and native Lambda proxy integration for serverless runtimes.
+  - Public HTTP Endpoint with API Gateway: Rejected because IAM SigV4-based authentication over private endpoints ensures traffic never traverses the public internet, satisfying security NFRs.

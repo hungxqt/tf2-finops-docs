@@ -4,9 +4,13 @@
      Status: Final (W11 T6 Pack #1) -> Updated (W12 T4 Pack #2)
 -->
 
+> [!IMPORTANT]
+> **Safety Boundary**: All containment actions executed by this infrastructure must conform to the absolute hard boundaries: **NEVER terminate prod, delete data, or modify IAM**.
+
+
 ## 1. Architecture diagram
 
-The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with a single shared AIOps-provided AI Engine endpoint hosted once per Task Force on a managed ECS cluster (`tf-2-aiops-cluster`). The ECS compute tier uses a hybrid configuration of Fargate always-on capacity provider tasks and Fargate Spot capacity provider tasks to optimize execution costs. The shared endpoint is reached at `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication.
+The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with a single shared AIOps-provided AI Engine endpoint hosted once per Task Force using AWS Lambda container images. The serverless compute tier utilizes Lambda functions running within private subnets, integrated behind a Private REST API Gateway. An asynchronous queueing model using SQS/DLQ isolates heavy inference workloads without timing out the API. The private endpoint is reached internally at `https://ai-engine.tf-2.internal/` (via Private API Gateway with VPC Endpoints) using IAM SigV4 authentication.
 
 The architecture is sized around recurring CDO platform responsibilities, not around the AIOps model-training dataset. CDO must reliably pull billing data from approved AWS sources, normalize it into a contract-ready shape, invoke the AIOps-owned AI Engine, and preserve the returned decision evidence. Any synthetic historical dataset used to train, enhance, or backtest the model remains AIOps-owned. Detection telemetry is strictly CUR-only (S3 CUR partition pulls and Cost Explorer API calls) and does NOT include CloudWatch utilization metrics (CPU, memory, database connections), which are used ONLY for platform operational observability (alerts, logging, metrics, dashboard).
 
@@ -33,29 +37,27 @@ graph TB
             Athena[Athena Query Engine]
         end
 
-        subgraph "Private Subnets (ECS Cluster)"
-            subgraph "ECS Cluster Services"
-                ControlPlane[ECS Control Plane]
-            end
+        subgraph "Private Subnets (Serverless API & Queue)"
+            APIGW[Private REST API Gateway]
             
-            subgraph "Fargate Always-On Capacity Provider"
-                API_P[AI Engine API Tasks]
-                EXP_P[ai-engine-explainer Tasks]
-                SecretsMap[ECS Task Definition Secrets Mapping]
-                Core_P[Core CDO Platform Tasks]
+            subgraph "API Lambda Endpoint"
+                AILambdaAPI[AI Engine API Lambda]
             end
 
-            subgraph "Fargate Spot Capacity Provider"
-                WRK_P[AI Engine Worker Tasks]
-                Batch_J[Batch Scoring Tasks]
-                Train_J[Model Retraining Tasks]
+            subgraph "SQS Buffer"
+                SQSQueue[SQS Ingest Queue]
+                SQSDLQ[SQS Dead Letter Queue]
             end
 
-            InternalALB[Internal ALB]
+            subgraph "Worker Lambda Executor"
+                AILambdaWorker[AI Engine Worker Lambda]
+            end
+
+            VPCEndpoints[Private VPC Endpoints: S3, DDB, ECR, KMS, Logs, STS, Secrets]
         end
 
         subgraph "Database Store"
-            DDB[(DynamoDB Run State & Audit)]
+            DDB[(DynamoDB Run State, Audit & Results)]
         end
     end
 
@@ -84,11 +86,17 @@ graph TB
     LambdaAlert -->|Route alert payload| Email
 
     %% AI Engine Integration
-    SF -->|Detect Request via Internal ALB| InternalALB
-    InternalALB -->|Route Ingress| API_P
-    API_P -->|Coordinate batch scoring| WRK_P
-    WRK_P -->|Process logs| Batch_J
-    Batch_J -->|Read/Write features| S3Cur
+    SF -->|1. POST /v1/detect| APIGW
+    APIGW -->|2. Route Ingress| AILambdaAPI
+    AILambdaAPI -->|3. Queue detection job| SQSQueue
+    AILambdaAPI -->|4. Return 202 Accepted| SF
+    SQSQueue -->|5. Trigger worker| AILambdaWorker
+    SQSQueue -.->|Error fallback| SQSDLQ
+    AILambdaWorker -->|6. Read/Write features| S3Cur
+    AILambdaWorker -->|7. Write results| DDB
+    SF -->|8. Poll GET /v1/detect/result/{id}| APIGW
+    APIGW -->|9. Route status request| AILambdaAPI
+    AILambdaAPI -->|10. Query results| DDB
     
     %% Dashboard presentation
     CloudFront -->|Serve Static Files & JSON| FinanceUsers[Finance Users]
@@ -97,7 +105,7 @@ graph TB
     SF -->|Write run summaries| DDB
 ```
 
-*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR and Cost Explorer data to S3, and catalogs it. The workflow requests anomaly detection from the AIOps-owned AI Engine via the ECS internal ALB. The ECS cluster isolates stable APIs on Fargate always-on capacity provider tasks and batch-scoring/training tasks on Fargate Spot capacity provider tasks. Dashboard views and containment workflows pull clean state from precomputed summaries in S3 and DynamoDB.*
+*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR and Cost Explorer data to S3, and catalogs it. The workflow requests anomaly detection from the AIOps-owned AI Engine via the Private REST API Gateway, which forwards to the API Lambda, queues the task to SQS, and returns 202 Accepted. The Worker Lambda polls SQS, executes detection, and writes results to DynamoDB, which Step Functions polls to completion. Dashboard views and containment workflows pull clean state from S3 and DynamoDB.*
 
 ---
 
@@ -105,7 +113,7 @@ To provide a clearer view of the CDO platform's operations, the overall architec
 
 ### 1.1 High-Level Architecture Overview
 
-This diagram represents the high-level macro interactions between the central orchestrator, the lakehouse data plane, the ECS compute cluster, and the alerting/containment engines.
+This diagram represents the high-level macro interactions between the central orchestrator, the lakehouse data plane, the Private API Gateway and Lambda container compute, and the alerting/containment engines.
 
 ```mermaid
 graph TD
@@ -116,8 +124,8 @@ graph TD
     subgraph "CDO Management Account"
         SF[Step Functions Orchestrator] -->|1. Pull Data| Lakehouse[(S3 Lakehouse & Athena)]
         Lakehouse -->|2. Ingested Cost Data| SF
-        SF -->|3. Invoke AI Inference| ECS[ECS Cluster: AI Engine]
-        ECS -->|4. Anomaly Decision| SF
+        SF -->|3. Invoke AI Inference| APIGW[Private API Gateway & Lambda Container]
+        APIGW -->|4. Anomaly Decision| SF
         SF -->|5. Contain & Alert| Actions[Alerting & Containment Engine]
     end
 
@@ -125,7 +133,7 @@ graph TD
     Actions -->|7. Publish| Dashboard[Finance Dashboard / Channels]
 ```
 
-*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting data to the Lakehouse, calling the ECS-hosted AI Engine for anomaly decisions, and invoking alerting and containment workflows based on the results.*
+*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting data to the Lakehouse, calling the Lambda-container-hosted AI Engine via Private API Gateway for anomaly decisions, and invoking alerting and containment workflows based on the results.*
 
 Operationally, Step Functions is the control boundary between deterministic CDO logic and probabilistic AI output. Every transition records a `run_id`, cost window, account scope, and contract version so that Finance can trace a dashboard anomaly back to the exact ingestion batch and AI decision. This design also prevents the AI Engine from directly touching member accounts; all alerting and containment actions are mediated by CDO policy workers.
 
@@ -162,9 +170,9 @@ graph TB
 
 The ingestion workflow normalizes the two operational billing shapes before invoking the AI Engine. CUR provides resource-level fields such as account ID, product code, resource ID, unblended cost, and resource tags. Cost Explorer provides aggregate fields such as linked account, service name, service code, region, unblended cost, and estimated/final status. The curated layer keeps both normalized service code and display-name fields so CDO can pass consistent payloads to AIOps and build dashboard views without taking ownership of model training data.
 
-### 1.3 AI Engine ECS Hosting Platform
+### 1.3 AI Engine Lambda Container Hosting Platform
 
-This diagram zooms in on the ECS cluster layout, illustrating the separation of stable API tasks (Always-On) from batch-processing and retraining tasks (Spot).
+This diagram zooms in on the AWS Lambda container architecture, showing the Private REST API Gateway, the API Lambda, SQS queuing, and the Worker Lambda executing asynchronous inference.
 
 ```mermaid
 graph TB
@@ -176,19 +184,24 @@ graph TB
         CuratedS3[(S3 Curated Zone)]
     end
 
-    subgraph "ECS Cluster ap-southeast-1"
-        ALB[Internal ALB]
+    subgraph "Database Store"
+        DDB[(DynamoDB Run State & Results)]
+    end
+
+    subgraph "Private Serverless Compute & Queues"
+        APIGW[Private REST API Gateway]
         
-        subgraph "Fargate Always-On Capacity Provider"
-            API[AI Engine API Tasks]
-            EXP[ai-engine-explainer Tasks]
-            Core[Core Platform Tasks & Secrets Mapping]
+        subgraph "API Ingress & Control"
+            API[AI Engine API Lambda Function]
         end
 
-        subgraph "Fargate Spot Capacity Provider"
-            Worker[AI Engine Worker Tasks]
-            Batch[Batch Scoring Tasks]
-            Train[Model Retraining Tasks]
+        subgraph "Asynchronous Messaging"
+            SQS[SQS Ingest Queue]
+            DLQ[SQS Dead Letter Queue]
+        end
+
+        subgraph "Async Inference Execution"
+            Worker[AI Engine Worker Lambda Function]
         end
     end
     
@@ -198,21 +211,26 @@ graph TB
     end
 
     %% Flow
-    SF -->|1. POST /v1/detect| ALB
-    ALB -->|2. Ingress Route| API
-    API -->|3. Coordinate Job| Worker
-    Worker -->|4. Run Batch/Retrain| Batch
-    Batch -->|5. Read/Write Features| CuratedS3
-    API -->|6. Return Confidence & Explanation| SF
+    SF -->|1. POST /v1/detect| APIGW
+    APIGW -->|2. Route Ingress| API
+    API -->|3. Enqueue Job & return 202| SQS
+    SQS -->|4. Trigger Poll| Worker
+    SQS -.->|Failed retries| DLQ
+    Worker -->|5. Read/Write Features| CuratedS3
+    Worker -->|6. Write inference results| DDB
+    SF -->|7. GET /v1/detect/result/{audit_id}| APIGW
+    APIGW -->|8. Route status request| API
+    API -->|9. Query results| DDB
     
-    Core -->|native ECS Secrets mapping| SM
-    API -.->|Pull Image| ECR
-    Worker -.->|Pull Image| ECR
+    API -.->|Pull Image by Digest| ECR
+    Worker -.->|Pull Image by Digest| ECR
+    API -.->|Access SDK| SM
+    Worker -.->|Access SDK| SM
 ```
 
-*Caption: The AI Engine `/v1/detect` request from the Step Functions orchestrator is routed via the Internal ALB to the AI Engine API Tasks running on Fargate always-on capacity provider tasks. Heavy-duty tasks are coordinated on Fargate Spot capacity provider tasks to read/write curated features from S3. Credentials and configurations are synced from Secrets Manager using native ECS Task Definition Secrets Manager mapping.*
+*Caption: The AI Engine `/v1/detect` request from the Step Functions orchestrator is routed via the Private REST API Gateway to the AI Engine API Lambda function. The API Lambda validates the request, enqueues the job to an SQS Queue, and returns 202 Accepted. The Worker Lambda is triggered by SQS to poll the queue, perform batch scoring, read features from S3, and write results back to DynamoDB. API and execution secrets are retrieved using the AWS SDK from Secrets Manager.*
 
-The ECS platform separates runtime reliability from cost-efficient batch execution. AI Engine API Tasks and `ai-engine-explainer` tasks remain on Fargate always-on capacity provider tasks because Step Functions depends on predictable response behavior during the daily run. AI Engine Worker Tasks, batch scoring tasks, feature engineering tasks, and retraining tasks are placed on Fargate Spot capacity provider tasks because they can checkpoint to S3 and retry after interruption. This distinction is required for both cost control and accurate failure recovery.
+The Lambda-based platform separates runtime API request handling from asynchronous batch execution using SQS queues. The AI Engine API Lambda function handles rapid API ingress (accepting `/v1/detect` requests, generating audit IDs, and enqueuing jobs) and status retrieval via `/v1/detect/result/{audit_id}`. The AI Engine Worker Lambda function is triggered asynchronously by SQS to perform resource-intensive model inference, checkpointing feature progress to S3 and storing final results in DynamoDB. This decoupling ensures API responsiveness, isolates compute consumption via reserved concurrency limits, and uses native SQS/DLQ retries to handle transient failures gracefully.
 
 ### 1.4 Alerting & Containment Engine
 
@@ -269,12 +287,12 @@ The following infrastructure components are deployed in `ap-southeast-1` to oper
 | Metadata Catalog | Glue Data Catalog | Automatically registers table partitions and maintains the schema definitions for Athena. | First 1M cataloged objects are free; crawler runs cost $0.44 per DPU-hour. |
 | Query Engine | Amazon Athena | Allows serverless SQL queries on S3 files to build materialized views and drive dashboards. | $5.00 per TB of data scanned. |
 | State & Audit Database | Amazon DynamoDB | Stores run state, idempotency keys, containment audit logs, and dashboard materialized views. | On-demand capacity: $1.25 per million write units, $0.25 per million read units. |
-| AI Engine Hosting | Amazon ECS | Hosts the shared AIOps-provided AI Engine (service `ai-engine` on cluster `tf-2-aiops-cluster`) with task sizing of 2 vCPU and 4 GB memory, and a 300s timeout. | ECS control plane is fully managed at no additional cluster charge. |
-| Stable Workload Compute | Fargate always-on capacity provider tasks | Runs stable, always-on tasks (AI Engine API Tasks, ai-engine-explainer, monitoring, load balancing integration) on Fargate always-on capacity provider. Scaled via AWS Application Auto Scaling (min 2 / max 10 tasks, triggered when CPU >70% or SQS backlog >100). | Fargate On-Demand rate (based on vCPU and memory per hour in ap-southeast-1). |
-| Batch Workload Compute | Fargate Spot capacity provider tasks | Runs batch detection tasks, heavy feature engineering, and model training/retraining (AI Engine Worker Tasks) on Fargate Spot capacity provider. Spot tasks are interruptible, supporting checkpoint recovery and backoff. | Fargate Spot rate with up to 60-70% savings compared to on-demand Fargate tasks. |
-| Container Registry | Amazon ECR | Hosts versioned Docker container images for AIOps models. | $0.10 per GB/month (first 500 MB free). |
-| Secrets Provider | Secrets Manager | Securely manages API keys, DB credentials, and Slack webhooks with automated rotation. | $0.40 per secret/month + $0.05 per 10,000 requests. |
-| Load Balancer | Application Load Balancer (Internal) | Exposes the shared ECS AI Engine API service internally to Step Functions/Lambda functions over private subnets via `https://ai-engine.tf-2.internal/` (port 443 HTTPS, TLS 1.3, SG-to-SG ingress; port 8080 `/health` check). | ~$0.0225 per LCU-hour. |
+| AI Engine Hosting | AWS Lambda (Container Image) | Hosts the shared AIOps-provided AI Engine (API and Worker functions) using container images packaged in ECR with up to 10 GB storage size support. | Pay-per-use execution costs: ~$0.00001667 per GB-second. |
+| Private Ingress Endpoint | Private REST API Gateway | Exposes private API endpoints for /v1/* contract paths internally via interface VPC Endpoints, using IAM SigV4 for caller authentication. | $3.50 per million API calls + data transfer charges. |
+| Async Queue Buffer | Amazon SQS & DLQ | Buffers incoming detect tasks from API Gateway to isolate compute execution, scale worker Lambda, and manage failures via Dead Letter Queue. | $0.40 per million messages (first 1M free). |
+| Container Registry | Amazon ECR | Hosts versioned Docker container images for AIOps models, referenced in deployment by immutable image digest hashes. | $0.10 per GB/month (first 500 MB free). |
+| Secrets Provider | Secrets Manager | Securely manages API keys, DB credentials, and Slack webhooks, accessed dynamically via the AWS SDK inside Lambda functions. | $0.40 per secret/month + $0.05 per 10,000 requests. |
+| Private VPC Traffic | VPC Endpoints | Enables secure, private access to AWS services (ECR, S3, DynamoDB, KMS, Logs, Secrets Manager) from within private VPC subnets. | ~$7.20 per endpoint/month per AZ + data processing charges. |
 | Finance Dashboard | Amazon S3 + CloudFront | A lightweight internal web dashboard hosted as static assets in Amazon S3 and delivered through Amazon CloudFront. The dashboard reads precomputed finance-readable summaries from S3 JSON objects or DynamoDB records. | S3 storage and CloudFront HTTPS request/data transfer fees (typically <$5/month). QuickSight is retained only as a future BI option. |
 | Alert Channels | Amazon SNS / Slack API | Delivers separate routing paths for alerts (Finance alerts via Slack/Email, Eng alerts via Slack/Jira). | SNS is free up to 100k email notifications/month; Slack API is free. |
 | Containment Worker | AWS Lambda | Assumes roles in member accounts to apply tags or shut down dev/sandbox resources, strictly executing in `dry-run` or `apply` modes. | Pay-per-use. |
@@ -287,7 +305,7 @@ The component model maps directly to the three data contracts used by the platfo
 | Contract | CDO component responsible | Minimum evidence retained |
 |---|---|---|
 | Cost data pull contract | EventBridge Scheduler, Step Functions, Ingestion Lambda, S3, Glue, Athena | Source object URI, cost window, account, service, region, tag owner, unblended cost, estimated/final flag. |
-| AI decision output contract | Internal ALB, AI Engine API Tasks, Step Functions, DynamoDB | Model version, anomaly ID, confidence, severity, expected vs actual spend, evidence window, explanation, recommended route. |
+| AI decision output contract | Private API Gateway, AI Engine API & Worker Lambdas, Step Functions, DynamoDB | Model version, anomaly ID, confidence, severity, expected vs actual spend, evidence window, explanation, recommended route. |
 | Alert and containment contract | Alert Lambda, Containment Lambda, DynamoDB, S3 audit trail | Route target, approval requirement, execution mode, before/after state, rollback path, audit record ID. |
 
 ---
@@ -296,32 +314,32 @@ The component model maps directly to the three data contracts used by the platfo
 
 ### 3.1 Why this angle?
 
-The CDO platform implements a **lakehouse-centric FinOps control plane with serverless orchestration and ECS hybrid hosting for the AI Engine**.
+The CDO platform implements a **lakehouse-centric FinOps control plane with serverless orchestration and AWS Lambda container image hosting for the AI Engine**.
 1. **Lakehouse Fit**: Production FinOps operates on a natural 24h cadence dictated by AWS CUR export frequencies. A lakehouse pattern (S3 + Glue + Athena) avoids the high fixed costs of an always-on data warehouse (like Redshift) or relational databases, while keeping historical cost data fully structured, audit-ready, and partition-queried.
 2. **Serverless Orchestration**: EventBridge and Step Functions manage the flow serverless-first, keeping the operational overhead of the pipeline orchestrator near zero.
-3. **ECS Fargate Hybrid Compute for AI**: The AIOps-provided AI Engine contains two distinct workloads:
-   - Stable inference endpoints (AI Engine API Tasks, `ai-engine-explainer`) that must remain highly available and low-latency.
-   - Heavy batch jobs (AI Engine Worker Tasks for feature engineering, batch scoring, and model retraining) that are computationally intensive but interruptible.
-   Hosting the AI Engine on ECS enables the CDO to place stable APIs on Fargate always-on capacity provider tasks to guarantee SLOs, and batch workers on Fargate Spot capacity provider tasks. This achieves a 60-70% reduction in AI compute cost. Under ECS Fargate, we configure Capacity Providers to allocate workloads across Fargate (always-on) and Fargate Spot, achieving automated lifecycle management and cost-optimized compute scaling without managing EC2 infrastructure.
+3. **AWS Lambda Container Hosting for AI**: The AIOps-provided AI Engine separates runtime tasks into:
+   - Synchronous API and status verification tasks (handled by the API Lambda) exposed via Private REST API Gateway, requiring low latency and quick execution.
+   - Asynchronous batch inference jobs (handled by the Worker Lambda) triggered via SQS to bypass API gateway and Lambda timeout constraints.
+   Hosting the AI Engine on AWS Lambda container images enables serverless scaling, eliminates idle compute costs (unlike always-on containers), and leverages ECR digest pinning for immutable deployment. Compute capacity and throttling are managed via Reserved Concurrency limits. Offline model training, retraining, and heavy offline analysis remain outside the CDO runtime scope.
 
-The practical reason this matters is operational independence. AIOps can iterate on model logic, feature engineering, and false-positive handling without changing the CDO workflow. CDO keeps the lakehouse, scheduler, API invocation path, alert routing, and containment policy stable, while the ECS-hosted AI Engine can evolve behind a versioned contract.
+The practical reason this matters is operational independence. AIOps can iterate on model logic, feature engineering, and false-positive handling without changing the CDO workflow. CDO keeps the lakehouse, scheduler, API invocation path, alert routing, and containment policy stable, while the Lambda-container-hosted AI Engine can evolve behind a versioned contract.
 
 ### 3.2 Strengths (with metrics)
 
-The metrics below highlight the trade-offs of the lakehouse-centric + ECS Fargate hybrid architecture compared to alternative CDO approaches:
+The metrics below highlight the trade-offs of the lakehouse-centric + Lambda container architecture compared to alternative CDO approaches:
 
-| Axis | Chosen Angle (Lakehouse + ECS Fargate Hybrid) | Alternative A (ECS Cluster on EC2 + RDS Aurora) | Alternative B (Third-Party SaaS Platform) |
+| Axis | Chosen Angle (Lakehouse + Lambda Container) | Alternative A (ECS Cluster on EC2 + RDS Aurora) | Alternative B (Third-Party SaaS Platform) |
 |---|---|---|---|
 | **Cost per daily run (Ingest + Query)** | ~$0.15 (S3 + Athena pay-per-query) | ~$5.00 (Fixed daily rate of RDS instance) | N/A (Included in subscription fees) |
-| **AI compute cost (Hosting/Month)** | ~$80 (ECS Fargate always-on + Fargate Spot tasks) | ~$240 (ECS cluster management + Spot instance scaling) | N/A |
-| **Operational overhead (Hours/Week)** | ~2 hours (Managing Terraform ECS, task config) | ~8 hours (ECS cluster on EC2 and Terraform ECS configuration updates) | ~1 hour (SaaS connection updates) |
+| **AI compute cost (Hosting/Month)** | ~$40 (Lambda pay-per-use + SQS queueing) | ~$240 (ECS cluster management + Spot instance scaling) | N/A |
+| **Operational overhead (Hours/Week)** | ~1 hour (Managing Terraform Lambda and API Gateway) | ~8 hours (ECS cluster on EC2 and Terraform ECS configuration updates) | ~1 hour (SaaS connection updates) |
 | **Account onboarding time** | < 10 mins (Terraform IAM cross-account stack) | ~25 mins (Manual DB schema setup + VPC peering) | > 60 mins (Manual setup + IAM configs) |
-| **Scalability for model retraining** | Excellent (Fargate Spot task pools scaled via AWS Application Auto Scaling) | Excellent (ECS Spot task pools scaled via AWS Application Auto Scaling) | Poor (AIOps model cannot run locally) |
+| **Scalability for model retraining** | N/A (Offline; training stays offline / AIOps-managed) | Excellent (ECS Spot task pools scaled via AWS Application Auto Scaling) | Poor (AIOps model cannot run locally) |
 
 ### 3.3 Accepted weaknesses
 
-- **ECS Fargate Spot Interruption Risk**: Running heavy batch training and scoring workloads on Fargate Spot capacity provider tasks exposes the system to task termination. This is accepted because ECS Fargate automatically handles task rescheduling, and the AIOps worker supports checkpointing to S3, minimizing lost progress while securing 60-70% compute savings.
-- **VPC Endpoints Cost**: Routing all traffic privately within the VPC requires interface endpoints (Secrets Manager, ECR, CloudWatch), adding fixed charges (~$7.20/endpoint/month). This is accepted to meet the strict security requirement of zero public transit of cost/audit data.
+- **Lambda Cold Start and Scale Concurrency Limits**: Running inference workloads on Lambda container images can introduce cold-start latency (pulling container images on initialization) and risk concurrency limit exhaustion. This is accepted because detection runs on a daily batch cadence (not real-time), and API concurrency is isolated via Reserved Concurrency constraints.
+- **VPC Endpoints Cost**: Routing all traffic privately within the VPC requires interface endpoints (ECR, S3, DynamoDB, KMS, Logs, Secrets Manager), adding fixed charges (~$7.20/endpoint/month per AZ). This is accepted to meet the strict security requirement of zero public transit of cost/audit data.
 - **CUR Ingestion Latency**: AWS CUR exports lag by 8 to 24 hours. This lag is accepted since the platform runs on a 24-hour cadence, meaning real-time streaming is not required for daily anomaly detection.
 
 ---
@@ -352,12 +370,12 @@ When onboarding a new AWS account or squad to the FinOps Watch platform, the fol
 1. Add account ID and owner mapping to the Terraform 'accounts.tfvars' configuration.
 2. Terraform execution applies IAM Stack:
    - Provisions 'FinOpsCrossAccountAccessRole' in the target member account.
-   - Configures trust policy allowing the central CDO Lambda and ECS task roles to assume it.
+   - Configures trust policy allowing the central CDO Lambda and the AI Engine Lambda execution roles to assume it.
    - Updates target account CUR export configuration to deliver data to S3.
 3. Glue crawler is triggered to update partitions in the Glue Data Catalog.
 4. E2E Validation run:
    - Ingestion Lambda makes a test API call to target account Cost Explorer.
-   - Verifies connectivity to ECS internal service endpoint.
+   - Verifies connectivity to Private REST API Gateway endpoint.
 5. Account status marked as 'ACTIVE' in the DynamoDB registry.
 ```
 
@@ -373,7 +391,7 @@ To prevent duplicate runs for the same cost period (which would skew dashboard d
 
 To protect the AWS Cost Explorer API from exceeding its strict rate limit of **5 requests per second**, the CDO platform implements a DynamoDB-based caching strategy as described in the telemetry contract:
 - **CDO Cache Storage**: The Ingestion Lambda queries daily Cost Explorer metrics and caches the result payload inside a dedicated DynamoDB table (`cdo-cost-cache-table`) keyed by `AccountID:DateRange`.
-- **AI Engine Offline Consumption**: When the AIOps-provided AI Engine executes and requires historical baseline cost data (such as 7-day or 30-day trailing spends for feature engineering and anomaly analysis), it reads the cached cost records directly from the CDO DynamoDB store via the internal ALB boundary.
+- **AI Engine Offline Consumption**: When the AIOps-provided AI Engine executes and requires historical baseline cost data (such as 7-day or 30-day trailing spends for feature engineering and anomaly analysis), it reads the cached cost records directly from the CDO DynamoDB store via the Private REST API Gateway.
 - **Benefits**: This prevents the AI Engine and multiple platform Lambdas from calling the Cost Explorer API concurrently, ensuring the platform remains well below the 5 requests/sec threshold and eliminating any chance of AWS throttling.
 
 ### 4.6 Telemetry Ingestion Compliance & Validation
@@ -402,9 +420,9 @@ The CDO platform enforces all data-plane validation and security controls define
 - **Option A**: Apache Airflow on AWS (MWAA).
   - *Pros*: Excellent Python integration, native complex dependency trees, detailed task visualizer.
   - *Cons*: High fixed cost (~$350/month minimum), slow startup time (20+ minutes), complex infrastructure configuration.
-- **Option B**: ECS Scheduled Tasks.
-  - *Pros*: Runs natively within the ECS cluster using EventBridge scheduler.
-  - *Cons*: Difficult to orchestrate complex multi-step cross-account workflows, manage intermediate states, and implement custom error handlers compared to AWS Step Functions.
+- **Option B**: Lambda Direct Cron Trigger.
+  - *Pros*: Simple, runs natively as an EventBridge schedule target calling a single Lambda function.
+  - *Cons*: Difficult to orchestrate complex multi-step cross-account workflows, manage intermediate states, handle 15-minute timeout limitations, and implement custom error handlers compared to AWS Step Functions.
 - **Chosen**: EventBridge Scheduler + Step Functions Standard.
   - *Reason*: 100% serverless, zero idle costs, native integration with AWS Lambda and DynamoDB, and robust out-of-the-box error retry handlers.
 
@@ -425,12 +443,12 @@ The CDO platform enforces all data-plane validation and security controls define
 
 The CDO platform scales dynamically to handle increases in data volume and compute requirements:
 
-- **ECS Task Autoscaling**: The AI Engine API Tasks and `ai-engine-explainer` services use ECS Service Auto Scaling (using CPU target tracking 70%) to scale out if concurrent request volume spikes.
-- **ECS Capacity Provider Scaling**: The ECS cluster utilizes AWS Application Auto Scaling and Fargate Capacity Providers. It dynamically provisions and terminates Fargate tasks, scheduling AI Engine Worker Tasks onto Fargate Spot capacity provider tasks and stable API tasks onto Fargate always-on capacity provider tasks.
+- **Lambda Concurrency Limits**: The API and Worker Lambdas utilize AWS Lambda Reserved Concurrency limits to bound execution capacity. This prevents runaway API execution from consuming the entire account's concurrency pool, while Provisioned Concurrency can be enabled as a production optimization to eliminate cold-start lag.
+- **SQS Ingestion Decoupling**: Rather than scaling computing tasks concurrently to handle massive ingestion batches, SQS queues buffer incoming tasks. This allows the Worker Lambda to process messages sequentially or in controlled batches (e.g. batch size of 10), preventing resource exhaustion on dependent databases like DynamoDB or external APIs.
 - **Athena Query Optimization**: S3 buckets are partitioned by `account_id`, `year`, and `month`. Athena queries limit data scans to specific partitions, preventing execution bottlenecks.
 - **DynamoDB Scaling**: The `cdo-run-state-table` is configured in **On-Demand Capacity Mode**, allowing it to scale instantly from zero to thousands of read/write requests without manual intervention.
 
-The production scaling assumption is that line-item volume grows faster than account count. Therefore, S3 partitioning, Athena scan limits, and AI batch worker autoscaling are more important than increasing Lambda concurrency. Model-training or backtest dataset size is handled by AIOps; CDO scales the operational ingestion, invocation, dashboard, and audit path.
+The production scaling assumption is that line-item volume grows faster than account count. Therefore, S3 partitioning, Athena scan limits, and AI batch Lambda worker scaling are more important than increasing Lambda concurrency. Model-training or backtest dataset size is handled by AIOps; CDO scales the operational ingestion, invocation, dashboard, and audit path.
 
 ---
 
@@ -442,22 +460,22 @@ The following table outlines the failure modes, detection mechanisms, and recove
 |---|---|---|---|---|
 | **CUR Export Delay** | Step Functions validation Lambda returns empty or missing daily Parquet partition in S3. | Step Functions enters a wait state and retries every 2 hours. If delay exceeds 24 hours, it alerts the operator. | N/A | 24 hours |
 | **Cost Explorer Throttling** | Ingestion Lambda catches `LimitExceededException` from AWS API. | Exponential backoff with random jitter in Lambda code; retries up to 5 times. | 30 mins | 0 |
-| **AI Engine Timeout / API Error** | Client receives `500 Internal Error` with `ERR_LLM_TIMEOUT` (Bedrock 45s hard limit) or `503 Service Unavailable` with `ERR_SERVICE_DOWN`. | **CDO fails closed**: Ingestion workflow terminates, containment actions are blocked, a failed run is logged, and CDO immediately falls back to static rule-based SRE alerting. | 4 hours | 24 hours |
+| **AI Engine Timeout / API Error** | Client receives `500 Internal Error` with `ERR_LLM_TIMEOUT` (Bedrock 45s hard limit), `504 Gateway Timeout` (API Gateway 29s limit), or Lambda execution timeout. | **CDO fails closed**: Ingestion workflow terminates, containment actions are blocked, a failed run is logged, and CDO immediately falls back to static rule-based SRE alerting. | 4 hours | 24 hours |
 | **Failed Run Workflow** | Step Functions execution status updates to `FAILED`; triggers CloudWatch Alarm. | Step Functions logs the error block to DynamoDB. Engineers resolve the issue and trigger a manual redrive of the state machine from the failed step. | 2 hours | 24 hours |
 | **Duplicate Run Attempt** | DynamoDB write returns unique key constraint violation, or API returns HTTP `409` with `Retry-After: 30`. | CDO worker sleeps for 30 seconds and polls for results, avoiding double calls. | < 10s | 0 |
 | **Mismatched Idempotency Payload** | API returns HTTP `400` with `ERR_IDEMPOTENCY_MISMATCH` due to different payload on same key. | CDO logs critical alert, blocks run, and SRE fixes the key generation logic. | 2 hours | 0 |
 | **Dashboard Stale Data** | CloudWatch Alarm triggers if the latest curated partition timestamp is >26 hours old. | Alerts engineers to review the pipeline logs and manually trigger a redrive of the daily ingestion run. | 1 hour | 24 hours |
 | **Alert Delivery Failure** | `LambdaAlertRouting` catches connection timeout or HTTP 5xx error from Slack API. | The Lambda function sends the alert payload to an SQS Dead Letter Queue (DLQ) and attempts delivery via SES email fallback. | 10 mins | 0 |
 | **Containment Action Denial** | Member account cross-account role assumption returns `AccessDeniedException`. | **CDO fails closed**: The incident is logged in the DynamoDB audit table as `DENIED`, and a critical alert is sent to the security channel. | 1 hour | 0 |
-| **AI Contract Version Mismatch** | Pre-run validation finds that the deployed AI Engine API Tasks contract version differs from the Step Functions expected schema. | Block the run before detection, mark the run as `FAILED_CONTRACT_CHECK`, notify CDO and AIOps, and do not execute containment. | 2 hours | 24 hours |
-| **Spot Worker Interruption** | ECS task receives Fargate Spot task termination or interruption event. | Retry the batch job from the latest S3 checkpoint on a healthy Fargate Spot task or on-demand fallback task if the retry window is exhausted. | 1 hour | 0 for checkpointed work |
+| **AI Contract Version Mismatch** | Pre-run validation finds that the deployed AI Engine API Lambda contract version differs from the Step Functions expected schema. | Block the run before detection, mark the run as `FAILED_CONTRACT_CHECK`, notify CDO and AIOps, and do not execute containment. | 2 hours | 24 hours |
+| **SQS Worker Lambda Failure** | SQS message processing fails, or worker Lambda execution times out (15-min limit) or crashes. | The SQS queue automatically retries execution based on the redrive policy. If retries are exhausted, the message is routed to the SQS DLQ, and an operator alert is fired. | 1 hour | 0 for checkpointed work |
 
 ---
 
 ## Related documents
 
 - [`01_requirements_analysis.md`](01_requirements_analysis.md) - Business context, NFR targets, and CDO/AIOps boundaries.
-- [`03_security_design.md`](03_security_design.md) - IAM roles, Security Groups, ECS Task Roles, and KMS encryption keys.
+- [`03_security_design.md`](03_security_design.md) - IAM roles, Security Groups, Lambda execution roles, and KMS encryption keys.
 - [`04_deployment_design.md`](04_deployment_design.md) - Terraform IaC modular configurations, GitHub Actions (CI/CD) deployment pipelines.
 - [`05_cost_analysis.md`](05_cost_analysis.md) - Estimated pipeline operational budget and cadence comparisons.
-- [`08_adrs.md`](08_adrs.md) - Architectural decisions regarding 24h cadence and ECS Fargate capacity provider selection.
+- [`08_adrs.md`](08_adrs.md) - Architectural decisions regarding 24h cadence, Lambda container images, and Private API Gateway.
