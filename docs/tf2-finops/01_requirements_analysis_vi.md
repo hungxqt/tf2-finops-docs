@@ -1,7 +1,5 @@
-# Phân tích Yêu cầu (Requirements Analysis) - Task Force 2 · FinOps Watch CDO
-
-<!-- Doc owner: CDO Team
-     Status: Final (W11 T6 Pack #1) → Refined (W12 T4 Pack #2)
+# Phân tích Yêu cầu (Requirements Analysis) - Task Force 2 · FinOps Watch<!-- Doc owner: CDO Team
+     Status: Final (W11 T6 Pack #1) -> Refined (W12 T4 Pack #2)
 -->
 
 ## 1. Context
@@ -10,7 +8,7 @@ Task Force 2 đang xây dựng hệ thống **FinOps Watch** cho CFO của một
 
 CFO mong muốn có một hệ thống **FinOps Watch** hoạt động liên tục theo chu kỳ (cadence) xác định để nạp dữ liệu chi phí (CUR và Cost Explorer API), phát hiện các bất thường (anomaly) với tỷ lệ precision và false-positive đo lường được, định tuyến cảnh báo (alert routing) đến đúng phòng ban (Finance so với Engineering), và kích hoạt các hành động ngăn chặn tự động an toàn (safe containment) đối với các mẫu lãng phí rõ ràng (ví dụ: tài nguyên nhàn rỗi, chi phí gắn sai thẻ tag, hoặc cụm training chạy quá mức kiểm soát).
 
-Đội ngũ CDO chịu trách nhiệm về FinOps control plane, xây dựng kiến trúc lakehouse-centric để ingest và xử lý dữ liệu chi phí, workflow điều phối (orchestration), quản lý trạng thái vận hành, hiển thị dashboard, định tuyến cảnh báo (alert routing), thiết lập các containment guardrails, và ghi nhật ký kiểm toán (audit logs). Đội ngũ CDO cũng host AI Engine do đội ngũ AIOps cung cấp trên AWS EKS, phân chia các workload giữa các nhóm node group: on-demand và spot.
+Đội ngũ CDO chịu trách nhiệm về FinOps control plane, xây dựng kiến trúc lakehouse-centric để ingest và xử lý dữ liệu chi phí, workflow điều phối (orchestration), quản lý trạng thái vận hành, hiển thị dashboard, định tuyến cảnh báo (alert routing), thiết lập các containment guardrails, và ghi nhật ký kiểm toán (audit logs). Đội ngũ CDO cũng host AI Engine do đội ngũ AIOps cung cấp trên AWS ECS (cụ thể trong ECS cluster 'tf-2-aiops-cluster'), phân chia các workload giữa các Fargate always-on capacity provider tasks và Fargate Spot capacity provider tasks.
 
 Đội ngũ AIOps sở hữu bất kỳ bộ dữ liệu lịch sử tổng hợp (synthetic historical dataset) nào được sử dụng để huấn luyện, cải tiến, hiệu chuẩn hoặc backtest mô hình phát hiện bất thường. Tài liệu CDO coi bộ dữ liệu đó là đầu vào phục vụ chất lượng mô hình ở thượng nguồn (upstream), chứ không phải là nguồn định cỡ hệ thống (sizing source) hoặc nguồn dữ liệu vận hành của nền tảng CDO. CDO tiêu thụ mô hình thông qua một hợp đồng API đã ký kết, lưu trữ bằng chứng quyết định được trả về và chứng minh rằng chính sách cảnh báo và containment được áp dụng một cách an toàn.
 
@@ -28,7 +26,7 @@ Hệ thống CDO phải đáp ứng các yêu cầu phi chức năng (NFRs) sau 
 | Dashboard readability | Giao diện Finance-friendly, không yêu cầu kỹ năng SQL | Đội ngũ CFO phải đọc hiểu được các bất thường chi phí mà không cần chạy truy vấn kỹ thuật. |
 | Cost per run | Tối thiểu hóa; theo dõi bằng `Cần bằng chứng: Chi phí vận hành pipeline CDO` | Đảm bảo bản thân hệ thống vận hành hoạt động hiệu quả về mặt chi phí. |
 | Security baseline | IAM least-privilege, cross-account read-only access | Ranh giới cứng: NEVER terminate prod, delete data, hoặc modify IAM. |
-| AI Engine hosting uptime | ≥99.5% availability cho hosted model API | API AI Engine do CDO host trên EKS phải đáng tin cậy cho các tác vụ gọi inference đồng bộ. |
+| AI Engine hosting uptime | ≥99.5% availability cho hosted model API | API AI Engine do CDO host trên ECS phải đáng tin cậy cho các tác vụ gọi inference đồng bộ. |
 | Cost data contract coverage | Account, service, region, resource, tag, cost period, USD amount, và estimated/final flag | Đảm bảo CDO gửi đủ ngữ cảnh vận hành tới AIOps AI Engine mà không cần sở hữu dữ liệu huấn luyện mô hình. |
 | Idempotency | Một lần chạy được chấp nhận cho mỗi tài khoản và cửa sổ chi phí (cost window) | Ngăn ngừa cảnh báo trùng lặp, các cuộc gọi AI Engine trùng lặp và double-counted (tính toán lặp lại) khi cập nhật dashboard. |
 | Alert explainability | Mỗi cảnh báo bất thường bao gồm độ tin cậy (confidence), mức độ nghiêm trọng (severity), cửa sổ bằng chứng (evidence window), định tuyến chủ sở hữu và giải thích | Finance và Engineering phải có thể quyết định xem cảnh báo có hợp lệ hay không và cần làm gì tiếp theo. |
@@ -38,9 +36,9 @@ Các NFRs được cố ý viết dưới dạng các mục tiêu vận hành, k
 
 ## 3. Differentiation angle (KEY)
 
-- **Angle chọn**: FinOps control plane dạng lakehouse-centric kết hợp serverless orchestration và CDO-hosted AI Engine trên AWS EKS.
-- **Why this angle**: Quy trình FinOps trong thực tế hoạt động theo chu kỳ 24h tự nhiên theo tần suất xuất bản dữ liệu CUR. Việc nạp dữ liệu CUR và Cost Explorer API vào một lakehouse (S3 + Glue Data Catalog + Athena) cho phép lưu trữ lịch sử để truy vấn, phục vụ kiểm toán và tạo ra các materialized views thân thiện với Finance. AI Engine được triển khai trên cụm EKS chuyên biệt, sử dụng managed node groups để tối ưu hóa chi phí: các service API chạy ổn định (inference/explainer) được đặt trên on-demand nodes, trong khi các workload batch nặng (batch scoring, feature engineering, model retraining) chạy trên spot nodes. Thiết kế lai này giúp giảm thiểu chi phí máy chủ nhàn rỗi và đảm bảo khả năng mở rộng của hệ thống.
-- **Trade-off chấp nhận**: Chấp nhận độ phức tạp vận hành của cụm EKS và quy trình triển khai bằng Helm/GitOps so với kiến trúc serverless container thuần túy. Điều này là xứng đáng vì EKS cung cấp khả năng kiểm soát chặt chẽ vị trí đặt workload (node affinity đối với on-demand và spot), bảo mật mạng (network policies), và mở rộng quy mô hiệu quả cho các tác vụ batch và training nặng.
+- **Angle chọn**: FinOps control plane dạng lakehouse-centric kết hợp serverless orchestration và CDO-hosted AI Engine trên AWS ECS (cụ thể trong ECS cluster 'tf-2-aiops-cluster').
+- **Why this angle**: Quy trình FinOps trong thực tế hoạt động theo chu kỳ 24h tự nhiên theo tần suất xuất bản dữ liệu CUR. Việc nạp dữ liệu CUR và Cost Explorer API vào một lakehouse (S3 + Glue Data Catalog + Athena) cho phép lưu trữ lịch sử để truy vấn, phục vụ kiểm toán và tạo ra các materialized views thân thiện với Finance. AI Engine được triển khai trên cụm ECS chuyên biệt (tf-2-aiops-cluster), sử dụng Fargate Capacity Providers để tối ưu hóa chi phí: các service API chạy ổn định (inference/explainer) được đặt trên Fargate always-on capacity provider tasks, trong khi các workload batch nặng (batch scoring, feature engineering, model retraining) chạy trên Fargate Spot capacity provider tasks. Thiết kế lai này giúp giảm thiểu chi phí máy chủ nhàn rỗi và đảm bảo khả năng mở rộng của hệ thống.
+- **Trade-off chấp nhận**: Chấp nhận độ phức tạp vận hành của cụm ECS và quy trình triển khai bằng Terraform ECS configuration và GitHub Actions (CI/CD) deployment pipelines so với kiến trúc serverless container thuần túy. Điều này là xứng đáng vì ECS cung cấp khả năng kiểm soát chặt chẽ vị trí đặt workload (always-on vs. Spot capacity provider allocation), bảo mật mạng (security groups), và mở rộng quy mô hiệu quả cho các tác vụ batch và training nặng.
 - **Lock date**: 2026-06-23 (khóa thiết kế W11).
 
 Sự khác biệt không phải là "sử dụng AI cho FinOps"; quyền sở hữu đó thuộc về AIOps. Sự khác biệt của CDO là control plane xung quanh quyết định của AI: kéo dữ liệu lặp lại, bằng chứng lịch sử có thể truy vấn, gọi mô hình được gắn phiên bản (versioned model invocation), định tuyến an toàn, containment thực thi theo chính sách và báo cáo tài chính trực quan. Một cách tiếp cận thuần túy tập trung vào dashboard sẽ chỉ hiển thị chi tiêu mà không thể khép kín quy trình. Một cách tiếp cận thuần túy tập trung vào tự động hóa sẽ hoạt động quá quyết liệt mà không có đủ bằng chứng. Góc độ được chọn giữ cho vòng lặp FinOps hàng ngày có thể đo lường và đảo ngược được.
@@ -58,13 +56,13 @@ Bảng phân chia trách nhiệm giữa đội CDO và AIOps được xác đị
 | Xử lý tag metadata & phân định tài nguyên sở hữu | Owns | |
 | Orchestration workflow (Step Functions) | Owns | |
 | Quản lý run state, idempotency & scheduling | Owns | |
-| Xây dựng dashboard thân thiện với Finance (QuickSight/Athena) | Owns | |
+| Xây dựng dashboard thân thiện với Finance (S3 + CloudFront dashboard backed by Athena/DynamoDB summaries) | Owns | |
 | Định tuyến cảnh báo (các kênh Finance vs. Engineering) | Owns | |
 | Triển khai safe containment guardrails & audit log trail | Owns | |
-| EKS Cluster Hosting Platform (Vòng đời cluster, IAM roles, VPC networking) | Owns | |
-| EKS Managed Node Groups (Cấu hình On-demand/Spot) | Owns | |
-| Xây dựng deployment pipelines (Helm, GitOps, IaC) cho AI workloads | Owns | |
-| Cấu hình runtime monitoring & autoscaling (HPA/KEDA) | Owns | |
+| ECS Cluster Hosting Platform (Vòng đời cluster, ECS Task Role, ECS Task Execution Role, VPC networking) | Owns | |
+| ECS Fargate Capacity Providers (Cấu hình always-on/Spot) | Owns | |
+| Xây dựng deployment pipelines (Terraform ECS configuration, GitHub Actions (CI/CD) deployment pipelines, IaC) cho AI workloads | Owns | |
+| Cấu hình runtime monitoring & autoscaling (ECS Service Auto Scaling (using CPU target tracking 70% and SQS step scaling)) | Owns | |
 | AI Engine model internals, logic & code | | Owns |
 | Huấn luyện model, retraining & cấu hình hyperparameter | | Owns |
 | Logic tính confidence scoring & phân loại anomaly | | Owns |
@@ -73,11 +71,25 @@ Bảng phân chia trách nhiệm giữa đội CDO và AIOps được xác đị
 | Đánh giá và báo cáo hiệu năng backtest của AI model | | Owns |
 | Cung cấp các versioned container artifacts (images, weights, configs) | | Provides |
 
-*Ghi chú: Đội ngũ CDO tiêu thụ (consume) AI Engine thông qua một hợp đồng API được version hóa, được expose qua endpoint service nội bộ trong cụm EKS. AIOps cung cấp các container image và model weight được gắn version rõ ràng, trong khi CDO quản lý việc triển khai, vận hành, tự động scale và xử lý lỗi.*
+*Ghi chú: Đội ngũ CDO tiêu thụ (consume) AI Engine thông qua một hợp đồng API được version hóa, được expose qua endpoint service nội bộ trong cụm ECS. AIOps cung cấp các container image và model weight được gắn version rõ ràng, trong khi CDO quản lý việc triển khai, vận hành, tự động scale và xử lý lỗi.*
 
 Ranh giới này được thực thi tại thời điểm chạy (runtime) cũng như trong tài liệu. CDO xác thực schema yêu cầu và phản hồi `/detect` trước mỗi bản phát hành tương thích, ghi lại phiên bản mô hình do AIOps trả về, lưu trữ URI bằng chứng cho mỗi bất thường và fail closed (đóng an toàn) khi AI Engine không khả dụng hoặc trả về payload không hợp lệ. AIOps tiếp tục chịu trách nhiệm về các chỉ số chất lượng mô hình như precision, recall, hiệu chuẩn độ tin cậy và logic giải thích, trong khi CDO tiếp tục chịu trách nhiệm về việc liệu các đầu ra đó có được sử dụng an toàn trong các quy trình cảnh báo, dashboard và containment hay không.
 
 Đầu ra quyết định tối thiểu của AI mà CDO tiêu thụ là: `run_id`, `model_version`, `anomaly_id`, `tenant/account`, `anomaly_type`, `confidence`, `severity`, `expected_spend`, `actual_spend`, `delta`, `evidence_window`, `explanation`, `recommended_route`, `recommended_containment_mode` và `evidence_uri`. Việc thiếu các trường bắt buộc sẽ chặn containment và tạo ra cảnh báo cho người vận hành.
+
+### 4.1 Tuân thủ Hợp đồng Mục tiêu Mức độ Dịch vụ (SLO)
+
+Nền tảng CDO tiêu thụ AI Engine API theo các Mục tiêu Mức độ Dịch vụ (SLOs) được xác định trong `ai-api-contract.md` §6. Sự tích hợp phải được xác minh và giám sát chặt chẽ dựa trên các mục tiêu bắt buộc sau:
+
+| Chỉ số SLO | Mục tiêu Hợp đồng | Sự kiện xác minh |
+|---|---|---|
+| **Độ trễ Ingestion (P99)** | < 50 ms | Thời gian xử lý hai chiều của yêu cầu POST `/v1/detect`. |
+| **Độ trễ truy vấn kết quả (P99)** | < 10 ms | Thời gian truy xuất dữ liệu từ DynamoDB Store. |
+| **LLM Inference SLA** | < 30 giây | Khung thời gian thực thi của Amazon Bedrock (Nova LLM) và ghi DB. |
+| **Tính khả dụng hệ thống** | >=99.5% | Tổng thời gian hoạt động của ALB nội bộ/API Gateway dành cho CDO. |
+| **Tỷ lệ lỗi** | < 0.5% | Tỷ lệ phản hồi lỗi hệ thống (HTTP 5xx) trên tổng số yêu cầu. |
+
+Bất kỳ vi phạm nào đối với các tham số SLA này sẽ kích hoạt quy trình dự phòng (cảnh báo SRE, áp dụng quy tắc tĩnh, hoặc đóng an toàn đối với các quyết định containment).
 
 ## 5. Constraints
 
@@ -104,9 +116,9 @@ Các ràng buộc này xác định những gì nền tảng CDO không được
 - [ ] **Tagging compliance baseline**: Tỷ lệ tài nguyên hiện tại được tag đầy đủ các key `owner` và `squad` là bao nhiêu?
 - [ ] **Escalation SLA**: Một hành động containment sẽ chờ ở trạng thái `dry-run` hoặc chờ phê duyệt trong bao lâu trước khi escalate lên quy trình duyệt manual?
 - [ ] **AIOps API contract freeze**: Cấu trúc payload cho API `/detect` đã được đóng băng và freeze chưa?
-- [ ] **Budget ceiling**: Hạn mức ngân sách tối đa dành cho CDO EKS hosting platform (control plane + node groups) trong thời gian chạy capstone là bao nhiêu?
-- [ ] **Identity management**: Truy cập dashboard QuickSight sẽ được tích hợp với Identity Provider (IdP) doanh nghiệp qua SAML/OIDC như thế nào?
-- [ ] **Spot reclamation strategy**: Điểm lưu trữ checkpoint (format và S3 location) của AIOps batch training jobs đã được xác định để xử lý khi spot node bị thu hồi chưa?
+- [ ] **Budget ceiling**: Hạn mức ngân sách tối đa dành cho CDO ECS hosting platform (control plane + Fargate capacity provider tasks) trong thời gian chạy capstone là bao nhiêu?
+- [ ] **Identity management**: Truy cập dashboard S3 + CloudFront sẽ được tích hợp với Identity Provider (IdP) doanh nghiệp (ví dụ sử dụng CloudFront + Cognito hoặc OIDC) như thế nào, và khi nào nên đưa QuickSight vào làm tích hợp BI trong tương lai?
+- [ ] **Spot reclamation strategy**: Điểm lưu trữ checkpoint (format và S3 location) của AIOps batch training jobs đã được xác định để xử lý khi Fargate Spot task bị thu hồi chưa?
 - [ ] **False-positive approval calendar**: Lịch phê duyệt false-positive: Finance có thể cung cấp các cửa sổ di dời hệ thống (migration), load-test và flash-sale đã biết cho AIOps để hiệu chuẩn mô hình và cho CDO để chú thích cảnh báo không?
 - [ ] **Dashboard decision owner**: Chủ sở hữu quyết định dashboard: Vai trò Finance nào ký duyệt các nhãn mức độ nghiêm trọng (severity labels), ngưỡng ngân sách và từ ngữ leo thang được sử dụng trong các chế độ hiển thị dành cho ban điều hành?
 - [ ] **Containment approval owner**: Chủ sở hữu phê duyệt containment: Đối với các hành động ở chế độ apply trên non-prod, sự phê duyệt đến từ chủ sở hữu squad, chủ sở hữu nền tảng hay chủ sở hữu Finance?

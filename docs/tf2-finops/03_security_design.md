@@ -1,7 +1,7 @@
 # Security Design - Task Force 2 · FinOps Watch CDO
 
 <!-- Doc owner: CDO Team
-     Status: Final (W11 T6 Pack #1) → Updated (W12 T4 Pack #2)
+     Status: Final (W11 T6 Pack #1) -> Updated (W12 T4 Pack #2)
 -->
 
 ## 1. Network Security
@@ -10,16 +10,15 @@
 
 The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications and external model endpoint calls occur privately using AWS VPC Endpoints.
 
-The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The AIOps-owned AI Engine is reachable only through an internal EKS service endpoint; it does not receive direct credentials for member account containment actions.
+The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The AIOps-owned AI Engine is reachable only through an internal ECS service endpoint; it does not receive direct credentials for member account containment actions.
 
 ```mermaid
 graph TD
     subgraph "CDO Management Account VPC (ap-southeast-1)"
-        subgraph "Private Subnets (EKS & Core Logic)"
-            subgraph "EKS Cluster"
-                API_P[ai-engine-api Pods]
-                WRK_P[ai-engine-worker Pods]
-                ESO_P[External Secrets Pods]
+        subgraph "Private Subnets (ECS & Core Logic)"
+            subgraph "ECS Cluster"
+                API_P[AI Engine API Tasks]
+                WRK_P[AI Engine Worker Tasks]
             end
             L_Pull[Ingestion Lambda]
             L_Cont[Containment Lambda]
@@ -44,14 +43,14 @@ graph TD
     L_Cont -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| DDB
     
-    %% EKS traffic
-    ALB -->|HTTPS Port 8443| API_P
+    %% ECS traffic
+    ALB -->|HTTPS Port 443| API_P
     API_P -->|gRPC/REST| WRK_P
-    ESO_P -->|VPC Endpoint HTTPS| VPCE
+    API_P -->|Fetch secrets via VPCE| VPCE
     VPCE -->|Fetch API Key| SM
 ```
 
-*Caption: The EKS cluster, load balancer, and orchestration Lambda functions are deployed within private-only subnets. They utilize dedicated AWS VPC Interface Endpoints (Privatelink) to connect to AWS services, preventing data transmission over the public internet.*
+*Caption: The ECS cluster, load balancer, and orchestration Lambda functions are deployed within private-only subnets. They utilize dedicated AWS VPC Interface Endpoints (Privatelink) to connect to AWS services, preventing data transmission over the public internet.*
 
 ### 1.2 Security Groups
 
@@ -59,11 +58,10 @@ Traffic between compute components is regulated using stateful security groups e
 
 | SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `alb-sg` | TCP 443 (from Step Functions / Lambda Client) | TCP 8443 (to `eks-node-sg`) | internal ALB |
-| `eks-cluster-sg` | TCP 443 (from CI/CD runner and bastion hosts) | TCP 10250, TCP 53 (to Node groups) | EKS Control Plane |
-| `eks-node-sg` | TCP 10250 (from Control Plane), TCP 8443 (from `alb-sg`), TCP/UDP 53 (DNS) | TCP 443 (to `vpce-sg`), TCP 10250, TCP/UDP 53 | EKS managed node groups (On-Demand & Spot) |
+| `alb-sg` | TCP 443 (from Step Functions / Lambda Client) | TCP 80/443 (to `ecs-tasks-sg`) | internal ALB |
+| `ecs-tasks-sg` | TCP 80/443 (from `alb-sg`), TCP/UDP 53 (DNS) | TCP 443 (to `vpce-sg`), TCP/UDP 53 | ECS Fargate tasks (always-on & Spot) |
 | `lambda-sg` | None | TCP 443 (to `vpce-sg`), TCP 443 (to `alb-sg`) | Lambda functions |
-| `vpce-sg` | TCP 443 (from `eks-node-sg` and `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr) |
+| `vpce-sg` | TCP 443 (from `ecs-tasks-sg` and `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr) |
 
 ### 1.3 Network ACL / VPC Endpoint
 
@@ -75,7 +73,7 @@ VPC interface endpoints are configured with private DNS enabled, routing all tra
 - `com.amazonaws.ap-southeast-1.ecr.dkr` (Interface Endpoint)
 - `com.amazonaws.ap-southeast-1.logs` (Interface Endpoint - CloudWatch logs)
 
-Network policies are deployed in the EKS cluster to restrict pod-to-pod communications (e.g., blocking `ai-engine-worker` pods on spot nodes from initiating connections to anything other than the `ai-engine-api` pods).
+Security groups are deployed in the ECS cluster to restrict task-to-task communications (e.g., blocking AI Engine Worker Tasks on Fargate Spot from initiating connections to anything other than the internal ALB or direct service endpoints).
 
 Endpoint policies are scoped to the smallest practical action set. The S3 gateway endpoint allows reads from approved CUR export prefixes and writes only to the CDO raw/curated buckets. The DynamoDB endpoint allows access only to run-state, idempotency, audit, and dashboard-materialization tables. Interface endpoints for Secrets Manager, ECR, and CloudWatch Logs are restricted to the CDO VPC security groups and execution roles. Network ACLs remain simple and stateless, with public ingress denied and ephemeral return traffic allowed only inside private subnet ranges.
 
@@ -89,32 +87,29 @@ AWS IAM service roles enforce strict separation. Crucially, no service role has 
 |---|---|---|
 | `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
 | `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (on target account CUR S3 bucket), `s3:PutObject` (on raw S3 bucket), `ce:GetCostAndUsage` |
-| `EksClusterRole` | EKS Control Plane | Standard `AmazonEKSClusterPolicy` and `AmazonEKSVPCResourceController` |
-| `EksNodeGroupRole` | EC2 Node Instances | `AmazonEKSWorkerNodePolicy`, `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy` |
+| `FinOpsTaskExecutionRole` | ECS Agent | `ecr:GetAuthorizationToken`, `ecr:BatchCheckLayerAvailability`, `ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage`, `secretsmanager:GetSecretValue` (for container secret mapping) |
+| `FinOpsAiApiIamRole` | AI Engine API task role | Read model config, read curated feature inputs, write invocation health metrics; no member account access. |
+| `FinOpsAiWorkerIamRole` | AI Engine Worker task role | Read curated feature inputs and write batch output/checkpoints; no IAM mutation and no direct containment permissions. |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Explicit deny for `iam:*`, `s3:Delete*`, and prod resource termination. |
-| `FinOpsAiApiIamRole` | `ai-engine-api` via IRSA | Read model config, read curated feature inputs, write invocation health metrics; no member account access. |
-| `FinOpsAiWorkerIamRole` | `ai-engine-worker` via IRSA | Read curated feature inputs and write batch output/checkpoints; no IAM mutation and no direct containment permissions. |
-| `FinOpsExternalSecretsRole` | External Secrets Operator | Read only approved Secrets Manager keys needed by EKS workloads. |
 
 > [!IMPORTANT]
 > **Hard Security Boundary**: Every CDO execution role has an attached Service Control Policy (SCP) ensuring it can **NEVER terminate prod, delete data, or modify IAM**. Production containment tasks are strictly restricted to tag, suggest, or dry-run audits.
 
-### 2.2 K8s RBAC & IRSA (IAM Roles for Service Accounts)
+### 2.2 ECS Task Role & ECS Task Execution Role
 
-Kubernetes Access Control is mapped to AWS IAM using **IAM Roles for Service Accounts (IRSA)**. Pods assume specific IAM roles via OIDC federation rather than inheriting permissions from host EC2 instances.
+ECS Fargate tasks utilize two distinct types of IAM roles to enforce the principle of least privilege:
+1. **ECS Task Execution Role** (`FinOpsTaskExecutionRole`): Used by the ECS container agent to authenticate with ECR to pull Docker images and to query Secrets Manager to resolve secret mappings in the task definition.
+2. **ECS Task Role** (`FinOpsAiApiIamRole`, `FinOpsAiWorkerIamRole`): Used by the application code running inside the container to make AWS API calls, such as reading from S3 or writing metrics to CloudWatch, isolating container privileges.
 
-- **K8s Service Accounts & Roles**:
-  - `ai-engine-api-sa`: Federated to `FinOpsAiApiIamRole` with read-only S3 access to fetch model artifacts.
-  - `ai-engine-worker-sa`: Federated to `FinOpsAiWorkerIamRole` with read-write access to S3 checkpoint and output buckets.
-  - `external-secrets-sa`: Federated to `FinOpsSecretsReaderIamRole` with access only to the model configuration secret in Secrets Manager.
+Workloads do not inherit IAM permissions from EC2 hosts. Each service task is explicitly associated with its respective task role in the ECS task definition.
 
-- **RBAC Mapping**:
+- **ECS Task Mappings**:
 
-| Role / ClusterRole | Subject (Service Account) | Namespace | Verbs | Resources |
-|---|---|---|---|---|
-| `ai-api-role` | `ai-engine-api-sa` | `ai-inference` | `get`, `list`, `watch` | `pods`, `services` |
-| `job-runner-role` | `ai-engine-api-sa` | `ai-batch-jobs` | `create`, `get`, `list`, `watch`, `delete` | `jobs`, `cronjobs` |
-| `eso-role` | `external-secrets-sa` | `kube-system` | `get`, `list`, `create`, `update` | `secrets` |
+| Service/Task Name | Task Execution Role | Task Role | Managed Policies / Custom Scoped Policies |
+|---|---|---|---|
+| AI Engine API Tasks | `FinOpsTaskExecutionRole` | `FinOpsAiApiIamRole` | Read-only S3 access (model artifacts), CloudWatch write metrics. |
+| `ai-engine-explainer` | `FinOpsTaskExecutionRole` | `FinOpsAiApiIamRole` | Read-only S3 access, CloudWatch write metrics. |
+| AI Engine Worker Tasks | `FinOpsTaskExecutionRole` | `FinOpsAiWorkerIamRole` | Read-write S3 access (checkpoint & features), SQS read/write. |
 
 ### 2.3 Cross-account Access
 
@@ -131,38 +126,36 @@ The following secrets are stored in AWS Secrets Manager:
 
 | Secret | Storage | Rotation | Accessed by |
 |---|---|---|---|
-| `finops/ai-engine/api-key` | AWS Secrets Manager (KMS CMK encrypted) | 30 days automatic | `ai-engine-api` pod (via External Secrets Operator) |
-| `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | QuickSight dataset engine / Athena crawler |
+| `finops/ai-engine/api-key` | AWS Secrets Manager (KMS CMK encrypted) | 30 days automatic | ECS Task Agent (via native task definition Secrets mapping) |
+| `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | Athena crawler / Future QuickSight dataset engine |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | 90 days manual | `LambdaAlertRouting` |
-| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | 90 days automatic | Step Functions validation Lambda and `ai-engine-api` |
+| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | 90 days automatic | Step Functions validation Lambda and AI Engine API Tasks |
 | `finops/containment/external-id-seed` | AWS Secrets Manager | Manual rotation on incident | Containment role provisioning workflow |
 
 ### 3.2 Inject Pattern
 
-We use the **External Secrets Operator (ESO)** in EKS to sync secrets from AWS Secrets Manager into Kubernetes native Secrets. The secrets are mounted as read-only files within tmpfs volumes in the containers.
-```yaml
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata:
-  name: ai-engine-api-key
-  namespace: ai-inference
-spec:
-  refreshInterval: 1h
-  secretStoreRef:
-    name: aws-secretsmanager-store
-    kind: SecretStore
-  target:
-    name: k8s-ai-api-key
-    creationPolicy: Owner
-  data:
-    - secretKey: api-key
-      remoteRef:
-        key: finops/ai-engine/api-key
-        property: apiKey
+We use native ECS Task Definition Secrets Manager mapping to inject secrets from AWS Secrets Manager into the container environment variables at runtime. The secrets are fetched by the ECS agent using the Task Execution Role during task startup, avoiding plaintext exposures in state files or code.
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "name": "fargate-api-tasks",
+      "image": "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/fargate-api-tasks:latest",
+      "secrets": [
+        {
+          "name": "AI_ENGINE_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:finops/ai-engine/api-key:apiKey::"
+        }
+      ]
+    }
+  ]
+}
 ```
+
 For Lambda functions, secrets are resolved during function cold-starts, cached in the `/tmp` memory directory, and validated with cache TTL policies to avoid direct API invocation overhead.
 
-The injection path intentionally differs by runtime. Lambda functions read secrets directly through the Secrets Manager SDK because they are short-lived adapters. EKS workloads receive secrets through ESO so Kubernetes manifests never contain plaintext values. Terraform creates secret containers and IAM permissions, but it does not store secret values in `.tfvars`, Terraform state, Helm values, or GitOps manifests.
+The injection path intentionally differs by runtime. Lambda functions read secrets directly through the Secrets Manager SDK because they are short-lived adapters. ECS workloads receive secrets through native ECS task definition mappings so deployment files never contain plaintext values. Terraform creates secret containers and IAM permissions, but it does not store secret values in `.tfvars`, Terraform state, or build configurations.
 
 ### 3.3 Anti-leak Controls
 
@@ -170,7 +163,7 @@ The injection path intentionally differs by runtime. Lambda functions read secre
 - **VPC Endpoint Restriction**: Secrets Manager VPC Endpoints enforce policies restricting access to only the CDO management VPC CIDR.
 - **Log Redaction**: Outbound application logs are passed through a regex-based masking filter, replacing API keys, tokens, and authorization headers with `[REDACTED]`.
 - **Terraform State Control**: Terraform state is encrypted, access-controlled, and reviewed so sensitive values are modeled as secret references rather than plaintext outputs.
-- **Container Boundary**: EKS workloads run as non-root, mount secrets read-only, and avoid writing secret material to persistent volumes or checkpoints.
+- **Container Boundary**: ECS workloads run as non-root, mount temporary storage read-only, and avoid writing secret material to persistent volumes or checkpoints.
 - **Incident Response**: Suspected secret exposure triggers secret rotation, Git history review, CloudTrail lookup for `GetSecretValue`, and temporary suspension of affected deployment credentials.
 
 ## 4. Encryption
@@ -184,22 +177,22 @@ All platform data is encrypted at rest using Customer Managed Keys (CMKs) in AWS
 | Raw/Curated Cost Data | S3 | `aws/s3` or custom CMK | S3 Bucket Key enabled to reduce KMS API costs. |
 | Run State & Metadata | DynamoDB | `aws/dynamodb` or custom CMK | Encrypted using KMS. |
 | Secrets Store | Secrets Manager | `finops-secrets-key` | Decryption requires role trust. |
-| Node Disk Volumes | EC2 EBS (EKS Nodes) | `finops-ebs-key` | All node storage volumes are encrypted. |
+| Task Storage | Fargate Ephemeral Storage | `aws/ecs` or custom CMK | All task ephemeral storage is encrypted by default. |
 | Audit Trail Logs | S3 Object Lock | `finops-audit-key` | Retained for 90 days with compliance lock. |
 
 ### 4.2 In Transit
 
 - **TLS Requirements**: All ingress and egress traffic requires TLS 1.3 (with TLS 1.2 as a minimum fallback). Weak ciphers are disabled on the internal ALB.
-- **Internal Service Traffic**: EKS pod-to-pod communications for API-to-worker traffic use HTTP/2 with mTLS via Linkerd/App Mesh (or Kubernetes internal ClusterIP services mapped to TLS endpoints).
+- **Internal Service Traffic**: ECS task-to-task communications for API-to-worker traffic use private App Mesh integration or direct internal DNS routing with TLS encryption.
 - **AI Engine Calls**: Step Functions and Lambda invoke the internal AI Engine endpoint through private networking only. The request includes a contract version and correlation ID, and the response is rejected if the signature, schema, or required fields are invalid.
 - **Alert Webhooks**: Slack or email integrations are called from the alerting Lambda after payload minimization. Sensitive cost evidence is linked through internal dashboard/audit references instead of embedded directly in external messages.
 
 ### 4.3 Key Management
 
 - **Rotation**: CMK keys rotate automatically every 365 days.
-- **Access Policies**: Key policies enforce separation of duties, ensuring only the deployment pipelines can modify key settings, and only execution roles (Lambda/EKS) can call decrypt operations.
+- **Access Policies**: Key policies enforce separation of duties, ensuring only the deployment pipelines can modify key settings, and only execution roles (Lambda/ECS) can call decrypt operations.
 - **Audit**: All key usage is monitored and logged in AWS CloudTrail.
-- **Blast-radius control**: Separate CMKs are preferred for cost data, audit records, secrets, and EKS node volumes unless Finance and Security approve consolidation for cost reasons.
+- **Blast-radius control**: Separate CMKs are preferred for cost data, audit records, secrets, and ECS task storage unless Finance and Security approve consolidation for cost reasons.
 - **Break-glass access**: Manual decrypt access is not granted to day-to-day developers. Temporary access requires incident approval, ticket reference, expiry time, and post-use review.
 
 ## 5. Audit Logging
@@ -251,7 +244,7 @@ Audit logs are stored securely with immutable controls:
 |---|---|---|---|
 | Containment Audits | S3 + Object Lock | 90 days minimum | Athena / DynamoDB |
 | AWS API Calls | CloudTrail (S3 Raw) | 1 year | Athena |
-| EKS Cluster Logs | CloudWatch Logs | 30 days | CloudWatch Logs Insights |
+| ECS Container Logs | CloudWatch Logs | 30 days | CloudWatch Logs Insights |
 | App/Lambda Logs | CloudWatch Logs | 14 days | CloudWatch Logs Insights |
 
 Containment audit storage is append-only by design. DynamoDB supports low-latency dashboard lookup, while S3 with Object Lock is the durable evidence store. The dashboard should link to the audit record ID rather than duplicating sensitive before/after state in alert messages. Retention shorter than 90 days is not allowed for containment records, even in sandbox, because the capstone requirement measures traceability of automated decisions.
@@ -260,16 +253,16 @@ Containment audit storage is append-only by design. DynamoDB supports low-latenc
 
 To prevent mixing synthetic anomaly logs with real account settings during testing:
 - CDO-owned demo injections are marked with `source = "synthetic-demo"`.
-- QuickSight dashboard filters allow toggling between real and synthetic data displays.
+- Dashboard filters (S3 + CloudFront UI) allow toggling between real and synthetic data displays.
 - Synthetic containment actions are routed to a mock target endpoint, leaving real AWS resources untouched.
 - AIOps-owned model training, enhancement, and backtest datasets remain outside CDO ownership. CDO may store AIOps-provided model metrics as integration evidence, but it does not copy or reclassify the AI team's training dataset as CDO operational data.
 
 ## 6. CI Security Controls
 
 - **Image & Dependency Scanning**: Trivy is integrated into the CI/CD pipeline. Build actions fail automatically if container images contain `CRITICAL` or `HIGH` severity CVEs.
-- **Non-Root Execution**: Container configurations enforce running workloads as a non-root user (`securityContext.runAsNonRoot: true`).
-- **Pod Security Standards**: EKS namespaces are configured with Pod Security Admission (PSA) set to `restricted` mode, preventing privileged escalations, host network binding, and unsafe system calls.
-- **Spot Workload Isolation**: Worker pods running batch tasks are scheduled with node selectors, tolerations, and node affinity rules, ensuring they compile and compute exclusively on designated spot node instances, avoiding resource starvation on stable service nodes.
+- **Non-Root Execution**: Container configurations enforce running workloads as a non-root user (e.g., `"user": "1000"` in ECS Task Definition).
+- **Task Security Standards**: ECS Task Definitions enforce host network isolation (`awsvpc` network mode) and restrict execution privileges (`readonlyRootFilesystem: true`, `privileged: false`).
+- **Spot Workload Isolation**: Worker tasks running batch workloads are configured with ECS Fargate Spot capacity providers, ensuring they run exclusively on Spot instances, avoiding resource starvation on stable always-on service tasks.
 
 ## 7. Compliance Touchpoints
 
@@ -290,5 +283,5 @@ The compliance mapping is intentionally limited to capstone-relevant controls. T
 
 ## Related documents
 
-- [`02_infra_design.md`](02_infra_design.md) - Architecture design, VPC layout, and managed node groups.
-- [`04_deployment_design.md`](04_deployment_design.md) - CI/CD pipeline, GitOps orchestration, and secret rotation gates.
+- [`02_infra_design.md`](02_infra_design.md) - Architecture design, VPC layout, and ECS Capacity Providers.
+- [`04_deployment_design.md`](04_deployment_design.md) - CI/CD pipeline, GitHub Actions deployment pipelines, and secret rotation gates.
