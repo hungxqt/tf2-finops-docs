@@ -94,7 +94,7 @@ graph TB
     SQSQueue -.->|Error fallback| SQSDLQ
     AILambdaWorker -->|6. Read/Write features| S3Cur
     AILambdaWorker -->|7. Write results| DDB
-    SF -->|8. Poll GET /v1/detect/result/{id}| APIGW
+    SF -->|"8. Poll GET /v1/detect/result/{id}"| APIGW
     APIGW -->|9. Route status request| AILambdaAPI
     AILambdaAPI -->|10. Query results| DDB
     
@@ -218,7 +218,7 @@ graph TB
     SQS -.->|Failed retries| DLQ
     Worker -->|5. Read/Write Features| CuratedS3
     Worker -->|6. Write inference results| DDB
-    SF -->|7. GET /v1/detect/result/{audit_id}| APIGW
+    SF -->|"7. GET /v1/detect/result/{audit_id}"| APIGW
     APIGW -->|8. Route status request| API
     API -->|9. Query results| DDB
     
