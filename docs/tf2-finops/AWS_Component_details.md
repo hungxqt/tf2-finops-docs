@@ -18,7 +18,7 @@ The scope is the CDO-owned FinOps control plane:
 - Apply only safe containment modes.
 - Preserve audit evidence for review and dashboarding.
 
-This document documents the CDO-owned components, including the Private API Gateway, Lambda container functions, ECR image deployment by digest, Lambda execution roles, and network isolation deployed to host the AI Engine container provided by the AIOps team. It excludes the AIOps-owned AI model internals, logic, weights, and training datasets.
+This document documents the CDO-owned components, including the Lambda container functions, ECR image deployment by digest, SQS queues, DynamoDB stores, Lambda execution roles, and network isolation deployed to host the AI Engine container provided by the AIOps team. It excludes the AIOps-owned AI model internals, logic, weights, and training datasets.
 
 ## Scope Boundary
 
@@ -32,7 +32,7 @@ This document documents the CDO-owned components, including the Private API Gate
 | Alert routing | Yes | CDO owns Finance and Engineering alert routing. |
 | Safe containment | Yes | CDO owns dry-run, tag, suggest, and approved non-prod containment paths. |
 | AI Engine API Contract | Yes | CDO calls, validates, and adheres to the versioned API and telemetry contracts. |
-| AI Engine Hosting Infrastructure | Yes | CDO deploys and operates the Private API Gateway, Lambda container functions, Lambda execution roles, and security configuration. |
+| AI Engine Hosting Infrastructure | Yes | CDO deploys and operates the Lambda container functions, SQS queues, DynamoDB stores, Lambda execution roles, and security configuration. |
 | AI model internals & datasets | No | AIOps owns model logic, training, weights, and backtest datasets. |
 
 ## Component Summary
@@ -49,7 +49,7 @@ This document documents the CDO-owned components, including the Private API Gate
 | 8 | Ingestion Lambda | AWS Lambda | Pulls CUR files and Cost Explorer data. |
 | 9 | State Lambda | AWS Lambda | Checks and updates idempotency and run state. |
 | 10 | Normalization / Validation Lambda | AWS Lambda | Converts raw cost data into contract-ready records. |
-| 11 | AI Contract Client Lambda | AWS Lambda | Calls the external AI Engine contract and fails closed on invalid response. |
+| 11 | AI Engine Request Lambda | AWS Lambda | Validates input payloads and enqueues requests to SQS (representing POST /v1/detect contract semantic). |
 | 12 | Alert Routing Lambda | AWS Lambda | Routes anomaly decisions to the correct notification path. |
 | 13 | Containment Lambda | AWS Lambda | Executes dry-run, tag, suggest, or approved non-prod containment actions. |
 | 14 | Audit Writer Lambda | AWS Lambda | Writes immutable audit records before and after policy actions. |
@@ -64,13 +64,12 @@ This document documents the CDO-owned components, including the Private API Gate
 | 23 | Finance Dashboard | Amazon S3 + CloudFront | Presents static web-based finance-readable views without SQL; assets are secured via OAC (Origin Access Control) and verified by Lambda@Edge. |
 | 24 | Alert Channels | Amazon SNS, Slack API, SES | Sends Finance, Engineering, Platform, and Security notifications. |
 | 25 | CloudWatch Monitoring | CloudWatch Logs, Metrics, Alarms | Observes workflow failures, stale data, and delivery failures. |
-| 26 | AI Engine Lambda Container Functions | AWS Lambda | Runs AI API inference and asynchronous detection tasks using AIOps container images. |
-| 27 | Private API Gateway | Amazon API Gateway | Private REST API Gateway exposing the AI Engine endpoints via VPC interface endpoint. |
-| 28 | ECR Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
-| 29 | AI Engine SQS/DLQ | Amazon SQS | Manages decoupling queues: requests queue, DLQ, and retry. |
-| 30 | AI Engine DynamoDB Stores | Amazon DynamoDB | Persistent state tables for execution results, idempotency, and anomalies. |
-| 31 | Dashboard Auth Gateway | Amazon Cognito | Authenticates dashboard users and provides group-based authorization (readonly Finance vs Engineering operators). |
-| 32 | Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. |
+| 26 | AI Engine Worker Lambda | AWS Lambda | Consumes requests from SQS, runs the model container, and writes results to S3 and DynamoDB. |
+| 27 | ECR Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
+| 28 | AI Engine SQS/DLQ | Amazon SQS | Manages decoupling queues: requests queue, DLQ, and retry. |
+| 29 | AI Engine DynamoDB Stores | Amazon DynamoDB | Persistent state tables for execution results, idempotency, and anomalies. Step Functions polls this store directly for results. |
+| 30 | Dashboard Auth Gateway | Amazon Cognito | Authenticates dashboard users and provides group-based authorization (readonly Finance vs Engineering operators). |
+| 31 | Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. |
 
 ## Excluded Components
 
@@ -351,38 +350,33 @@ It ensures CUR and Cost Explorer data can be queried, sent to the AI decision co
 - Validation errors for missing or malformed fields.
 - Ownership fallback such as `unassigned-resources`.
 
-## 11. AI Contract Client Lambda
+## 11. AI Engine Request Lambda
 
 ### Role
 
-The AI Contract Client Lambda calls the shared Task Force AI Engine endpoint.
+Validates input payloads and enqueues requests to SQS (representing the POST `/v1/detect` contract-level semantic).
 
 ### Purpose
 
-It is the boundary between deterministic CDO control-plane logic and AIOps-owned anomaly detection. CDO validates the request and response and hosts the private hosting platform for the Lambda functions, but does not own or train the AI model itself.
+It serves as the entry point for the AI detection flow. It validates incoming request schemas, checks for idempotency conflicts, and enqueues the request to SQS for asynchronous downstream processing.
 
 ### Input
 
-- Normalized cost window.
+- Normalized cost window payload.
 - Run ID and idempotency key.
 - Account scope.
 - Contract version.
-- AI endpoint secret reference.
-- Contract signing key secret reference.
-- Timeout setting.
-- Required response schema.
+- Secrets reference for payload integrity signing.
+- Downstream SQS Queue URL.
 
 ### Output
 
-- Validated AI decision payload.
-- Model version returned by AIOps.
-- Anomaly ID.
-- Confidence and severity.
-- Expected spend, actual spend, and delta.
-- Explanation and recommended route.
-- Recommended containment mode.
-- Evidence URI.
-- Fail-closed error when the AI endpoint is unavailable or response schema is invalid.
+- Success status (contract-level equivalent of HTTP `202 Accepted`) containing:
+  - `audit_id` (tracking UUID)
+  - `status`: `"processing"`
+  - `retry_after_seconds`: `30`
+- Message successfully enqueued to SQS.
+- Error codes or validation failures (contract-level equivalents of HTTP `400 Bad Request` or `409 Conflict`) if idempotency check or payload validation fails.
 
 ## 12. Alert Routing Lambda
 
@@ -780,51 +774,31 @@ It provides operational detection for failed workflows, stale dashboard data, La
 - Operator alerts.
 - Evidence that the platform ran, failed, retried, or recovered.
 
-## 26. AI Engine Lambda Container Functions
+## 26. AI Engine Worker Lambda
 
 ### Role
 
-Runs the containerized AI Engine workloads (inference and asynchronous detection execution).
+Consumes requests from SQS, runs the AI model container, and writes results to S3 and DynamoDB.
 
 ### Purpose
 
-Executes model inference and analysis inside a Lambda function initialized from an AIOps-provided container image, utilizing reserved concurrency as a guardrail.
+Executes model inference and anomaly analysis inside a Lambda function initialized from an AIOps-provided container image. It is triggered by SQS messages and utilizes reserved concurrency to control blast radius and throttle limits.
 
 ### Input
 
-- Immutable ECR image digest.
+- SQS messages containing detection targets.
+- Pinned ECR image digest.
+- Downstream DynamoDB tables and S3 bucket ARNs.
 - Lambda execution role ARN.
-- Environment variables containing DB tables, queues, and configuration.
-- SQS messages or direct invocation payloads.
 - Reserved concurrency configuration.
 
 ### Output
 
-- Executed container tasks.
-- Detection results written to DynamoDB and logs sent to CloudWatch/X-Ray.
+- Anomaly detection results and explanations written directly to the AI Engine DynamoDB store.
+- Detailed execution reasoning evidence written to the S3 bucket.
+- Execution traces sent to X-Ray and logs sent to CloudWatch.
 
-## 27. Private API Gateway
-
-### Role
-
-Exposes the AI Engine service privately inside the VPC.
-
-### Purpose
-
-Exposes endpoints `/v1/detect` and `/v1/detect/result/{audit_id}` with IAM SigV4 authentication. Forwards `/v1/detect` requests to SQS/API Lambda, returning a `202 Accepted` immediately, and serves execution results from DynamoDB via GET requests.
-
-### Input
-
-- API Gateway REST API configurations.
-- Resource policy restricting access to specific VPC interface endpoints.
-- Target integrations (API Lambda, DynamoDB, or SQS direct integration).
-
-### Output
-
-- Private REST endpoints accessible only via VPC endpoint.
-- Signed request validation and payload routing.
-
-## 28. ECR Repository
+## 27. ECR Repository
 
 ### Role
 
@@ -843,7 +817,7 @@ Acts as the single registry for deployment. Images are pinned by SHA256 digest i
 
 - Pinned image URI (`.dkr.ecr.ap-southeast-1.amazonaws.com/ai-engine@sha256:...`) pulled by AWS Lambda.
 
-## 29. AI Engine SQS/DLQ
+## 28. AI Engine SQS/DLQ
 
 ### Role
 
@@ -851,7 +825,7 @@ Queue-based asynchronous decoupling between CDO caller and AI Engine worker.
 
 ### Purpose
 
-Handles incoming detect requests as SQS messages to allow API Gateway to respond quickly (`202 Accepted`) and allows worker Lambda to consume messages at a controlled rate, routing poison messages to DLQ after 3 retries.
+Handles incoming detection requests as SQS messages to allow the Request Lambda to return a success status quickly, and allows the Worker Lambda to consume messages at a controlled rate, routing poison messages to the DLQ after 3 retries.
 
 ### Input
 
@@ -860,10 +834,10 @@ Handles incoming detect requests as SQS messages to allow API Gateway to respond
 
 ### Output
 
-- Queue triggers for AI Engine worker Lambda.
+- Queue triggers for the AI Engine Worker Lambda.
 - DLQ alerts on message delivery failures.
 
-## 30. AI Engine DynamoDB Stores
+## 29. AI Engine DynamoDB Stores
 
 ### Role
 
@@ -875,13 +849,13 @@ Stores the run locks, idempotency records, anomaly detection outputs, and contai
 
 ### Input
 
-- Writes from AI Engine Lambda Container Functions, CDO platform Lambdas.
+- Writes from the AI Engine Worker Lambda, CDO platform Lambdas.
 
 ### Output
 
-- Low-latency lookups for Step Functions polling and the S3 + CloudFront dashboard.
+- Low-latency status and result records polled directly by Step Functions and retrieved by the S3 + CloudFront dashboard.
 
-## 31. Amazon Cognito
+## 30. Amazon Cognito
 
 ### Role
 
@@ -899,7 +873,7 @@ Authenticates dashboard users via secure Cognito Hosted UI (Authorization Code F
 
 - ID, Access, and Refresh JWT tokens containing group claims, stored as secure cookies.
 
-## 32. Lambda@Edge Viewer Request Auth
+## 31. Lambda@Edge Viewer Request Auth
 
 ### Role
 
@@ -932,11 +906,11 @@ Intercepts dashboard requests at the CloudFront viewer request event, parses JWT
 
 | Field | Detail |
 | --- | --- |
-| Responsible CDO components | Step Functions, AI Contract Client Lambda, DynamoDB, S3 audit trail, Private API Gateway |
+| Responsible CDO components | Step Functions, AI Engine Request Lambda, AI Engine Worker Lambda, DynamoDB, S3 audit trail, SQS |
 | Excluded components | AI Engine model weights, AI training jobs, model training datasets, and AI model internal logic |
 | Input | Normalized cost window, run ID, account scope, contract version, evidence window |
 | Output | Model version, anomaly ID, confidence, severity, expected spend, actual spend, delta, explanation, recommended route, recommended containment mode, evidence URI |
-| Failure behavior | Fail closed, block containment, alert operators, and write failed contract state |
+| Failure behavior | Fail closed, block containment, alert operators, and write failed contract state in DynamoDB |
 
 ### Alert And Containment Contract
 
@@ -965,7 +939,7 @@ Intercepts dashboard requests at the CloudFront viewer request event, parses JWT
 | `1.1 High-Level Architecture Overview` | Orchestrator, lakehouse, alerting/containment engine, dashboard/channels |
 | `1.2 Ingestion & Data Lakehouse Workflow` | CUR, Cost Explorer, Scheduler, Step Functions, Ingestion Lambda, S3 Raw, S3 Curated, Glue, Athena |
 | `1.4 Alerting & Containment Engine` | Alert Lambda, Containment Lambda, State Lambda, DynamoDB state/audit, member resources, Slack, SES, S3 + CloudFront dashboard |
-| `2. Component table` | EventBridge Scheduler, Step Functions, Lambda, S3, Glue, Athena, DynamoDB, Secrets Manager, S3 + CloudFront dashboard, SNS/Slack, Containment Worker, Private API Gateway, Lambda container functions, ECR, SQS |
+| `2. Component table` | EventBridge Scheduler, Step Functions, Lambda, S3, Glue, Athena, DynamoDB, Secrets Manager, S3 + CloudFront dashboard, SNS/Slack, Containment Worker, Lambda container functions, ECR, SQS |
 | `4. Multi-account approach` | Member accounts, cross-account CUR puller role, cross-account containment role, account onboarding, idempotency |
 | `6. Scaling strategy` | Athena partitioning, DynamoDB on-demand scaling, Lambda reserved concurrency scaling |
-| `7. Failure modes + recovery` | CUR delay, Cost Explorer throttling, workflow failure, duplicate run, stale dashboard, alert delivery failure, containment denial, AI contract mismatch, Lambda cold starts and API Gateway timeouts |
+| `7. Failure modes + recovery` | CUR delay, Cost Explorer throttling, workflow failure, duplicate run, stale dashboard, alert delivery failure, containment denial, AI contract mismatch, Lambda cold starts and async processing |

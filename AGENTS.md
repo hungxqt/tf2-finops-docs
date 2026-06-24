@@ -55,9 +55,8 @@ Use these defaults unless the user provides different decisions:
 - Data sources: AWS Data Exports/CUR 2.0 or CUR in S3 plus Cost Explorer API.
 - Data lake: S3 raw and curated zones, Glue Data Catalog, Athena views, and governed prefixes for cost, ownership, anomaly, alert, containment, and audit datasets.
 - Orchestration: EventBridge Scheduler triggers Step Functions Standard workflows.
-- Compute: Lambda for short CDO adapters and policy workers; Lambda container images for hosting the AI Engine inference and API runtime.
-- AI integration: CDO hosts the AIOps-provided AI Engine on Lambda container images; CDO owns the hosting platform, Private API Gateway, ECR image deployment by digest, Lambda execution roles, reserved concurrency, SQS/DLQ async flow, DynamoDB result/idempotency stores, CloudWatch/X-Ray monitoring, and platform SLOs; AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics.
-- AI Engine runtime: Lambda container image in `ap-southeast-1` accessed privately via Private REST API Gateway, private VPC integration, ECR for container images, Lambda execution roles, Secrets Manager integration.
+- AI integration: CDO hosts the AIOps-provided AI Engine on Lambda container images; CDO owns the hosting platform, ECR image deployment by digest, Lambda execution roles, reserved concurrency, SQS/DLQ async flow, DynamoDB result/idempotency stores, CloudWatch/X-Ray monitoring, and platform SLOs; AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics.
+- AI Engine runtime: Lambda container image in `ap-southeast-1`, private VPC integration, ECR for container images, Lambda execution roles, Secrets Manager integration. Direct Lambda and SQS invocation is used for the default scheduled batch workflow (Step Functions -> AI Engine Request Lambda -> SQS -> AI Engine Worker Lambda -> DynamoDB/S3 results -> Step Functions result check).
 - Lambda concurrency guardrails: Lambda reserved concurrency (e.g., 5-10 concurrent executions baseline) to control blast radius and throttle limits, with Provisioned Concurrency only as a production optimization if cold-start latency demands it.
 - Async execution queue: SQS queues (and DLQ) for asynchronous processing, allowing `/v1/detect` to return `202 Accepted` quickly while a background Lambda function processes the CUR data and writes results to DynamoDB/S3.
 - Database: DynamoDB for tracking execution state, idempotency locks, run results, and audit trails.
@@ -71,9 +70,9 @@ Use these defaults unless the user provides different decisions:
 
 Use this boundary in every generated document:
 
-- CDO owns cost data ingestion, normalized cost windows, ownership/tag metadata, scheduling, idempotency, workflow state, dashboard views, alert routing, containment guardrails, audit logs, platform operational SLOs, and the Lambda container hosting platform for the AI Engine (Private API Gateway, Lambda functions, execution roles, reserved concurrency, ECR digest deployment, networking, and platform SLOs).
+- CDO owns cost data ingestion, normalized cost windows, ownership/tag metadata, scheduling, idempotency, workflow state, dashboard views, alert routing, containment guardrails, audit logs, platform operational SLOs, and the Lambda container hosting platform for the AI Engine (Lambda functions, execution roles, reserved concurrency, ECR digest deployment, networking, and platform SLOs).
 - AIOps owns anomaly detection logic, model selection, model training/retraining design, model versioning, confidence scoring, anomaly classification, explanation text, AI Engine code and model internals, and AI backtest metrics. AIOps provides versioned container artifacts (Lambda-compatible ECR container images, weights, configs); CDO deploys and operates them on AWS Lambda.
-- CDO hosts the AI Engine on AWS Lambda container images and exposes it through a Private API Gateway endpoint. CDO consumes the AI Engine through a versioned contract. CDO must document request/response fields, authentication, timeout, retry, circuit-breaker, unavailable-AI fallback, evidence storage, and the Lambda container operations runbook.
+- CDO hosts the AI Engine on AWS Lambda container images. CDO consumes the AI Engine through a versioned contract. For the default scheduled batch workflow, the interface is implemented via direct Lambda/SQS integrations, while /v1/detect and /v1/detect/result/{audit_id} represent the contract's logical operation semantics. CDO must document request/response fields, authentication, timeout, retry, circuit-breaker, unavailable-AI fallback, evidence storage, and the Lambda container operations runbook.
 - CDO must not claim responsibility for AI precision/recall internals. It may report AI metrics only as AIOps-provided integration evidence.
 - If AI Engine is unavailable, CDO must fail closed for containment: no automatic apply action, alert operators, preserve the failed run, and write an audit record.
 
@@ -143,7 +142,7 @@ Required sections:
 
 Required sections:
 
-- `## 1. Architecture diagram` — Mermaid diagram showing AWS Data Exports/CUR S3 bucket, Cost Explorer API, S3 raw/curated zones, Glue/Athena, EventBridge Scheduler, Step Functions, Lambda, DynamoDB, Private API Gateway, Lambda container functions, SQS/DLQ, ECR, dashboard, alerting, and containment workers. Include a caption explaining the flow.
+- `## 1. Architecture diagram` — Mermaid diagram showing AWS Data Exports/CUR S3 bucket, Cost Explorer API, S3 raw/curated zones, Glue/Athena, EventBridge Scheduler, Step Functions, Lambda functions (AI Engine Request Lambda, AI Engine Worker Lambda), SQS/DLQ, DynamoDB, ECR, dashboard, alerting, and containment workers. Include a caption explaining the flow.
 - `## 2. Component table` — Table with columns: Component, AWS Service, Reason, Cost note. One row per service.
 - `## 3. Differentiation angle deep-dive`
   - `### 3.1 Why this angle?` — Why lakehouse-centric FinOps control plane with serverless orchestration.
@@ -170,11 +169,11 @@ Required sections:
 Required sections:
 
 - `## 1. Network Security`
-  - `### 1.1 Network Diagram` — Mermaid diagram showing VPC layout, Lambda subnets, security groups, VPC endpoints, and Lambda/API Gateway private networking.
+  - `### 1.1 Network Diagram` — Mermaid diagram showing VPC layout, Lambda subnets, security groups, VPC endpoints, and private networking.
   - `### 1.2 Security Groups` — Table with columns: SG name, Inbound, Outbound, Attached to.
   - `### 1.3 Network ACL / VPC Endpoint` — List VPC endpoints (S3, Secrets Manager, etc.) for private traffic.
 - `## 2. IAM & Access Control`
-  - `### 2.1 Service Roles` — Table with columns: Role, Used by, Permissions (least-privilege). Include Lambda execution roles and Private API Gateway execution roles. Explicitly state: NEVER terminate prod, delete data, or modify IAM.
+  - `### 2.1 Service Roles` — Table with columns: Role, Used by, Permissions (least-privilege). Include Lambda execution roles. Explicitly state: NEVER terminate prod, delete data, or modify IAM.
   - `### 2.2 Containment Permissions` — Environment-aware permissions: prod is tag/suggest/dry-run only; dev/sandbox may allow schedule shutdown or quota cap when approved by policy.
   - `### 2.3 Cross-account Access` — Read-only cost access roles, tightly scoped containment roles, AI Engine API authentication.
 - `## 3. Secrets Management`
@@ -203,7 +202,7 @@ Required sections:
 Required sections:
 
 - `## 1. IaC strategy`
-  - `### 1.1 Tool choice` — Terraform for AWS infrastructure including Lambda container functions and Private API Gateway; state backend; modular structure.
+  - `### 1.1 Tool choice` — Terraform for AWS infrastructure including Lambda container functions; state backend; modular structure.
   - `### 1.2 Module structure` — Directory tree showing IaC modules for the CDO platform.
   - `### 1.3 State management` — Remote state per environment, state lock, plan-on-PR + apply-on-merge gate.
 - `## 2. CI/CD pipeline`
@@ -214,7 +213,7 @@ Required sections:
   - `### 3.2 Destructive-change review` — How destructive IaC changes are flagged and approved.
   - `### 3.3 AI contract compatibility` — AI Engine dependency handling, contract version check, AIOps ECR container image compatibility gate, Lambda function configuration and environment validation.
 - `## 4. Deployment strategy`
-  - `### 4.1 Strategy` — Canary stage deployment for Private API Gateway, Lambda version publishing and alias routing/rollback, and reserved concurrency limits.
+  - `### 4.1 Strategy` — Lambda version publishing and alias routing/rollback, and reserved concurrency limits.
   - `### 4.2 Rollback method` — Primary and secondary rollback, target RTO.
 - `## 5. Environment separation` — Table with columns: Env, Purpose, Account, Auto-deploy. Sandbox, staging, prod.
 - `## 6. Secrets in pipeline` — OIDC + IAM assume-role, secret scanning on PR, block merge on secret detected.
@@ -231,7 +230,7 @@ Required sections:
 
 Required sections:
 
-- `## 1. Cost model per cadence run (forecast)` — Table with columns: Component, Unit cost, Usage per run, $/run. Rows for Lambda container duration/invocations, Private API Gateway requests, SQS/DLQ, Step Functions, S3, Glue/Athena, DynamoDB, ECR, load balancer (if any), dashboard, CloudWatch logs/X-Ray, alerting, NAT/VPC endpoints. Separate CDO platform costs from AI Engine hosting costs. Mark unmeasured numbers with `Evidence needed: ...`.
+- `## 1. Cost model per cadence run (forecast)` — Table with columns: Component, Unit cost, Usage per run, $/run. Rows for Lambda container duration/invocations, SQS/DLQ, Step Functions, S3, Glue/Athena, DynamoDB, ECR, dashboard, CloudWatch logs/X-Ray, alerting, NAT/VPC endpoints. Separate CDO platform costs from AI Engine hosting costs. Mark unmeasured numbers with `Evidence needed: ...`.
 - `## 2. Cost at scale` — Table comparing monthly cost at different tenant/account counts. Show economies of scale.
 - `## 3. Cost optimization applied` — Checklist of cost optimizations: S3 lifecycle tiering, DynamoDB on-demand vs provisioned, log retention tiering, VPC endpoints to avoid NAT, Athena query limits.
 - `## 4. Cadence cost comparison` — Table comparing 12h, 24h, and 48h cadence costs and operational trade-offs. Defend the chosen 24h cadence.
@@ -290,7 +289,7 @@ Required sections:
   - `### 4.4 Lambda container image pull and cold-start tests` — Verify cold-start latency mitigation and container initialization times.
   - `### 4.5 Lambda reserved concurrency and throttling tests` — Verify reserved concurrency constraints and invocation behavior.
   - `### 4.6 API availability tests` — Verify AI Engine internal endpoint availability and health checks.
-  - `### 4.7 SQS/DLQ retry and API Gateway private endpoint tests` — Verify async invocation reliability, retry limits, and dead-letter queue behavior.
+  - `### 4.7 SQS/DLQ retry tests` — Verify async invocation reliability, retry limits, and dead-letter queue behavior.
 - `## 5. Alert and containment tests`
   - `### 5.1 Alert routing` — Finance vs Engineering channel routing validation.
   - `### 5.2 Containment dry-run` — Verify dry-run mode for all containment paths.
@@ -430,7 +429,7 @@ Before considering the document pack complete, verify:
 - `template-docs/` was not overwritten.
 - The English docs mention `lakehouse-centric`.
 - The English docs mention `AIOps-owned AI Engine`.
-- The English docs mention `Lambda container image` and `Private API Gateway`.
+- The English docs mention `Lambda container image`.
 - The English docs mention `ECR image digest pinning` and `reserved concurrency`.
 - The English docs mention async queues and SQS.
 - The English docs mention `EventBridge Scheduler`.
@@ -467,5 +466,5 @@ Get-ChildItem docs/tf2-finops/*_vi.md | Select-Object Name
 Run this targeted constraint check:
 
 ```powershell
-rg -n "lakehouse-centric|AIOps-owned AI Engine|Lambda container image|Private API Gateway|reserved concurrency|SQS|EventBridge Scheduler|CUR|Athena|dry-run|90 days|NEVER terminate prod|delete data|modify IAM" AGENTS.md docs/tf2-finops
+rg -n "lakehouse-centric|AIOps-owned AI Engine|Lambda container image|reserved concurrency|SQS|EventBridge Scheduler|CUR|Athena|dry-run|90 days|NEVER terminate prod|delete data|modify IAM" AGENTS.md docs/tf2-finops
 ```

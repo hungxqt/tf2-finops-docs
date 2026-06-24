@@ -192,7 +192,7 @@
 
 ## ADR-011 - Private REST API Gateway over internal ALB
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-012
 - **Date**: 2026-06-24
 - **Context**: The AI Engine API must be accessed securely and privately by multiple CDO platforms within the private network. The previous decision used an internal ALB (ADR-009). However, migrating to AWS Lambda container hosting makes REST API Gateway with Lambda integrations a more natural and secure choice for private API exposure.
 - **Decision**: Expose the shared AI Engine endpoints using a Private REST API Gateway with IAM SigV4 authentication and Lambda proxy/container integrations. Multi-tenant isolation is maintained using the `X-Tenant-Id` request header to partition data and requests.
@@ -208,3 +208,22 @@
 - **Alternatives considered**:
   - Internal ALB routing: Rejected because API Gateway provides superior endpoint management, rate limiting, and native Lambda proxy integration for serverless runtimes.
   - Public HTTP Endpoint with API Gateway: Rejected because IAM SigV4-based authentication over private endpoints ensures traffic never traverses the public internet, satisfying security NFRs.
+
+---
+
+## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway
+
+- **Status**: Accepted
+- **Date**: 2026-06-24
+- **Context**: The current CDO flow is a scheduled batch workflow driven by EventBridge Scheduler and Step Functions. The AI API contract requires /v1/detect and /v1/detect/result/{audit_id} behavior, but the architecture does not need a separate Private REST API Gateway when Step Functions is the only orchestrating caller.
+- **Decision**: Private REST API Gateway is not required for the default CDO scheduled workflow. The default path should use direct AWS service integration through Lambda and SQS: Step Functions -> AI Engine Request Lambda -> SQS -> AI Engine Worker Lambda -> DynamoDB/S3 results -> Step Functions result check. Private API Gateway becomes an optional future/shared-client pattern, not the baseline architecture.
+- **Consequence**:
+  - Pro: Removes unnecessary API Gateway, VPC endpoint, stage deployment, usage plan, and resource policy complexity.
+  - Pro: Keeps the workflow fully serverless and easier to operate for the 24h batch cadence.
+  - Pro: Preserves the AIOps Docker image boundary through Lambda container image deployment.
+  - Trade-off: No reusable HTTP /v1/* endpoint exists by default for other internal clients.
+  - Trade-off: API-style throttling, request validation, and stage controls must be implemented through Lambda, SQS, IAM, and contract tests.
+- **Alternatives considered**:
+  - Keep Private REST API Gateway: rejected for the default path because it adds infrastructure without clear value when Step Functions is the only caller.
+  - Public API Gateway: rejected because the AI Engine must remain private and internal.
+  - Internal ALB: rejected because it is heavier than needed for Lambda container hosting and scheduled batch invocation.

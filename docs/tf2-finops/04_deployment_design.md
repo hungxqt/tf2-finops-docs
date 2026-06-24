@@ -13,10 +13,10 @@
 ### 1.1 Tool choice
 
 The CDO platform uses a dual-layer deployment strategy to separate infrastructure provisioning from application workload deployments.
-1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, API Gateway, Lambda functions, ECR, DynamoDB, S3, IAM roles).
-2. **Workload Layer (Lambda Container Functions & API Gateway)**: Deployed using **Terraform Lambda configuration** and **GitHub Actions (CI/CD) deployment pipelines** by pinning ECR container image digests.
+1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, Lambda functions, ECR, DynamoDB, S3, IAM roles).
+2. **Workload Layer (Lambda Container Functions)**: Deployed using **Terraform Lambda configuration** and **GitHub Actions (CI/CD) deployment pipelines** by pinning ECR container image digests.
 
-Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda execution roles, ECR repositories, Private REST API Gateway resources, DynamoDB tables, and secrets plumbing. CDO owns the serverless hosting infrastructure deployment (VPC, subnets, API Gateway configuration, reserved concurrency settings, security groups, Lambda execution roles, SQS/DLQ queues, and DynamoDB state stores), while AIOps owns the container image builds, contract management, and model logic. Runtime Lambda desired state is managed through Terraform and GitHub Actions (CI/CD) deployment pipelines, so application image versions can move independently from infrastructure modules while still depending on Terraform outputs.
+Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda execution roles, ECR repositories, DynamoDB tables, and secrets plumbing. CDO owns the serverless hosting infrastructure deployment (VPC, subnets, reserved concurrency settings, security groups, Lambda execution roles, SQS/DLQ queues, and DynamoDB state stores), while AIOps owns the container image builds, contract management, and model logic. Runtime Lambda desired state is managed through Terraform and GitHub Actions (CI/CD) deployment pipelines, so application image versions can move independently from infrastructure modules while still depending on Terraform outputs.
 
 ### 1.2 Module structure
 
@@ -25,7 +25,6 @@ The repository is organized to separate infrastructure modules from environmenta
 ├── iac/
 │   ├── modules/
 │   │   ├── vpc/                  # Private VPC, subnets, NAT gateways, VPC endpoints
-│   │   ├── api-gateway/          # Private REST API Gateway and stage configurations
 │   │   ├── s3-lakehouse/         # Raw and curated S3 buckets, lifecycle policies
 │   │   ├── glue-catalog/         # Glue databases and tables
 │   │   ├── step-functions/       # Step Functions workflow definitions
@@ -60,7 +59,7 @@ The pipeline manages infrastructure and platform changes for:
 * Lambda functions for ingestion, state handling, alert routing, and containment.
 * S3 raw/curated zones, Glue Data Catalog, Athena query resources.
 * DynamoDB run state and audit tables.
-* Private API Gateway, API/Worker Lambda container functions, ECR, SQS queues, and Lambda execution roles.
+* AI Engine Request/Worker Lambda container functions, ECR, SQS queues, and Lambda execution roles.
 * Cognito User Pool, User Groups, and App Client configurations.
 * S3 dashboard static hosting bucket, CloudFront distribution, Origin Access Control (OAC), and Lambda@Edge viewer-request auth functions.
 * IAM roles and environment-specific configuration required by the CDO platform.
@@ -109,8 +108,8 @@ After merge, the deployment stage provisions or updates the infrastructure using
 | Plan            | Terraform modules                              | Preview AWS infrastructure changes before apply.                               |
 | Apply           | AWS infrastructure                             | Provision or update CDO platform components.                                   |
 | Build image     | ECR                                            | Store versioned container images for Lambda workloads.                         |
-| Deploy workload | Lambda (API/Worker)                            | Deploy Lambda container functions by publishing versions and updating aliases. |
-| Smoke test      | Step Functions, Lambda, API Gateway, DynamoDB | Verify the FinOps workflow after deployment.                                   |
+| Deploy workload | Lambda (Request/Worker)                        | Deploy Lambda container functions by publishing versions and updating aliases. |
+| Smoke test      | Step Functions, Lambda, DynamoDB               | Verify the FinOps workflow after deployment.                                   |
 
 The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 
@@ -119,14 +118,14 @@ The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 2. Run the ingestion Lambda against synthetic CUR/Cost Explorer data.
 3. Confirm raw and curated data are written to S3.
 4. Confirm Glue/Athena can query the curated cost dataset.
-5. Invoke the AI Engine /v1/detect endpoint through the Private REST API Gateway using IAM SigV4 authentication.
-6. Poll /v1/detect/result/{audit_id} via Private API Gateway until execution completes.
+5. Invoke the AI Engine Request Lambda function directly using IAM authorization.
+6. Poll the run state and results in DynamoDB/S3 until the async execution completes.
 7. Confirm alert routing produces Finance/Engineering payloads.
 8. Confirm containment stays in dry-run mode unless the target is dev/sandbox.
 9. Confirm run state and audit records are written to DynamoDB.
 ```
 
-A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, Lambda functions and API Gateway endpoints become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
+A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, Lambda functions become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
 
 ### 2.2 Branch strategy
 
@@ -147,13 +146,13 @@ The security gate also checks Terraform plans, Lambda deployment configurations,
 
 Any Terraform plan that modifies resource indexes or indicates resource deletion (e.g., S3 bucket recreation or IAM role changes) is flagged in the PR summary. These changes require explicit manual verification and dual approvals from both the CDO and Security Leads.
 
-The destructive-change gate is stricter for stateful resources. S3 buckets, DynamoDB tables, KMS keys, Private API Gateways, Lambda functions, IAM roles, and audit storage require reviewer acknowledgement when replacement or deletion appears in the plan. Production plans must fail if they attempt to terminate prod resources, delete data, or modify IAM outside the approved module set.
+The destructive-change gate is stricter for stateful resources. S3 buckets, DynamoDB tables, KMS keys, Lambda functions, IAM roles, and audit storage require reviewer acknowledgement when replacement or deletion appears in the plan. Production plans must fail if they attempt to terminate prod resources, delete data, or modify IAM outside the approved module set.
 
 ### 3.3 AI contract compatibility
 
 Before Lambda container image updates are allowed, a pre-deployment script runs validation checks:
 1. Compares the AIOps model version registry against the target ECR image manifest.
-2. Performs JSON schema validation on the AI Engine `/v1/detect` request/response API contracts.
+2. Performs JSON schema validation on the AI Engine's logical `/v1/detect` request/response contracts for direct Lambda invocation.
 3. If schemas mismatch, the build fails before updating the Lambda function configuration, ensuring deployment compatibility.
 
 The compatibility check does not evaluate model quality or inspect AIOps training data. It verifies only the operational contract CDO depends on: endpoint health, request schema, response schema, required fields, model version field, timeout behavior, and failure modes. If the AI Engine is unavailable or incompatible, CDO deployment can proceed only for infrastructure changes that do not enable containment apply paths.
@@ -170,17 +169,18 @@ To ensure secure software delivery and prevent tampering in compliance with the 
 
 ### 4.1 Strategy
 
-- **AI Engine Lambda Workloads**: Deployed using **Lambda Weighted Aliases** and **API Gateway Stage Deployment**. Traffic shifts gradually: a `10%` canary window for 5 minutes, transitioning to `100%` if no execution errors occur.
+- **AI Engine Lambda Workloads**: Deployed using **Lambda Weighted Aliases** by publishing Lambda versions and pinning ECR digests. Traffic shifts gradually: a `10%` canary window for 5 minutes, transitioning to `100%` if no execution errors occur.
 - **Async SQS Lambda Workers**: Deployed using Lambda versions. Updates to worker configurations affect new SQS message pollers immediately.
-- **Lambda Reserved Concurrency**: Configured with a default reserved concurrency limit to act as a rate-limiting and cost guardrail, avoiding execution spikes.
-- **Lambda Timeout & Execution Retry Handling**: The API and Worker Lambda functions are built with automatic retry handling. SQS acts as a buffer; if a Lambda execution is interrupted (e.g., container recycling or platform issue), the message is returned to the queue for a retry, up to a maximum limit, before being routed to the Dead Letter Queue (DLQ).
+- **Lambda Reserved Concurrency**: Configured with a default reserved concurrency limit (e.g., 5-10 concurrent executions baseline) to act as a rate-limiting and cost guardrail, avoiding execution spikes and throttling limits.
+- **SQS Concurrency Controls**: Configured on the event source mapping using maximum concurrency settings and batch size constraints to align message processing with AI Engine capacity and prevent database connection exhaustion.
+- **Lambda Timeout & Execution Retry Handling**: The Request and Worker Lambda functions are built with automatic retry handling. SQS acts as a buffer; if a Lambda execution is interrupted (e.g., container recycling or platform issue), the message is returned to the queue for a retry, up to a maximum limit, before being routed to the Dead Letter Queue (DLQ).
 
 ### 4.2 Rollback method
 
 - **Primary Rollback**: Reverting a Git commit to the previous stable release SHA triggers an automatic GitHub Actions deployment pipeline run to redeploy the previous stable container digest and configuration to the Lambda function.
 - **Secondary Rollback**: If the Step Functions workflow or smoke tests catch execution errors, a rollback script shifts the Lambda alias weight back to the previous stable version immediately (RTO < 5 seconds).
-- **Infrastructure Rollback**: Terraform rollback is plan-reviewed rather than automatic. State-bearing resources are preserved, `prevent_destroy` remains enabled where supported, and any API Gateway/Lambda infrastructure rollback must account for VPC settings and SQS configuration.
-- **Runbook Trigger**: Rollback is triggered by failed smoke tests, AI contract validation failure, elevated Step Functions or API Gateway error rates, Lambda cold-start failures/timeouts, or stale dashboard data after deployment.
+- **Infrastructure Rollback**: Terraform rollback is plan-reviewed rather than automatic. State-bearing resources are preserved, `prevent_destroy` remains enabled where supported, and any Lambda infrastructure rollback must account for VPC settings and SQS configuration.
+- **Runbook Trigger**: Rollback is triggered by failed smoke tests, AI contract validation failure, elevated Step Functions or Lambda execution error rates, Lambda cold-start failures/timeouts, or stale dashboard data after deployment.
 
 ### 4.3 Budget Guardrails & SLO Circuit Breakers (Error Budget Lock)
 
@@ -198,7 +198,7 @@ We enforce isolation across three AWS accounts:
 | Env | Purpose | Account | Auto-deploy |
 |---|---|---|---|
 | **Sandbox** | Fast iteration, integration smoke tests, and non-prod containment examples. | `1111-2222-3333` | True, from `develop` after checks pass |
-| **Staging** | Validation of AIOps container artifacts, Private API Gateway routing, and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True, from `main` after reviewed merge |
+| **Staging** | Validation of AIOps container artifacts, direct Lambda invocation, and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True, from `main` after reviewed merge |
 | **Prod** | Production control plane. Monitors approved company accounts. Auto-containment is strictly tag/suggest/dry-run. | `7777-8888-9999` | False, requires GitHub environment approval |
 
 Environment-specific values live only in `environments/*`. Sandbox may enable limited non-prod apply-mode examples; staging validates dry-run and integration behavior; prod must keep containment apply disabled by default.
@@ -219,7 +219,7 @@ The Step Functions state machine and EventBridge Scheduler are deployed using Te
 ```
 1. Deploy updated Step Functions JSON definition via Terraform.
 2. Temporarily disable the EventBridge Scheduler rule to prevent triggering midway.
-3. Execute smoke-test run to verify API endpoint connectivity and Glue tables.
+3. Execute smoke-test run to verify Lambda connectivity and Glue tables.
 4. Enable the EventBridge Scheduler rule targeting the new state machine version.
 5. Record pipeline transition and execution time in the DynamoDB deployment log.
 ```
@@ -232,12 +232,12 @@ The platform's operational health is monitored using a centralized observability
 
 | Component | Tool | Purpose |
 |---|---|---|
-| **Log Aggregator** | CloudWatch Logs | Centralizes application, Lambda container, and API Gateway execution logs. |
-| **Trace Analyzer** | AWS X-Ray | Traces requests from Step Functions, through API Gateway and API Lambda, to SQS and Worker Lambda execution. |
-| **Metrics Collector** | CloudWatch Metrics / X-Ray | Tracks Lambda execution duration, cold starts, concurrency, SQS queue age, and API Gateway latency. |
+| **Log Aggregator** | CloudWatch Logs | Centralizes application and Lambda container execution logs. |
+| **Trace Analyzer** | AWS X-Ray | Traces requests from Step Functions, through Request Lambda, to SQS and Worker Lambda execution. |
+| **Metrics Collector** | CloudWatch Metrics / X-Ray | Tracks Lambda execution duration, cold starts, concurrency, and SQS queue age. |
 | **Alarms Engine** | CloudWatch Alarms | Sends alerts via SNS if Step Functions fail, or if the dashboard data is stale (>26 hours). |
 
-Core deployment alarms cover Step Functions failure, Lambda error rate, AI Engine internal endpoint unavailability, API Gateway gateway/integration errors, SQS age of oldest message spikes, Lambda reserved concurrency throttling, audit write failure, and dashboard data freshness. Deployment is not considered complete until these alarms are present and the smoke test writes an audit record. All audit records generated during deployment validation are stored in compliance-ready S3 buckets with Object Lock enabled, adhering to the strict platform requirement of >=90 days audit retention.
+Core deployment alarms cover Step Functions failure, Lambda error rate, AI Engine internal endpoint unavailability, SQS age of oldest message spikes, Lambda reserved concurrency throttling, audit write failure, and dashboard data freshness. Deployment is not considered complete until these alarms are present and the smoke test writes an audit record. All audit records generated during deployment validation are stored in compliance-ready S3 buckets with Object Lock enabled, adhering to the strict platform requirement of >=90 days audit retention.
 
 ## 9. Open questions
 
@@ -248,5 +248,5 @@ Core deployment alarms cover Step Functions failure, Lambda error rate, AI Engin
 
 ## Related documents
 
-- [`02_infra_design.md`](02_infra_design.md) - Private REST API Gateway, API/Worker Lambda container functions, and SQS/DLQ routing.
+- [`02_infra_design.md`](02_infra_design.md) - AI Engine Request and Worker Lambda container functions, and SQS/DLQ routing.
 - [`03_security_design.md`](03_security_design.md) - Lambda Execution Role configurations, VPC endpoints, and security groups.

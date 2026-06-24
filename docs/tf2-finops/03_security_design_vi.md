@@ -8,24 +8,23 @@
 
 ### 1.1 Network Diagram
 
-CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API và các cuộc gọi API bên ngoài đều được định tuyến nội bộ qua AWS VPC Endpoints.
+CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API đều được định tuyến nội bộ qua AWS VPC Endpoints.
 
-Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Endpoint AI Engine dùng chung do AIOps cung cấp được expose nội bộ tới các nền tảng CDO (cả CDO-01 và CDO-02) qua một Private REST API Gateway, được truy cập tại `https://ai-engine.tf-2.internal/` thông qua xác thực IAM SigV4. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
+Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Bộ điều phối Step Functions gọi trực tiếp hàm AI Engine Request Lambda. Mô hình hàng đợi bất đồng bộ sử dụng SQS/DLQ tách biệt khối lượng công việc suy luận nặng khỏi việc xác thực yêu cầu. Request Lambda xử lý các yêu cầu phát hiện đầu vào, đẩy chúng vào hàng đợi SQS và trả về trạng thái ngay lập tức. Lưu ý rằng `/v1/detect` và `/v1/detect/result/{audit_id}` đại diện cho ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai, vì không có Private API Gateway nào được triển khai. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
 
 ```mermaid
 graph TD
     subgraph "CDO Management Account VPC (ap-southeast-1)"
-        subgraph "Private Subnets (Serverless API & Queue)"
-            APIGW[Private REST API Gateway]
-            AILambdaAPI[AI Engine API Lambda]
+        subgraph "Private Subnets (Serverless Compute & Queue)"
+            AILambdaReq[AI Engine Request Lambda]
             AILambdaWorker[AI Engine Worker Lambda]
-            SQSQueue[SQS Queue]
+            SQSQueue[SQS Ingest Queue]
             L_Pull[Ingestion Lambda]
             L_Cont[Containment Lambda]
         end
 
         subgraph "VPC Endpoint Subnet"
-            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR, KMS, Logs, STS, Lambda, API Gateway]
+            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR, KMS, Logs, STS, Lambda]
         end
     end
 
@@ -43,15 +42,14 @@ graph TD
     VPCE -->|Private link| DDB
     
     %% Serverless traffic
-    APIGW -->|IAM SigV4 / Ingress| AILambdaAPI
-    AILambdaAPI -->|Enqueue| SQSQueue
+    AILambdaReq -->|Enqueue| SQSQueue
     SQSQueue -->|Trigger| AILambdaWorker
-    AILambdaAPI -->|Fetch secrets via SDK| VPCE
+    AILambdaReq -->|Fetch secrets via SDK| VPCE
     AILambdaWorker -->|Fetch secrets via SDK| VPCE
     VPCE -->|Private link| SM
 ```
 
-*Caption: Private REST API Gateway, các hàm AI Engine API & Worker Lambda, và các hàm Lambda điều phối được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (PrivateLink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng. Endpoint AI Engine dùng chung được expose riêng tư qua API Gateway và truy cập qua `https://ai-engine.tf-2.internal/` bằng xác thực IAM SigV4.*
+*Chú thích: Các hàm AI Engine Request và Worker Lambda, cùng các hàm Lambda điều phối và adapter dữ liệu, được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (PrivateLink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng. Không có Private API Gateway nào được triển khai; Step Functions gọi trực tiếp hàm Request Lambda và việc thực thi Worker được dẫn dắt bất đồng bộ qua SQS.*
 
 ### 1.2 Security Groups
 
@@ -59,8 +57,7 @@ Luồng traffic giữa các thành phần compute được kiểm soát thông q
 
 | SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `apigw-vpce-sg` | TCP 443 (từ VPC CIDR / Step Functions client) | TCP 443 (đến `lambda-sg`) | VPC endpoint cho API Gateway |
-| `lambda-sg` | TCP 443 (từ `apigw-vpce-sg`) | TCP 443 (đến `vpce-sg`) | Các hàm AI Engine API & Worker Lambda |
+| `lambda-sg` | None (Gọi trực tiếp qua dịch vụ thực thi programmatic) | TCP 443 (đến `vpce-sg`) | Các hàm Lambda Ingestion, Containment, và AI Engine Request & Worker |
 | `vpce-sg` | TCP 443 (từ `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr, KMS, Logs, STS, Lambda) |
 
 ### 1.3 Network ACL / VPC Endpoint
@@ -75,9 +72,8 @@ Các VPC interface endpoints được cấu hình bật tính năng Private DNS,
 - `com.amazonaws.ap-southeast-1.kms` (Interface Endpoint - Key Management Service)
 - `com.amazonaws.ap-southeast-1.sts` (Interface Endpoint - Security Token Service)
 - `com.amazonaws.ap-southeast-1.lambda` (Interface Endpoint - Lambda execution)
-- `com.amazonaws.ap-southeast-1.execute-api` (Interface Endpoint - API Gateway endpoint access)
 
-Security groups và resource policies được triển khai để giới hạn kết nối (ví dụ: Private REST API Gateway áp dụng một resource policy chỉ cho phép truy cập từ các CDO VPC endpoints, và API Lambda chỉ chấp nhận traffic được định tuyến qua API Gateway).
+Security groups và IAM resource policies được triển khai để giới hạn kết nối (ví dụ: Request Lambda chỉ chấp nhận hành động gọi được bắt đầu bởi vai trò Step Functions, và chính sách SQS Queue chỉ cho phép xuất bản tin nhắn từ vai trò của Request Lambda).
 
 Các chính sách endpoint được thu hẹp phạm vi vào tập hợp hành động thực tế nhỏ nhất. S3 gateway endpoint cho phép đọc từ các tiền tố xuất CUR đã phê duyệt và chỉ ghi vào các bucket raw/curated của CDO. DynamoDB endpoint chỉ cho phép truy cập vào các bảng run-state, idempotency, kiểm toán và bảng materialized hiển thị của dashboard. Các interface endpoint dành cho Secrets Manager, ECR và CloudWatch Logs bị giới hạn trong các security group của VPC CDO và các role thực thi. Các Network ACL duy trì tính đơn giản và không trạng thái (stateless), với lượt truy cập công cộng bị từ chối và lưu lượng phản hồi tạm thời chỉ được phép trong phạm vi private subnet.
 
@@ -89,9 +85,9 @@ Các IAM service roles trong AWS thực thi sự phân tách trách nhiệm nghi
 
 | Role | Used by | Permissions |
 |---|---|---|
-| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction`, `execute-api:Invoke` (để gọi Private API Gateway) |
+| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
 | `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (trên CUR S3 bucket của tài khoản đích), `s3:PutObject` (trên raw S3 bucket), `ce:GetCostAndUsage` |
-| `FinOpsAiApiExecutionRole` | AI Engine API Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `sqs:SendMessage` (để xếp hàng các yêu cầu detect), `dynamodb:GetItem` / `dynamodb:Query` (để lấy trạng thái kết quả) |
+| `FinOpsAiRequestExecutionRole` | AI Engine Request Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `sqs:SendMessage` (để xếp hàng các yêu cầu detect), `dynamodb:GetItem` / `dynamodb:Query` (để lấy trạng thái kết quả) |
 | `FinOpsAiWorkerExecutionRole` | AI Engine Worker Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `sqs:ReceiveMessage` / `sqs:DeleteMessage` (để thăm dò hàng đợi), `s3:GetObject` / `s3:PutObject` (đọc dữ liệu chi phí và ghi checkpoint/features), `dynamodb:PutItem` (để lưu trữ kết quả suy luận) |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Cấu hình explicit deny cho các quyền `iam:*`, `s3:Delete*`, và xóa tài nguyên prod. |
 
@@ -101,7 +97,7 @@ Các IAM service roles trong AWS thực thi sự phân tách trách nhiệm nghi
 ### 2.2 Lambda Execution Roles
 
 Các hàm AWS Lambda sử dụng các Role thực thi (Execution Roles) để áp dụng nguyên tắc đặc quyền tối thiểu:
-1. **Lambda Execution Role** (`FinOpsAiApiExecutionRole`, `FinOpsAiWorkerExecutionRole`): Được dịch vụ Lambda sử dụng để chạy mã hàm, kéo hình ảnh container từ ECR và ghi log thực thi vào CloudWatch.
+1. **Lambda Execution Role** (`FinOpsAiRequestExecutionRole`, `FinOpsAiWorkerExecutionRole`): Được dịch vụ Lambda sử dụng để chạy mã hàm, kéo hình ảnh container từ ECR và ghi log thực thi vào CloudWatch.
 2. **Cô lập quyền truy cập**: Mã ứng dụng chạy bên trong các hàm Lambda sử dụng các role này để truy vấn Secrets Manager (qua SDK), đọc/ghi vào dữ liệu chi phí curated trong S3, thăm dò từ hàng đợi SQS, hoặc ghi kết quả vào DynamoDB. Đội ngũ CDO sở hữu các role thực thi này như một phần của nền tảng host, trong khi đội AIOps cung cấp các container image được gắn phiên bản.
 
 Workloads không kế thừa quyền từ host. Mỗi hàm Lambda được liên kết rõ ràng với role thực thi tương ứng trong cấu hình hàm.
@@ -110,7 +106,7 @@ Workloads không kế thừa quyền từ host. Mỗi hàm Lambda được liên
 
 | Tên Hàm | IAM Execution Role | Managed Policies / Custom Scoped Policies |
 |---|---|---|
-| AI Engine API Lambda | `FinOpsAiApiExecutionRole` | Quyền đọc Secrets Manager (contract và API keys), SQS gửi tin nhắn, DynamoDB truy vấn trạng thái chạy, CloudWatch Logs ghi log. |
+| AI Engine Request Lambda | `FinOpsAiRequestExecutionRole` | Quyền đọc Secrets Manager (contract và API keys), SQS gửi tin nhắn, DynamoDB truy vấn trạng thái chạy, CloudWatch Logs ghi log. |
 | AI Engine Worker Lambda | `FinOpsAiWorkerExecutionRole` | Quyền đọc-ghi S3 (cost files & checkpoints), SQS thăm dò tin nhắn, DynamoDB ghi kết quả, CloudWatch Logs ghi log. |
 
 ### 2.3 Cross-account Access
@@ -129,7 +125,7 @@ Kiểm soát truy cập cho Bảng điều khiển Tài chính tĩnh S3 + CloudF
 - **Xác thực Token bằng Lambda@Edge**: Hàm Lambda@Edge viewer-request của CloudFront chặn mọi yêu cầu, phân tách JWT cookie, kiểm tra chữ ký đối với endpoint JWKS của Cognito và xác thực các claim (hết hạn, audience, issuer). Token không hợp lệ hoặc hết hạn sẽ kích hoạt tự động redirect về trang đăng nhập Hosted UI.
 - **Chính sách truy cập theo nhóm (Group-Based Access Policies)**:
   - `finops-finance-readonly`: Thành viên được ủy quyền xem trực quan xu hướng chi tiêu, tóm tắt bất thường và các bản ghi lịch sử kiểm toán. Giao diện UI chặn hiển thị các lệnh CLI, rollback script thô hoặc các nút kích hoạt thực thi containment.
-  - `finops-engineering-operator`: Thành viên được ủy quyền truy cập chi tiết kỹ thuật, xem các lệnh thực thi `rollback_script_encapsulated` thô, và kích hoạt các nút điều khiển gia hạn (`POST /v1/action/extend`) và rollback (`POST /v1/action/rollback`) đã được phê duyệt.
+  - `finops-engineering-operator`: Thành viên được ủy quyền truy cập chi tiết kỹ thuật, xem các lệnh thực thi `rollback_script_encapsulated` thô, và kích hoạt các hành động programmatic được phê duyệt để gia hạn (đại diện cho ngữ nghĩa `/v1/action/extend`) và rollback (đại diện cho ngữ nghĩa `/v1/action/rollback`).
   - `finops-cdo-admin`: Thành viên được cấp quyền quản lý chính sách truy cập, điều chỉnh phân bổ người dùng vào nhóm và cấu hình các cờ kiểm soát nền tảng toàn cục.
 
 ## 3. Secrets Management
@@ -140,10 +136,10 @@ Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
 | Secret | Nơi lưu trữ | Chu kỳ xoay vòng | Được truy cập bởi |
 |---|---|---|---|
-| `finops/ai-engine/api-key` | AWS Secrets Manager (mã hóa bằng KMS CMK) | Tự động mỗi 30 ngày | AI Engine API Lambda (qua SDK khi khởi động lạnh) |
+| `finops/ai-engine/api-key` | AWS Secrets Manager (mã hóa bằng KMS CMK) | Tự động mỗi 30 ngày | AI Engine Request Lambda (qua SDK khi khởi động lạnh) |
 | `finops/dashboard/db-creds` | AWS Secrets Manager | Tự động mỗi 60 ngày | Athena crawler / QuickSight dataset engine trong tương lai |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | Thủ công mỗi 90 ngày | `LambdaAlertRouting` |
-| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | Tự động mỗi 90 ngày | Hàm Lambda xác thực của Step Functions và AI Engine API Lambda |
+| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | Tự động mỗi 90 ngày | Hàm Lambda xác thực của Step Functions và AI Engine Request Lambda |
 | `finops/containment/external-id-seed` | AWS Secrets Manager | Xoay vòng thủ công khi xảy ra sự cố | Quy trình cung cấp vai trò containment |
 
 ### 3.2 Inject Pattern
@@ -189,9 +185,9 @@ Toàn bộ dữ liệu của hệ thống được mã hóa tại chỗ (at rest
 
 ### 4.2 In Transit
 
-- **Yêu cầu TLS**: Tất cả traffic đi vào và đi ra đều yêu cầu mã hóa TLS 1.3 (với TLS 1.2 là phiên bản tối thiểu được chấp nhận). Các cipher suites yếu đều bị vô hiệu hóa trên Private API Gateway.
+- **Yêu cầu TLS**: Tất cả traffic đi vào và đi ra đều yêu cầu mã hóa TLS 1.3 (với TLS 1.2 là phiên bản tối thiểu được chấp nhận).
 - **Traffic nội bộ**: Giao tiếp function-to-function và tin nhắn SQS được mã hóa hoàn toàn khi truyền tải natively bởi các dịch vụ AWS sử dụng TLS.
-- **Các cuộc gọi AI Engine**: Step Functions và Lambda gọi endpoint AI Engine nội bộ qua Private REST API Gateway chỉ qua mạng riêng tư VPC endpoints. Yêu cầu bao gồm một phiên bản hợp đồng và ID tương quan, và phản hồi sẽ bị từ chối nếu chữ ký, schema hoặc các trường bắt buộc không hợp lệ.
+- **Các cuộc gọi AI Engine**: Step Functions gọi trực tiếp hàm AI Engine Request Lambda nội bộ qua mạng riêng tư VPC. Payload yêu cầu bao gồm một phiên bản hợp đồng và ID tương quan, và payload sẽ được xác thực bên trong môi trường thực thi của hàm.
 - **Alert Webhook**: Tích hợp Slack hoặc email được gọi từ Lambda cảnh báo sau khi giảm thiểu payload. Dữ liệu chi phí nhạy cảm được liên kết thông qua các tham chiếu dashboard/audit nội bộ thay vì được nhúng trực tiếp vào các tin nhắn bên ngoài.
 
 ### 4.3 Key Management

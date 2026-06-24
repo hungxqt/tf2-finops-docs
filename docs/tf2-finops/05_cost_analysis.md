@@ -10,9 +10,9 @@
 
 ## 1. Cost Model per Tenant and Cadence Run (Forecast)
 
-A "tenant" in the TF2 FinOps Watch context is an AWS member account under cost monitoring. The cost model separates variable per-tenant costs from shared platform costs. This distinction matters because the lakehouse and Lambda workflow scale mostly with account/data volume, while Lambda containers, Private API Gateway, and baseline observability create shared fixed cost that must be amortized across tenants.
+A "tenant" in the TF2 FinOps Watch context is an AWS member account under cost monitoring. The cost model separates variable per-tenant costs from shared platform costs. This distinction matters because the lakehouse and Lambda workflow scale mostly with account/data volume, while Lambda containers and baseline observability create shared fixed cost that must be amortized across tenants.
 
-CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda container functions: Private API Gateway, Lambda container execution, ECR, Lambda execution roles, secrets plumbing, reserved concurrency, SQS/DLQ queues, and runtime monitoring. AIOps owns model development, model training design, model quality, and any synthetic historical dataset used to train, enhance, or backtest the model. If AIOps training or retraining tasks run on the CDO-hosted Lambda functions, the compute cost must be tagged and reported separately as "AI Engine workload cost hosted by CDO".
+CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda container functions: Lambda container execution, ECR, Lambda execution roles, secrets plumbing, reserved concurrency, SQS/DLQ queues, and runtime monitoring. AIOps owns model development, model training design, model quality, and any synthetic historical dataset used to train, enhance, or backtest the model. If AIOps training or retraining tasks run on the CDO-hosted Lambda functions, the compute cost must be tagged and reported separately as "AI Engine workload cost hosted by CDO".
 
 | Component | Unit Cost | Avg Usage Assumption | Cost treatment |
 |---|---|---|---|
@@ -24,15 +24,14 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Database - DynamoDB on-demand** | $1.25/million write + $0.25/million read | Run state, idempotency, audit index, dashboard materialization | Variable with runs and dashboard reads. |
 | **Query - Athena** | $5.00/TB scanned | Dashboard refresh, evidence lookup, operational review | Variable; controlled by partition pruning and query limits. |
 | **Data Catalog - Glue** | Catalog/crawler charges by object and DPU-hour | Cost tables, partitions, schema evolution | Variable but small at capstone scale. |
-| **Compute - AI Engine API/Worker Lambdas** | $0.20/1M requests + $0.0000166667/GB-second | AI Engine API Lambda container functions, Explainer, and SQS-triggered worker executions; 24h cadence | Variable AI workload hosting cost; tag separately from CDO adapters. |
-| **API Gateway - Private REST API Gateway** | $3.50/million requests | Private REST API Gateway for secure AI Engine endpoint routing | Shared fixed/variable request-driven cost. |
+| **Compute - AI Engine Request/Worker Lambdas** | $0.20/1M requests + $0.0000166667/GB-second | AI Engine Request Lambda container function and SQS-triggered worker executions; 24h cadence | Variable AI workload hosting cost; tag separately from CDO adapters. |
 | **Hàng đợi SQS & DLQ** | $0.40/million requests | Buffering requests for async worker Lambda execution | Variable queue operations cost. |
 | **ECR repositories** | $0.10/GB-month storage | Versioned AIOps container images and Lambda container image versions | Shared fixed/variable by retained image count. |
 | **VPC endpoints** | Hourly endpoint charge + data processing where applicable | Private connections for ECR, S3, DynamoDB, Secrets Manager, Logs, KMS, STS, and Lambda | Shared fixed security cost. |
 | **Secrets Manager** | $0.40/secret/month + request charges | AI Engine credentials, webhooks, contract signing key, external IDs | Shared fixed plus request volume. |
 | **KMS** | $1.00/CMK/month + request charges | Data, audit, secrets, encryption keys | Shared fixed; consolidation requires Security approval. |
-| **Observability - CloudWatch & X-Ray** | Logs, metrics, trace analyzer, and dashboard charges | Lambda logs, Step Functions traces, API Gateway logs, queue metrics, and platform dashboards | Shared and variable; can become a top cost driver. |
-| **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for AI Engine API Lambda | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
+| **Observability - CloudWatch & X-Ray** | Logs, metrics, trace analyzer, and dashboard charges | Lambda logs, Step Functions traces, queue metrics, and platform dashboards | Shared and variable; can become a top cost driver. |
+| **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for AI Engine Request Lambda | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
 | **Dashboard - S3 + CloudFront** | S3 & CloudFront pricing | Finance stakeholder dashboard access | S3 storage and CloudFront HTTPS request/data transfer fees. |
 | **Amazon Cognito (Auth)** | Free tier up to 50,000 MAUs; then $0.0055/MAU | User directory and Hosted UI auth gateway for dashboard access | Shared platform cost; free for capstone scale. |
 | **Lambda@Edge Viewer-Request Auth** | $0.60 per 1 million requests + duration ($0.0000500125/GB-sec) | Edge validation of JWT signatures against Cognito JWKS | Variable dashboard request cost; very low for target user base. |
@@ -41,32 +40,31 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 
 **Important notes**:
 - The above forecast is the estimated **CDO platform infrastructure** including the CDO-owned Lambda container hosting platform, but excluding AIOps-owned model development and model-quality work.
-- VPC endpoints, Private API Gateway, KMS, and observability are the largest fixed costs.
+- VPC endpoints, KMS, and observability are the largest fixed costs.
 - Actual costs must be measured from tagged AWS spend. Use `Evidence needed: CDO Lambda hosting actual`, `Evidence needed: CDO pipeline per-run actual`, and `Evidence needed: AI workload hosted-on-CDO actual` until measured.
 
 ---
 
 ## 2. Cost at Scale
 
-As tenant count grows, fixed costs such as VPC endpoints, Private API Gateway baseline, KMS CMKs, and S3 + CloudFront dashboard are amortized across multiple tenants, reducing average per-tenant cost. This section uses a forecast structure rather than claiming measured results.
+As tenant count grows, fixed costs such as VPC endpoints, KMS CMKs, and S3 + CloudFront dashboard are amortized across multiple tenants, reducing average per-tenant cost. This section uses a forecast structure rather than claiming measured results.
 
 | Tenant Count | Shared fixed platform/month | Variable CDO workflow/month | Hosted AI workload/month | Total/month | Avg/tenant |
 |---|---|---|---|---|---|
-| **1** | `Evidence needed: API Gateway + endpoints` | `Evidence needed: one account run cost` | `Evidence needed: AI Lambda usage` | `Evidence needed` | `Evidence needed` |
+| **1** | `Evidence needed: VPC endpoints` | `Evidence needed: one account run cost` | `Evidence needed: AI Lambda usage` | `Evidence needed` | `Evidence needed` |
 | **10** | Same shared baseline | `Evidence needed: 10-account run cost` | `Evidence needed: AI Lambda usage` | `Evidence needed` | `Evidence needed` |
 | **50** | Same shared baseline plus possible scaling | `Evidence needed: 50-account run cost` | `Evidence needed: AI Lambda usage` | `Evidence needed` | `Evidence needed` |
 | **200** | Shared baseline plus scale-out assumptions | `Evidence needed: 200-account run cost` | `Evidence needed: AI Lambda usage` | `Evidence needed` | `Evidence needed` |
 
 **Fixed costs include**:
-- 8× VPC Interface Endpoints (API Gateway, Lambda, ECR, Logs, S3, DynamoDB, KMS, Secrets Manager): $57.60
+- 7× VPC Interface Endpoints (Lambda, ECR, Logs, KMS, Secrets Manager, STS): $50.40 (with S3 and DynamoDB configured as free Gateway Endpoints)
 - 3× KMS CMKs: $3.00
 - Dashboard - S3 + CloudFront (MVP): S3 storage & CloudFront request/data transfer fees (typically <$1.00/month)
-- Private REST API Gateway base cost: negligible request fees (unless Provisioned Concurrency is enabled).
 - CloudWatch dashboard, logs, metrics, and X-Ray tracing: `Evidence needed: retained log volume`
 
 **Analysis**:
-- VPC endpoints and Private API Gateway constitute the platform baseline supporting secure AI API hosting, queue buffering, observability, and private networking.
-- At larger tenant counts, average cost should decline because the baseline endpoints, API Gateway, and dashboard costs are shared.
+- VPC endpoints constitute the platform baseline supporting secure Lambda hosting, queue buffering, observability, and private networking.
+- At larger tenant counts, average cost should decline because the baseline endpoints and dashboard costs are shared.
 - The break-even point must be recalculated after Lambda container invocation volumes and AI worker queue patterns are known; do not reuse the older serverless-only $46.77/tenant estimate.
 
 ---
@@ -100,7 +98,7 @@ This section compares the current CDO06 direction against common alternatives. I
 | Architecture Angle | $/tenant/month (forecast) | Difference Reason | Notes |
 |---|---|---|---|
 | **CDO06: Lakehouse-centric scheduled + Lambda container-hosted AI Engine** | `Evidence needed: CDO platform actual after Lambda memory/concurrency sizing` | Serverless orchestration keeps CDO adapters low-cost, while Lambda container functions add compute hosting cost for AIOps runtime. | Win axis: traceable FinOps control plane, private AI Engine hosting, safe containment, and amortized platform cost at scale. |
-| Pure serverless CDO prototype (without container support) | Lower one-tenant fixed cost, but incomplete for current scenario | Avoids ECR container storage and Private API Gateway baseline. | Rejected because current scenario requires CDO-hosted AI Engine runtime to accept containerized model artifacts from AIOps. |
+| Pure serverless CDO prototype (without container support) | Lower one-tenant fixed cost, but incomplete for current scenario | Avoids ECR container storage. | Rejected because current scenario requires CDO-hosted AI Engine runtime to accept containerized model artifacts from AIOps. |
 | Always-on warehouse approach | Higher fixed data cost | Redshift/RDS-style storage can simplify some SQL workflows but creates idle cost for 24h cadence. | Rejected because S3/Glue/Athena fits daily FinOps evidence with lower idle cost. |
 | Third-party FinOps SaaS | Subscription-dependent | Can reduce platform operations but weakens CDO/AIOps ownership boundary and containment guardrail control. | Not selected for capstone implementation. |
 
@@ -108,7 +106,7 @@ This section compares the current CDO06 direction against common alternatives. I
 - Compute pattern cost (Lambda container execution duration vs ECS Fargate vs EC2)
 - Storage/query cost (RDS vs Redshift vs Athena vs EMR)
 - Networking cost (VPC endpoints vs NAT Gateway vs private VPC routing)
-- Operational cost (managed API Gateway/Lambda service overhead vs container orchestrator cluster)
+- Operational cost (managed Lambda service overhead vs container orchestrator cluster)
 - AI Engine hosting split (CDO platform runtime vs AIOps model development/training)
 
 ---
@@ -126,12 +124,12 @@ This section must be filled only after running the platform with tagged AWS reso
 | S3 raw/curated/audit | `Evidence needed: GB-month and request forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Separate cost data and audit evidence prefixes. |
 | DynamoDB | `Evidence needed: read/write forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Run state, idempotency, audit index, dashboard materialization. |
 | Athena/Glue | `Evidence needed: scanned TB and crawler usage` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Validate partition pruning. |
-| Private REST API Gateway | `Evidence needed: request count and base cost` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Secure Private REST API Gateway endpoints for API requests. |
-| AI Engine Lambda compute | `Evidence needed: invocation count and GB-seconds` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | API Lambda container and SQS-triggered worker execution duration. |
+
+| AI Engine Lambda compute | `Evidence needed: invocation count and GB-seconds` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Request Lambda container and SQS-triggered worker execution duration. |
 | SQS queues & DLQ | `Evidence needed: message count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Buffering operations for asynchronous execution. |
 | ECR image storage | `Evidence needed: image count and sizes` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | ECR repository for Lambda container images. |
-| VPC Endpoints | `Evidence needed: endpoint count × hourly charge` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Private AWS service access. |
-| CloudWatch/X-Ray | `Evidence needed: log volume and metric count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Lambda, Step Functions, SQS, API Gateway. |
+| VPC Endpoints | `Evidence needed: 7 endpoints × hourly charge` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Private AWS service access. |
+| CloudWatch/X-Ray | `Evidence needed: log volume and metric count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Lambda, Step Functions, SQS. |
 | KMS/Secrets Manager | `Evidence needed: CMK and secret count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Data, audit, AI Engine secret, webhooks. |
 | Amazon Cognito | Free tier up to 50,000 MAUs | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | User pool and login authentication for the dashboard. |
 | Lambda@Edge Viewer-Request Auth | `Evidence needed: request count and execution duration` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Edge authorization filtering for S3/CloudFront. |
@@ -154,7 +152,7 @@ After onboarding test accounts with different load levels:
 | Medium | Moderate account count, common shared services, multiple owner tags | `Evidence needed` | `Evidence needed` | Validates expected capstone operating shape. |
 | Large | Higher account count, larger CUR volume, heavier dashboard/query activity | `Evidence needed` | `Evidence needed` | Validates Athena scan limits and SQS worker queue backlog scaling. |
 
-**Expected insight**: S3, Athena, DynamoDB, and Lambda costs scale with account and data volume. Baseline Private API Gateway and VPC endpoints scale as shared fixed platform cost, while Lambda container invocations scale with the AI API and worker queue capacity.
+**Expected insight**: S3, Athena, DynamoDB, and Lambda costs scale with account and data volume. Baseline VPC endpoints scale as shared fixed platform cost, while Lambda container invocations scale with the AI request and worker queue capacity.
 
 ### 5.3 Cost-per-Correct-Decision
 
@@ -164,7 +162,7 @@ This metric measures the cost efficiency of the full FinOps Watch decision loop.
 |---|---|---|---|
 | **Total AI Engine calls** | `Evidence needed: planned run count × account count` | `Evidence needed` | Count only operational contract calls from CDO to the hosted AI Engine. |
 | **Correct decisions** | AIOps-provided metric | `Evidence needed: AIOps evaluation result` | CDO does not derive this from the AI team's training dataset. |
-| **CDO platform cost** | `Evidence needed: CDO forecast total` | `Evidence needed` | CDO adapters, lakehouse, dashboard, alerting, audit, API Gateway/VPC endpoint baseline. |
+| **CDO platform cost** | `Evidence needed: CDO forecast total` | `Evidence needed` | CDO adapters, lakehouse, dashboard, alerting, audit, VPC endpoint baseline. |
 | **Hosted AI runtime cost on CDO Lambda** | `Evidence needed: worker/API task cost allocation` | `Evidence needed` | Runtime cost only, separated from AIOps model development. |
 | **AIOps model development cost** | Out of CDO scope unless AIOps provides it | AIOps-provided | Optional for full task-force ROI, not a CDO claim. |
 | **Cost per correct decision** | `Evidence needed` | `Evidence needed` | = agreed total cost / AIOps-provided correct decisions. |
@@ -189,14 +187,13 @@ To prevent cost overruns during capstone and demo:
 | **Athena query daily limit** | 200 GB scanned/day | Service Quotas + alarm | Cap ad-hoc query cost |
 | **Lambda concurrent execution** | 10 concurrent | Reserved concurrency limit | Prevent lambda storm |
 | **DynamoDB WCU/RCU burst** | Auto-scaling max 100 | DynamoDB auto-scaling cap | Limit burst cost |
-| **VPC endpoint hourly cost** | $57.60/month fixed | Alert on unexpected endpoint creation | Prevent fixed networking cost drift |
-| **API Gateway requests volume** | `Evidence needed: max requests/day` | Alert on unexpected call spikes and rate-limit | Prevent API request cost runaway |
+| **VPC endpoint hourly cost** | $50.40/month fixed | Alert on unexpected endpoint creation | Prevent fixed networking cost drift |
 | **Lambda execution duration** | `Evidence needed: max execution hours/day` | Stop runaway SQS worker executions and alert CDO/AIOps | Prevent runaway batch processing cost |
 
 **Monitoring dashboard**: CloudWatch dashboard `FinOpsWatch-CDO-CostGuardrails` shows:
 - Daily spend trend (last 7 days)
 - Forecast vs actual spend
-- Top 5 cost drivers (service breakdown, including API Gateway, Lambda compute, SQS, VPC endpoints, CloudWatch, Athena)
+- Top 5 cost drivers (service breakdown, including Lambda compute, SQS, VPC endpoints, CloudWatch, Athena)
 - Budget utilization %
 - Hosted AI runtime cost separated from AIOps model-development cost
 
@@ -239,8 +236,7 @@ After completing the 2-week capstone with actual baseline, the following recomme
 | **Lambda cold-start provisioned concurrency** | +$50-150/month | Medium | Apply Provisioned Concurrency only where latency SLAs are breached; use autoscaling. |
 | **SQS retry loops** | +$50-300/day | Medium | Set maximum SQS receive counts, configure DLQs, check execution status. |
 | **CloudWatch high-cardinality metrics** | +$20-100/month | Medium | Limit custom metrics labels, use default VPC endpoint metrics. |
-| **API Gateway idle cost** | Fixed monthly cost | Certain | Use REST Private API Gateway stage variables to share gateway where safe. |
-| **Unclear AIOps/CDO cost ownership** | Budget disputes | Medium | Tag AI runtime separately from AIOps model development/training. |
+| **Mơ hồ sở hữu chi phí AIOps/CDO** | Budget disputes | Medium | Tag AI runtime separately from AIOps model development/training. |
 
 ---
 

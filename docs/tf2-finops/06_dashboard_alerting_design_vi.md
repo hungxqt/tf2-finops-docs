@@ -70,16 +70,16 @@ Một bảng kiểm toán tương tác liệt kê tất cả các hành động 
 - **Hành động containment đang hoạt động**: Bảng hiển thị ID tài nguyên, tài khoản, squad sở hữu, loại hành động (ví dụ: Tagging, Sandbox Shutdown, Quota Cap) và thời gian thực thi.
 - **Chế độ thực thi (Execution Mode)**: Gắn nhãn rõ ràng cho các hành động là `dry-run` (giả lập containment hoặc chỉ đề xuất) hoặc `apply` (áp dụng tự động chính sách trên môi trường non-production).
 - **Đường liên kết bản ghi kiểm toán**: Một đường liên kết trực tiếp, có thể nhấp để xem bản ghi kiểm toán không thể sửa đổi được lưu trữ dưới dạng đối tượng S3 JSON. Mỗi liên kết tham chiếu đến Correlation ID và Idempotency Key duy nhất của lượt chạy.
-- **Các trường trạng thái & đếm ngược dựa trên hợp đồng (Contract-Backed Countdown & Status Fields)**: Giao diện người dùng hiển thị các tham số chính nhận được từ endpoint `/v1/detect/result/{audit_id}`:
+- **Các trường trạng thái & đếm ngược dựa trên hợp đồng (Contract-Backed Countdown & Status Fields)**: Giao diện người dùng hiển thị các tham số chính được truy vấn trực tiếp từ bảng DynamoDB run-state, đại diện cho ngữ nghĩa hợp đồng logic `/v1/detect/result/{audit_id}`:
   - `audit_id`: Mã định danh duy nhất cho phiên kiểm toán chi phí.
   - `enforcement_countdown.time_lock_seconds`: Khoảng thời gian đếm ngược ban đầu (thường là 14400 giây / 4 giờ trên môi trường Staging).
   - `fallback_action`: Hành động chính sách tự động được áp dụng khi đếm ngược hết hạn (ví dụ: `schedule-shutdown`).
   - **Thời gian hết hạn hiện tại**: Dấu thời gian động hiển thị thời điểm hành động sẽ thực thi.
   - **Cờ khả dụng của điều khiển**: Các nút hiển thị liệu tính năng Gia hạn (Extend) hoặc Khôi phục (Rollback) có khả dụng đối với trạng thái tài nguyên và môi trường hiện tại hay không.
-- **Hành vi Gia hạn/Tạm ẩn (Extend/Snooze Behavior)**: Cho phép các kỹ sư trì hoãn thời gian đếm ngược bằng cách gọi endpoint API hợp đồng `POST /v1/action/extend`.
+- **Hành vi Gia hạn/Tạm ẩn (Extend/Snooze Behavior)**: Cho phép các kỹ sư trì hoãn thời gian đếm ngược bằng cách gọi trực tiếp hàm containment Lambda (đại diện cho ngữ nghĩa `/v1/action/extend`).
   - *Tham số request*: `audit_id`, `extend_seconds`, và `reason` (lý do gia hạn).
   - *Phản hồi/Trạng thái giao diện mong muốn*: Chuyển trạng thái sang `extended` và cập nhật đếm ngược để hiển thị `new_expiration_time` mới.
-- **Hành vi Khôi phục/Hoàn tác (Rollback/Restore Behavior)**: Cho phép các kỹ sư hoàn tác một hành động containment bằng cách gọi endpoint API hợp đồng `POST /v1/action/rollback` (được hiển thị dưới dạng nút **Revert** hoặc **Restore**).
+- **Hành vi Khôi phục/Hoàn tác (Rollback/Restore Behavior)**: Cho phép các kỹ sư hoàn tác một hành động containment bằng cách gọi trực tiếp hàm containment Lambda (đại diện cho ngữ nghĩa `/v1/action/rollback`), được hiển thị dưới dạng nút **Revert** hoặc **Restore**.
   - *Tham số request*: `audit_id`, `requested_by_user` (email người thực hiện), và `justification_on_rollback` (giải trình hoàn tác).
   - *Phản hồi/Trạng thái giao diện mong muốn*: Chuyển trạng thái sang `rollback_initiated`, hiển thị `rollback_payload.action_type` và `original_resource_id` tương ứng.
 - **Giới hạn kiểm soát truy cập (Access Control Restriction)**: Các câu lệnh khôi phục thô và kịch bản thực thi (ví dụ: `rollback_script_encapsulated`) bị giới hạn nghiêm ngặt, chỉ hiển thị và có khả năng thực thi bởi các kỹ sư CDO/Kỹ thuật được phân quyền dưới các IAM policy riêng biệt và nhóm người dùng Cognito. Người dùng Tài chính (Finance) chỉ tương tác với các trường trạng thái trực quan cấp cao và không bao giờ nhìn thấy hoặc thực thi các CLI script.
@@ -101,18 +101,18 @@ Các bất thường mức độ nghiêm trọng cao hoặc các sự kiện vư
 Tất cả các bất thường được phát hiện được định tuyến trực tiếp đến các squad chịu trách nhiệm về tài nguyên mục tiêu.
 - **Kênh phân phối**: Slack Webhook (Các kênh squad chuyên dụng) hoặc Jira API (tự động tạo ticket).
 - **Trọng tâm nội dung**: ID tài nguyên kỹ thuật (ARN), loại dịch vụ, môi trường (Dev/Sandbox/Prod), trạng thái tuân thủ tag và đường dẫn rollback đề xuất.
-- **Kiểm soát hành động (Action Control)**: Bao gồm các đường liên kết hành động Extend/Snooze và Rollback/Restore ngắn hạn, được xác thực (các URL trực tiếp thực thi đối với `POST /v1/action/extend` và `POST /v1/action/rollback` qua API Gateway) khi chính sách và cấu hình môi trường cho phép.
+- **Kiểm soát hành động (Action Control)**: Bao gồm các tùy chọn hành động Extend/Snooze và Rollback/Restore ngắn hạn, được xác thực (các liên kết gọi trực tiếp programmatic thực thi đối với lớp tính toán Lambda đại diện cho ngữ nghĩa `/v1/action/extend` và `/v1/action/rollback`) khi chính sách và cấu hình môi trường cho phép.
 - **Tần suất**: Gần như thời gian thực (trong vòng 30 phút sau khi pipeline hoàn thành).
 
 *Ghi chú về dữ liệu telemetry*: Dữ liệu telemetry được xử lý để phát hiện hoàn toàn không bao gồm các chỉ số hiệu suất sử dụng (CPU, Bộ nhớ, kết nối). Các số liệu CloudWatch chỉ được sử dụng cho việc giám sát sức khỏe vận hành của nền tảng CDO và dựng hiển thị dashboard.
 
 ### 3.3 Xử lý lỗi API hợp đồng (API contract error handling)
 Khi người vận hành kích hoạt các nút điều khiển hành động, hệ thống bảng điều khiển và cảnh báo sẽ xử lý các lỗi hợp đồng sau:
-- **`ERR_ROLLBACK_NOT_SUPPORTED`** (HTTP 422): Xảy ra khi cố gắng rollback một tài nguyên không hỗ trợ hoàn tác (ví dụ: tài nguyên trên production nơi containment chỉ ở mức tag/suggest). Giao diện người dùng sẽ vô hiệu hóa (disable) nút revert và hướng dẫn người vận hành liên hệ đội SRE để xem xét thủ công.
-- **`ERR_ALREADY_ROLLED_BACK`** (HTTP 422): Được kích hoạt nếu hành động rollback đã được thực thi trước đó. Giao diện cập nhật trạng thái tài nguyên thành "Restored" (Đã phục hồi) và vô hiệu hóa các lượt nhấp tiếp theo để ngăn ngừa xung đột trạng thái.
-- **`ERR_RESOURCE_NOT_FOUND`** (HTTP 422): Xảy ra khi tài nguyên mục tiêu đã bị xóa vật lý khỏi hạ tầng AWS. Bảng điều khiển xóa bộ đếm ngược và hiển thị "Resource Deleted Externally" (Tài nguyên đã bị xóa bên ngoài).
-- **`ERR_STATE_CONFLICT`** (HTTP 422): Kích hoạt bởi các hành động đồng thời của người vận hành trên cùng một tài nguyên (ví dụ: nhấp đúp hoặc hai kỹ sư cùng thực hiện rollback đồng thời). Giao diện sẽ yêu cầu tải lại trang để đồng bộ hóa trạng thái mới nhất từ DynamoDB.
-- **`ERR_CROSS_TENANT_DENIED`** (HTTP 403): Xảy ra nếu ngữ cảnh tenant của người vận hành (`X-Tenant-Id`) không trùng khớp với chủ sở hữu bất thường. Giao diện sẽ chặn thực thi và ghi lại nhật ký cảnh báo sự cố bảo mật.
+- **`ERR_ROLLBACK_NOT_SUPPORTED`** (mã lỗi): Xảy ra khi cố gắng rollback một tài nguyên không hỗ trợ hoàn tác (ví dụ: tài nguyên trên production nơi containment chỉ ở mức tag/suggest). Giao diện người dùng sẽ vô hiệu hóa (disable) nút revert và hướng dẫn người vận hành liên hệ đội SRE để xem xét thủ công.
+- **`ERR_ALREADY_ROLLED_BACK`** (mã lỗi): Được kích hoạt nếu hành động rollback đã được thực thi trước đó. Giao diện cập nhật trạng thái tài nguyên thành "Restored" (Đã phục hồi) và vô hiệu hóa các lượt nhấp tiếp theo để ngăn ngừa xung đột trạng thái.
+- **`ERR_RESOURCE_NOT_FOUND`** (mã lỗi): Xảy ra khi tài nguyên mục tiêu đã bị xóa vật lý khỏi hạ tầng AWS. Bảng điều khiển xóa bộ đếm ngược và hiển thị "Resource Deleted Externally" (Tài nguyên đã bị xóa bên ngoài).
+- **`ERR_STATE_CONFLICT`** (mã lỗi): Kích hoạt bởi các hành động đồng thời của người vận hành trên cùng một tài nguyên (ví dụ: nhấp đúp hoặc hai kỹ sư cùng thực hiện rollback đồng thời). Giao diện sẽ yêu cầu tải lại trang để đồng bộ hóa trạng thái mới nhất từ DynamoDB.
+- **`ERR_CROSS_TENANT_DENIED`** (lỗi xác thực): Xảy ra nếu ngữ cảnh tenant của người vận hành không trùng khớp với chủ sở hữu bất thường. Giao diện sẽ chặn thực thi và ghi lại nhật ký cảnh báo sự cố bảo mật.
 
 ### 3.4 Payload cảnh báo mẫu (Example alert payload)
 Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schema dưới đây đại diện cho một payload cảnh báo điển hình được gửi đến các kênh thông báo:
@@ -153,11 +153,11 @@ Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schem
       "time_lock_seconds": 14400,
       "fallback_action": "schedule-shutdown",
       "can_extend": true,
-      "extend_endpoint": "/v1/action/extend"
+      "extend_action": "extend"
     },
     "rollback": {
       "supported": true,
-      "endpoint": "/v1/action/rollback",
+      "rollback_action": "rollback",
       "required_fields": [
         "audit_id",
         "requested_by_user",

@@ -192,7 +192,7 @@
 
 ## ADR-011 - Sử dụng Private REST API Gateway thay thế cho internal ALB (Private REST API Gateway over internal ALB)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-012
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: API của AI Engine phải được truy cập một cách an toàn và riêng tư bởi nhiều nền tảng CDO trong mạng nội bộ. Quyết định trước đó sử dụng một internal ALB (ADR-009). Tuy nhiên, khi chuyển sang host trên AWS Lambda container, việc sử dụng REST API Gateway với tích hợp Lambda là lựa chọn tự nhiên và an toàn hơn cho việc công khai API nội bộ.
 - **Quyết định (Decision)**: Công khai endpoint AI Engine dùng chung qua Private REST API Gateway sử dụng xác thực IAM SigV4 và tích hợp Lambda proxy/container. Sự cô lập đa người thuê (multi-tenant) được duy trì thông qua header `X-Tenant-Id` của yêu cầu để phân vùng dữ liệu và các yêu cầu.
@@ -208,3 +208,22 @@
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
   - Định tuyến qua Internal ALB: Bị từ chối vì API Gateway cung cấp khả năng quản lý endpoint, rate limiting tốt hơn và tích hợp proxy Lambda gốc tối ưu cho serverless runtime.
   - Endpoint HTTP công cộng với API Gateway: Bị từ chối vì xác thực SigV4 qua private endpoint đảm bảo lưu lượng không đi qua internet công cộng, đáp ứng NFR về bảo mật.
+
+---
+
+## ADR-012 - Gọi trực tiếp Lambda/SQS cho AI Engine thay vì qua Private API Gateway (Direct Lambda/SQS AI Engine invocation over Private API Gateway)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-24
+- **Bối cảnh (Context)**: Luồng chạy CDO hiện tại là một quy trình xử lý theo lô (batch workflow) được lập lịch, điều phối bởi EventBridge Scheduler và Step Functions. Hợp đồng API của AI yêu cầu hành vi `/v1/detect` và `/v1/detect/result/{audit_id}`, nhưng kiến trúc không cần đến một Private REST API Gateway riêng biệt khi Step Functions là caller điều phối duy nhất.
+- **Quyết định (Decision)**: Private REST API Gateway không bắt buộc đối với luồng chạy lập lịch mặc định của CDO (Private REST API Gateway is not required for the default). Luồng mặc định nên sử dụng tích hợp trực tiếp dịch vụ AWS thông qua Lambda và SQS: Step Functions -> AI Engine Request Lambda -> SQS -> AI Engine Worker Lambda -> Kết quả lưu DynamoDB/S3 -> Step Functions kiểm tra kết quả. Private API Gateway trở thành một mô hình tùy chọn trong tương lai hoặc dành cho client chia sẻ (Private API Gateway becomes optional), không phải là kiến trúc cơ sở.
+- **Hệ quả (Consequence)**:
+  - Pro: Loại bỏ độ phức tạp không cần thiết của API Gateway, VPC endpoint, stage deployment, usage plan và resource policy.
+  - Pro: Giữ cho luồng công việc hoàn toàn serverless và dễ vận hành hơn cho chu kỳ chạy lô 24 giờ.
+  - Pro: Bảo toàn ranh giới Docker image của AIOps thông qua việc triển khai Lambda container image.
+  - Trade-off: Không có endpoint HTTP `/v1/*` dùng lại được theo mặc định cho các client nội bộ khác.
+  - Trade-off: Các cơ chế throttling kiểu API, xác thực yêu cầu và kiểm soát stage phải được tự thực hiện qua Lambda, SQS, IAM và các bài kiểm thử hợp đồng (contract tests).
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Giữ lại Private REST API Gateway: Bị từ chối đối với luồng mặc định vì nó tăng thêm tài nguyên hạ tầng mà không mang lại giá trị rõ ràng khi Step Functions là caller duy nhất.
+  - Public API Gateway: Bị từ chối vì AI Engine phải được giữ riêng tư và bảo mật nội bộ.
+  - Internal ALB: Bị từ chối vì nó nặng nề hơn mức cần thiết đối với việc hosting Lambda container và gọi theo lô theo lịch trình.
