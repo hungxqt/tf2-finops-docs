@@ -145,3 +145,23 @@
 - **Alternatives considered**:
   - Fargate always-on for all tasks: Rejected because it leads to excessive idle compute costs during large batch jobs or model retraining runs.
   - Fargate Spot for all tasks: Rejected because spot interruptions on the API/explainer tasks would disrupt dashboard availability and real-time alerting SLOs.
+
+---
+
+## ADR-009 - Shared Task Force AI Engine endpoint
+
+- **Status**: Accepted
+- **Date**: 2026-06-24
+- **Context**: Task Force 2 runs two separate FinOps CDO platforms (CDO-01 and CDO-02) representing different business units. To minimize operational costs and simplify model management, we need a deployment architecture for the AIOps AI Engine that hosts it once while serving both CDO platforms securely and efficiently.
+- **Decision**: Deploy a single, shared Task Force AI Engine endpoint hosted on ECS Fargate within a shared VPC, accessible internally via `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication. Multi-tenant isolation is maintained using the `X-Tenant-Id` request header to partition data and requests.
+- **Responsibility Split**:
+  - **CDO** owns the hosting infrastructure deployment: VPC networking (subnets, route tables, VPC endpoints), Internal Application Load Balancer (ALB), DNS record configuration, ECS cluster configuration, task scaling policies, Security Groups, ECS Task Execution and IAM Roles, SQS processing queues, and DynamoDB execution/idempotency state stores.
+  - **AIOps** owns the application logic inside the container: the AI model code, container image build and publishing (ECR image payload), Root Cause Analysis (RCA) and remediation recommendation logic, local fallback rules engine execution, internal API contract enforcement, and evaluation baseline tracking.
+- **Consequence**:
+  - Pro: Dramatically reduces runtime costs by hosting only a single shared ECS Fargate cluster instead of separate clusters for each CDO platform.
+  - Pro: Simplifies release management and model updates for AIOps since they publish a single version of the container image.
+  - Pro: Direct endpoint access using AWS private DNS (`https://ai-engine.tf-2.internal/`) ensures traffic never traverses the public internet, satisfying security NFRs.
+  - Trade-off: Requires coordination between CDO and AIOps for task sizing and autoscaling configurations, as well as strict tenant headers configuration to avoid cross-tenant data leakage.
+- **Alternatives considered**:
+  - Separate AI Engine per CDO Platform: Rejected due to duplicate resource costs and high maintenance overhead for model versioning and container deployments.
+  - Public HTTP Endpoint with API Gateway: Rejected because IAM SigV4-based authentication over private internal load balancers provides stronger transport security and lower latency without exposing endpoints to the internet.

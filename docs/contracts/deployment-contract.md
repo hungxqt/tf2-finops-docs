@@ -108,17 +108,17 @@ resource_limits:
 
 ---
 
-## 5. Networking Contract
+## 5. Networking Contract (Bản đồ cô lập mạng kín)
 
-| Aspect | Configuration | WHY |
+AI Engine tuân thủ nguyên lý an ninh mạng **Zero-Trust**. Hệ thống không có cổng Public ra Internet và bị cô lập hoàn toàn sau tường lửa:
+
+| Thành phần | Đặc tả cấu hình mạng | Lý do thiết kế (WHY) |
 |---|---|---|
-| **Subnet type** | Private | AI Engine không expose ra internet |
-| **ALB** | Internal only (không public-facing) | Chỉ CDO Platform trong VPC mới access được |
-| **Security group** | `tf-2-ai-engine-sg` | |
-| **Ingress rules** | Chỉ allow từ CDO Platforms SG (SG-to-SG reference) | Zero trust — không allow by IP/CIDR |
-| **Egress rules** | Chỉ allow tới: Bedrock endpoint, Secrets Manager VPCe, DynamoDB VPCe, SQS VPCe | Minimize attack surface |
-| **DNS** | Route 53 Private Hosted Zone | Resolve `ai-engine.tf-2.internal` trong VPC |
-| **TLS** | TLS 1.3 enforced | In-transit encryption |
+| **Subnet Type** | Private Subnet Only | Ngăn chặn hoàn toàn mọi nguy cơ tiếp cận từ môi trường Internet. |
+| **Load Balancer** | Internal ALB Only | Chỉ cho phép các dịch vụ nội bộ có định danh nằm trong VPC truy cập. |
+| **Ingress Rule** | SG-to-SG Enforcement | Chỉ chấp nhận kết nối duy nhất từ định danh Security Group của CDO Platforms. Cấm Allow by IP/CIDR. |
+| **Egress Rule** | VPC Endpoints (VPCe) Only | Khóa cứng lối ra. Chỉ cho phép định tuyến tới: Bedrock API Endpoint, Secrets Manager VPCe, DynamoDB VPCe, SQS VPCe, và **S3 Gateway Endpoint** (Phục vụ kéo an toàn file log CUR vi mô qua đường mạng nội bộ tốc độ cao). |
+| **Encryption** | TLS 1.3 Enforced | Mã hóa 100% dữ liệu dịch chuyển trên đường truyền mạng nội bộ. |
 
 ### Deployment Topology Diagram
 
@@ -133,9 +133,11 @@ graph TB
         SM["Secrets Manager VPCe"]
         DDB["DynamoDB VPCe"]
         SQS_E["SQS VPCe"]
+        S3_E["S3 Gateway Endpoint"]
         ECS --> SM
         ECS --> DDB
         ECS --> SQS_E
+        ECS --> S3_E
     end
     Bedrock["AWS Bedrock<br/>(ap-southeast-1)"]
     ECS --> Bedrock
@@ -146,7 +148,7 @@ graph TB
     end
     CDO1 --> ALB
     CDO2 --> ALB
-```
+  ```
 
 ### Per-CDO Platform Pointer
 

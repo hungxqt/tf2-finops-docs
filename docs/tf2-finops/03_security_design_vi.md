@@ -10,7 +10,7 @@
 
 CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API và các cuộc gọi API bên ngoài đều được định tuyến nội bộ qua AWS VPC Endpoints.
 
-Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. AI Engine do AIOps sở hữu chỉ có thể tiếp cận được thông qua một endpoint dịch vụ ECS nội bộ; nó không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
+Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Endpoint AI Engine dùng chung do AIOps cung cấp trên ECS Fargate (cluster 'tf-2-aiops-cluster') được expose nội bộ tới các nền tảng CDO (cả CDO-01 và CDO-02) dưới dạng một endpoint dịch vụ dùng chung duy nhất được truy cập tại `https://ai-engine.tf-2.internal/` thông qua xác thực IAM SigV4. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
 
 ```mermaid
 graph TD
@@ -50,7 +50,7 @@ graph TD
     VPCE -->|Fetch API Key| SM
 ```
 
-*Caption: Cụm ECS, load balancer, và các hàm Lambda điều phối được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (Privatelink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng.*
+*Caption: Cụm ECS, internal ALB, và các hàm Lambda điều phối được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface Endpoints (Privatelink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng. Endpoint AI Engine dùng chung trên ECS được truy cập qua `https://ai-engine.tf-2.internal/` bằng xác thực IAM SigV4.*
 
 ### 1.2 Security Groups
 
@@ -99,7 +99,7 @@ Các IAM service roles trong AWS thực thi sự phân tách trách nhiệm nghi
 
 Các tác vụ ECS Fargate sử dụng hai loại IAM role riêng biệt để thực thi nguyên tắc đặc quyền tối thiểu:
 1. **ECS Task Execution Role** (`FinOpsTaskExecutionRole`): Được sử dụng bởi ECS container agent để xác thực với ECR để kéo Docker images và truy vấn Secrets Manager để phân giải các ánh xạ secret trong task definition.
-2. **ECS Task Role** (`FinOpsAiApiIamRole`, `FinOpsAiWorkerIamRole`): Được sử dụng bởi mã ứng dụng chạy trong container để thực hiện các cuộc gọi AWS API, chẳng hạn như đọc từ S3 hoặc viết số liệu vào CloudWatch, cô lập các đặc quyền container.
+2. **ECS Task Role** (`FinOpsAiApiIamRole`, `FinOpsAiWorkerIamRole`): Được sử dụng bởi mã ứng dụng chạy trong container để thực hiện các cuộc gọi AWS API, chẳng hạn như đọc từ S3 hoặc viết số liệu vào CloudWatch, cô lập các đặc quyền container. Đội ngũ CDO sở hữu việc triển khai hạ tầng host, task execution role và task IAM role, trong khi đội AIOps cung cấp các container image được gắn phiên bản.
 
 Workloads không kế thừa quyền IAM từ các thực thể máy chủ EC2. Mỗi task của dịch vụ được liên kết rõ ràng với task role tương ứng trong ECS task definition.
 
@@ -230,11 +230,16 @@ Mọi hành động kiểm soát do CDO platform thực hiện đều được g
   },
   "approval_status": "pending_squad_response",
   "retention_location": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/",
-  "retention_period_days": 90
+  "retention_period_days": 90,
+  "audit_chain": {
+    "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
+    "event_hash": "673f8a0dc...",
+    "previous_hash": "a4f891b0d..."
+  }
 }
 ```
 
-Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment.
+Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại DynamoDB và S3, với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Telemetry gửi tới AI Engine để phát hiện bất thường là dữ liệu chi phí CUR-only và tuyệt đối không bao gồm các tín hiệu hiệu năng CloudWatch. Hệ thống log và metrics của CloudWatch chỉ phục vụ cho việc giám sát vận hành của CDO và cảnh báo SRE.
 
 ### 5.2 Storage + Retention
 

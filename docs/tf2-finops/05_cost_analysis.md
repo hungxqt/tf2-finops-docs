@@ -179,6 +179,7 @@ To prevent cost overruns during capstone and demo:
 | **Monthly budget alert 70%** | `Evidence needed: capstone ECS-aware budget × 70%` | CloudWatch alarm -> SNS Engineering | CDO team reviews usage patterns |
 | **Monthly budget alert 90%** | `Evidence needed: capstone ECS-aware budget × 90%` | Alarm + email escalation to mentor | CDO + Mentor review |
 | **Monthly budget hard stop 100%** | `Evidence needed: approved capstone budget` | Disable scheduler and block non-essential worker jobs | Auto fail-safe to prevent runaway cost |
+| **Bedrock token budget** | <$50/month ($1.67/day limit) | Fallback levels: Level 1 (80% daily budget) Nova Pro -> Nova Lite; Level 2 (100% daily budget) Nova -> Rules Engine; Level 3 (120% monthly budget) halts processing. | CDO + AIOps joint governance |
 | **Per-tenant S3 quota** | 100 GB/tenant curated data | S3 bucket quota + alarm | Prevent single tenant data explosion |
 | **Athena query daily limit** | 200 GB scanned/day | Service Quotas + alarm | Cap ad-hoc query cost |
 | **Lambda concurrent execution** | 10 concurrent | Reserved concurrency limit | Prevent lambda storm |
@@ -193,6 +194,8 @@ To prevent cost overruns during capstone and demo:
 - Top 5 cost drivers (service breakdown, including ECS/Fargate, ALB, VPC endpoints, CloudWatch, Athena)
 - Budget utilization %
 - Hosted AI runtime cost separated from AIOps model-development cost
+
+*Note on performance metrics: Performance metrics (CPU, Memory, database connections, SQS backlogs) are gathered strictly for CDO platform operational health monitoring (CloudWatch Container Insights, alarms, and Grafana) and are never sent to the AI Engine for detection telemetry.*
 
 ---
 

@@ -10,7 +10,7 @@
 
 The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications and external model endpoint calls occur privately using AWS VPC Endpoints.
 
-The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The AIOps-owned AI Engine is reachable only through an internal ECS service endpoint; it does not receive direct credentials for member account containment actions.
+The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The shared AIOps-provided AI Engine endpoint on ECS Fargate (cluster 'tf-2-aiops-cluster') is exposed internally to the CDO platforms (both CDO-01 and CDO-02) as a single shared service endpoint reached at `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication. The AI Engine does not receive direct credentials for member account containment actions.
 
 ```mermaid
 graph TD
@@ -50,7 +50,7 @@ graph TD
     VPCE -->|Fetch API Key| SM
 ```
 
-*Caption: The ECS cluster, load balancer, and orchestration Lambda functions are deployed within private-only subnets. They utilize dedicated AWS VPC Interface Endpoints (Privatelink) to connect to AWS services, preventing data transmission over the public internet.*
+*Caption: The ECS cluster, internal ALB, and orchestration Lambda functions are deployed within private-only subnets. They utilize dedicated AWS VPC Interface Endpoints (Privatelink) to connect to AWS services, preventing data transmission over the public internet. The shared AI Engine endpoint on ECS is accessed via `https://ai-engine.tf-2.internal/` using IAM SigV4 authentication.*
 
 ### 1.2 Security Groups
 
@@ -99,7 +99,7 @@ AWS IAM service roles enforce strict separation. Crucially, no service role has 
 
 ECS Fargate tasks utilize two distinct types of IAM roles to enforce the principle of least privilege:
 1. **ECS Task Execution Role** (`FinOpsTaskExecutionRole`): Used by the ECS container agent to authenticate with ECR to pull Docker images and to query Secrets Manager to resolve secret mappings in the task definition.
-2. **ECS Task Role** (`FinOpsAiApiIamRole`, `FinOpsAiWorkerIamRole`): Used by the application code running inside the container to make AWS API calls, such as reading from S3 or writing metrics to CloudWatch, isolating container privileges.
+2. **ECS Task Role** (`FinOpsAiApiIamRole`, `FinOpsAiWorkerIamRole`): Used by the application code running inside the container to make AWS API calls, such as reading from S3 or writing metrics to CloudWatch, isolating container privileges. The CDO team owns the task execution and task IAM roles as part of the hosting platform, while the AIOps team provides the versioned container image artifacts.
 
 Workloads do not inherit IAM permissions from EC2 hosts. Each service task is explicitly associated with its respective task role in the ECS task definition.
 
@@ -230,11 +230,16 @@ Every action taken by the CDO platform is documented. For containment actions, t
   },
   "approval_status": "pending_squad_response",
   "retention_location": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/",
-  "retention_period_days": 90
+  "retention_period_days": 90,
+  "audit_chain": {
+    "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
+    "event_hash": "673f8a0dc...",
+    "previous_hash": "a4f891b0d..."
+  }
 }
 ```
 
-The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Dry-run operations still produce audit records because Finance needs to see what the platform would have done and why the action remained safe. AI model training datasets are not logged by CDO; CDO logs only invocation metadata, returned decision fields, and operational evidence references needed for alerting and containment.
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in DynamoDB and S3, with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still produce audit records because Finance needs to see what the platform would have done and why the action remained safe. AI model training datasets are not logged by CDO; CDO logs only invocation metadata, returned decision fields, and operational evidence references needed for alerting and containment. Telemetry data sent to the AI Engine for detection is strictly CUR-only and excludes CloudWatch performance utilization signals. CloudWatch logs and metrics are used solely for CDO platform operational observability and SRE alerts.
 
 ### 5.2 Storage + Retention
 

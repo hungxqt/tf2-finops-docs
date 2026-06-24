@@ -57,7 +57,7 @@ In the event of an SLO breach, the following escalation and remediation protocol
 Data Ingestion verification focuses on retrieving and parsing cost data from AWS Data Exports (CUR 2.0) and AWS Cost Explorer API:
 - **Raw Ingestion**: The raw ingestion Lambda retrieves parquet/CSV files from the billing S3 bucket and verifies that schema definitions match the defined layout.
 - **Cost Explorer Queries**: Validates that mock responses from the Cost Explorer API match historical expectations and are mapped to normalized cost windows.
-- **Glue Crawler & Athena Views**: Tests verify that the Glue Crawler successfully catalogs the S3 raw partition structure and that Athena queries can aggregate cost metrics by service, region, account, and resource tags without syntax errors.
+- **Glue Crawler & Athena Views**: Tests verify that the Glue Crawler successfully catalogs the S3 raw partition structure and that Athena queries can aggregate cost metrics by service, region, account, and resource tags without syntax errors. Under the CUR-only telemetry design, no utilization signals from CloudWatch (CPU, memory, database connections) are gathered or sent to the AI Engine for detection. Utilization signals are verified to be used solely for CDO platform operational health observability (alerts, logging, metrics, dashboard).
 
 ### 3.2 Scheduled run idempotency
 
@@ -78,8 +78,8 @@ The pipeline runs on a scheduled cadence (ADR-001) triggered by EventBridge Sche
 ### 4.1 AI contract
 
 The contract-based interface between the CDO platform and the AIOps-provided AI Engine is validated for strict schema adherence:
-- **Request Format Verification**: The test harness sends requests containing `correlation_id`, `anomaly_id`, and `cost_window` to verify that they conform to the schema.
-- **Response Format Verification**: The test validates that the AI Engine returns a response containing the required parameters: `confidence_score` (between 0.00 and 1.00) and `explanation` (non-empty string).
+- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` to the shared endpoint (`https://ai-engine.tf-2.internal/`) using IAM SigV4 authentication. The test verifies that the request payload is strictly CUR-only (either `RAW_JSON` or `S3_POINTER` types) and contains no CloudWatch utilization metrics.
+- **Response Format Verification**: The test validates that the AI Engine returns a response containing the required parameters: `audit_id`, `status` (`completed` | `processing` | `failed`), `anomalies_list` (containing `anomaly_metadata`, `finance_dashboard_data`, and `engineering_dashboard_data`), and `pagination` controls (`next_token` and `limit`).
 
 ### 4.2 AI Engine timeout
 
@@ -155,11 +155,11 @@ If the AI Engine is completely unreachable (e.g., HTTP 503 error, ALB gateway ti
 
 ### 5.3 Audit log write
 
-The containment engine must generate an audit log entry for every action attempt. This test verifies that the written JSON schema contains all 14 required fields:
+The containment engine must generate an audit log entry for every action attempt. This test verifies that the written JSON schema contains all 15 required fields:
 1. `actor`: Entity executing the action (e.g., `cdo-platform-orchestrator`).
 2. `timestamp`: UTC execution timestamp.
 3. `correlation_id`: Unique identifier tracking the specific run.
-4. `idempotency_key`: Key preventing double executions.
+4. `idempotency_key`: Key preventing double executions (composite `tenant_id:YYYY-MM-DD`).
 5. `anomaly_id`: Reference ID of the detected anomaly.
 6. `resource_owner`: Team/squad responsible for the resource.
 7. `resource_id`: AWS ARN of the target resource.
@@ -170,6 +170,7 @@ The containment engine must generate an audit log entry for every action attempt
 12. `approval_status`: Status of authorizations (e.g., `pending_approval`, `approved`, `bypassed`).
 13. `retention_location`: S3 URI where the log is stored.
 14. `retention_period_days`: Number representing retention duration (must be >= 90 days).
+15. `audit_chain`: Tamper-evident ledger linking structure containing `event_hash` (`sha256(current_payload + previous_hash)`) and `previous_hash` of the append-only ledger.
 
 ---
 

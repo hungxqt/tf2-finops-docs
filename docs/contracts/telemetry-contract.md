@@ -11,19 +11,19 @@
 
 ## 1. Mục đích và Phạm vi
 
-Hợp đồng này định nghĩa **các tín hiệu (signals) dữ liệu chi phí và hiệu năng** mà nhóm CDO phải thu thập từ AWS Infrastructure → chuẩn hóa → truyền tải cho AI Engine.
+Hợp đồng này định nghĩa **các tín hiệu (signals) dữ liệu chi phí và cấu hình hạch toán** mà nhóm CDO phải thu thập từ AWS Infrastructure → chuẩn hóa → truyền tải cho AI Engine.
 
-**Nguyên tắc cốt lõi**: CDO Platform là **source-of-truth** duy nhất. CDO **PULL** dữ liệu từ AWS CUR (S3), Cost Explorer API, và CloudWatch theo chu kỳ cố định — AI Engine không trực tiếp gọi AWS APIs.
+**Nguyên tắc cốt lõi**: CDO Platform là **source-of-truth** duy nhất. CDO **PULL** dữ liệu từ AWS CUR (S3) và Cost Explorer API theo chu kỳ cố định — AI Engine không trực tiếp gọi AWS APIs để tối ưu hóa chi phí và bảo mật hệ thống.
 
-**Phạm vi phát hiện**: Contract phục vụ 5 loại bất thường chính (reference: TF2_FINOPS_LEARNER.md):
+**Phạm vi phát hiện (Chế độ CUR-Only)**: Để tối ưu chi phí telemetry và bám sát tệp dữ liệu thực nghiệm, dự án loại bỏ lớp dữ liệu hiệu năng CloudWatch. Hệ thống tập trung bóc tách không gian dữ liệu đa biến của CUR để phục vụ phát hiện 5 loại bất thường chính:
 
-| # | Anomaly Type | Tín hiệu chính |
+| # | Anomaly Type | Tín hiệu chính (Mô hình CUR-Only) |
 |---|---|---|
-| 1 | `runaway_usage` | Compute chạy 24/7, `usage_density_24h ≈ 1.0`, không giảm cuối tuần |
-| 2 | `idle_resource` | Cost đều đặn, `CPUUtilization ≈ 0%`, `DatabaseConnections ≈ 0` |
-| 3 | `untagged_spend` | `resource_tags_user_team` rỗng, cost lớn |
-| 4 | `sudden_spike` | Cost nhảy bậc thang, `cost_ratio_to_7d_avg > 3.0` |
-| 5 | `gradual_drift` | Trend tăng chậm nhiều tuần, chỉ visible trên `rolling_30d_avg` |
+| 1 | `runaway_usage` | Dòng chi phí tăng vọt đột biến, duy trì liên tục hằng ngày không giảm kể cả ngày nghỉ cuối tuần (`is_weekend = true`). |
+| 2 | `idle_resource` | Chi phí phát sinh đều đặn, liên tục kéo dài nhiều tuần nhưng tài nguyên dính cờ trống người sở hữu (`resource_tags_user_owner` rỗng) hoặc thuộc các stack thử nghiệm cũ đã quá hạn (`TTL Expiry`). |
+| 3 | `untagged_spend` | Thẻ định danh đội nhóm quản lý chi phí `resource_tags_user_team` mang giá trị rỗng/null, trong khi cost phát sinh vượt baseline. |
+| 4 | `sudden_spike` | Chi phí nhảy bậc thang đột ngột trong chu kỳ hạch toán, tỷ số biến động `unblended_cost` tăng vượt ngưỡng an toàn. |
+| 5 | `gradual_drift` | Xu hướng tăng trưởng chi phí chậm, âm thầm qua nhiều tuần, chỉ visible khi tiến hành tính toán độ lệch tích lũy chu kỳ dài hạn. |
 
 ---
 
@@ -111,121 +111,121 @@ hybrid_ingestion:
 
 ---
 
-## 6. Signal 1: `aws_cost_explorer_daily` — Macro Layer (Trends)
+## 6. Signal 1: aws_cost_explorer_daily — Macro Layer (Trends)
 
-Dữ liệu tổng hợp vĩ mô. Map trực tiếp với schema cost_explorer_daily.csv trong dataset TF2.
+Dữ liệu tổng hợp vĩ mô. Map trực tiếp với các cột thô gốc trong tệp tin `cost_explorer_daily.csv` thuộc bộ dữ liệu TF2.
 
-| Attribute | Value |
-|---|---|
-| **Type** | Tabular aggregate (daily grain) |
-| **Frequency** | PULL 1 lần/ngày lúc 02:00 AM (EventBridge cron) |
-| **Emit point** | CDO gọi `aws ce get-cost-and-usage` → normalize → đóng gói JSON |
-| **Retention** | 7 ngày hot (DynamoDB cache), 30 ngày cold (S3) |
-| **Used for** | Trend detection, account-level anomaly, baseline calculation |
-| **Emit SLA** | p99 < 60s từ CE API response → AI consumable |
-| **Volume SLA** | ~100-500 records/batch (6 accounts × ~20 services × 1 day) |
-| **Cost estimate** | $0.01/request × 2 requests/day = $0.60/month |
+| Thuộc tính    | Giá trị cấu hình                                              |
+| ------------- | ------------------------------------------------------------- |
+| Type          | Tabular aggregate (daily grain)                               |
+| Frequency     | PULL 1 lần/ngày lúc 02:00 AM (EventBridge cron)               |
+| Emit point    | CDO gọi aws ce get-cost-and-usage → normalize → đóng gói JSON |
+| Retention     | 7 ngày hot (DynamoDB cache), 30 ngày cold (S3)                |
+| Used for      | Trend detection, account-level anomaly, baseline calculation  |
+| Emit SLA      | p99 < 60s từ CE API response → AI consumable                  |
+| Volume SLA    | ~100-500 records/batch (6 accounts × ~20 services × 1 day)    |
+| Cost estimate | $0.01/request × 2 requests/day = $0.60/month                  |
 
-**Schema bắt buộc** (6 cột, khớp API Contract `aws_cost_explorer_daily`):
+### Schema bắt buộc
+
+*(Khớp 100% với 8 cột thô gốc của hệ thống hạch toán, loại bỏ toàn bộ các trường phái sinh tự tính toán)*
 
 ```yaml
 cost_explorer_signals:
-  unblended_cost: float           # Chi phí ngày hiện tại (USD)
-  service_code: string            # Mã ngắn CUR: AmazonEC2, AmazonRDS
-  service: string                 # Tên hiển thị CE: "Amazon Elastic Compute Cloud - Compute"
-  region: string                  # e.g. us-east-1, ap-southeast-1
-  cost_ratio_to_7d_avg: float     # (unblended_cost / rolling_7d_avg)
-  day_of_week: int                # 0-6 (Mon-Sun)
-  is_weekend: bool                # Derived from day_of_week
-  is_estimated: bool              # true cho 2 ngày cuối (CE chưa final)
+  date: string                    # Định dạng ngày hạch toán dòng tiền (YYYY-MM-DD)
+  linked_account_id: int64        # ID tài khoản AWS thành viên phát sinh chi phí
+  linked_account_name: string     # Tên định danh môi trường của tài khoản (VD: prod-core, staging)
+  service: string                 # Tên hiển thị thương mại của dịch vụ AWS (VD: "Amazon Relational Database Service")
+  service_code: string            # Mã code vĩ mô của dịch vụ (VD: AmazonRDS, AmazonEC2)
+  region: string                  # Vùng địa lý triển khai hạ tầng (VD: us-east-1, ap-southeast-1)
+  unblended_cost: float           # Chi phí ngày hiện tại chưa áp giảm giá (USD)
+  is_estimated: bool              # Trạng thái ước tính số liệu tạm thời của AWS (True/False)
 ```
 
 > [!WARNING]
-> **Naming Mismatch (đã verify với AWS thật)**: CUR dùng `service_code` (e.g. `AmazonEC2`), Cost Explorer dùng `service` (e.g. `Amazon Elastic Compute Cloud - Compute`). CDO **bắt buộc** cung cấp **cả hai trường** để tránh lỗi khi join dữ liệu — đây là cái bẫy thật ngoài production (reference: TF2 Dataset README line 79).
+> **Naming Mismatch (Bẫy lệch pha tên dịch vụ AWS):** CUR dùng mã ngắn `service_code` (e.g. AmazonEC2), Cost Explorer dùng tên dài `service` (e.g. Amazon Elastic Compute Cloud - Compute). CDO bắt buộc cung cấp nguyên bản cả hai trường từ file thô sang để tránh lỗi phân rã khi join dữ liệu ở tầng AI Engine.
 
 > [!IMPORTANT]
-> **Dữ liệu ước tính**: Khi `is_estimated = true` ở 2 ngày gần nhất, AI Engine **PHẢI** hạ confidence score và **KHÔNG** kích hoạt auto-containment. CDO gửi kèm `telemetry_delay_event = true` khi CUR chưa finalized → AI Engine tạm hoãn batch, kiểm tra lại mỗi 1h (reference: 01_requirements.md §7 Q3).
+> **Dữ liệu ước tính:** Khi dòng tiền dính cờ `is_estimated = true` ở các ngày chưa final, AI Engine PHẢI tự động hạ điểm tin cậy và KHÔNG được phép cấp lệnh can thiệp vật lý thật. CDO gửi kèm tín hiệu `telemetry_delay_event = true` khi CUR chưa finalized để AI tạm hoãn tiến trình và kiểm tra lại mỗi 1 giờ.
 
-> **WHY cache DynamoDB**: Cost Explorer API rate limit 5 requests/second. CDO cache kết quả vào DynamoDB tránh vượt limit. AI Engine đọc cache khi cần baseline 7d/30d thay vì gọi CE trực tiếp (reference: ADR-003).
+### WHY cache DynamoDB
+
+Cost Explorer API có rate limit là 5 requests/second. CDO sẽ cache toàn bộ kết quả thô thu thập được vào DynamoDB để tránh vượt limit. Khi AI Engine cần tính toán baseline trung bình trượt tuần/tháng phái sinh (`rolling_7d_avg`, `rolling_30d_avg`), code ứng dụng sẽ đọc trực tiếp từ cache này chứ không gọi trực tiếp lên AWS CE API.
 
 ---
 
-## 7. Signal 2: `daily_cur_spend_usd` — Micro Layer (Facts)
+# 7. Signal 2: `daily_cur_spend_usd` — Micro Layer (Facts)tf2
 
-Dữ liệu vi mô cấp tài nguyên. Map trực tiếp với schema cur_line_items.csv. **Đây là nguồn sự thật (source of truth) cho detection** (reference: TF2 Dataset README line 63).
+Dữ liệu vi mô cấp tài nguyên chi tiết. Khớp chính xác 100% với cấu trúc bản ghi thô gốc của tệp tin `cur_line_items.csv` thuộc bộ dữ liệu TF2. Đây là nguồn sự thật tối cao (Source of Truth) phục vụ cho mô hình AI cô lập và suy luận can thiệp hạ tầng.
 
-| Attribute | Value |
-|---|---|
-| **Type** | Tabular CUR 2.0 resource-level (daily grain) |
-| **Frequency** | PULL 1 lần/ngày sau CE signal |
-| **Emit point** | CDO đọc S3 CUR manifest → Athena query → JSON/gz → truyền qua S3_POINTER |
-| **Retention** | 7 ngày hot, 90 ngày cold (compliance) |
-| **Used for** | Resource-level anomaly detection, drill-down RCA, containment targeting |
-| **Emit SLA** | p99 < 300s (Athena query + compress + upload) |
-| **Volume SLA** | ~500-25K records/batch (TF2 dataset: 24,533 line items / 92 days ≈ 267/day) |
+## Thuộc tính
 
-**Schema bắt buộc** (khớp API Contract `aws_cur_line_items`):
+| Thuộc tính | Giá trị cấu hình                                                                                                                          |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Type       | Tabular AWS Cost and Usage Report (CUR 2.0) resource-level                                                                                |
+| Frequency  | PULL 1 lần/ngày ngay sau khi nhận được tín hiệu vĩ mô (Cost Explorer)                                                                     |
+| Emit point | CDO Platform đọc S3 CUR manifest → Athena Query trích xuất dữ liệu chu kỳ 24h → Đóng gói JSON / nén .gz → Truyền qua giao thức S3_POINTER |
+| Retention  | 7 ngày hot (DynamoDB audit cache), 90 ngày cold (Compliance Archive)                                                                      |
+| Used for   | Resource-level anomaly detection, drill-down RCA reasoning, containment targeting                                                         |
+| Emit SLA   | p99 < 300 giây (Bao gồm thời gian Athena Query + Nén + Upload Egress)                                                                     |
+| Volume SLA | ~200 - 500 records/batch/ngày (Dựa theo quy mô phân phối dữ liệu thô lịch sử)                                                             |
+
+## Schema bắt buộc
+
+(Bao bao phủ toàn bộ 23 cột thô gốc từ file mẫu, nghiêm cấm CDO tự ý đổi tên trường hoặc tính toán trước đặc trưng phái sinh):
 
 ```yaml
 cur_signals:
-  line_item_resource_id: string   # ARN hoặc Instance ID cụ thể
-  line_item_usage_type: string    # e.g. BoxUsage:p3.2xlarge
-  line_item_usage_amount: float   # Khối lượng hoạt động vật lý
-  pricing_unit: string            # e.g. Hrs, GB, Request
-  line_item_unblended_cost: float # *** Nguồn sự thật cho detection ***
-  line_item_unblended_rate: float # Đơn giá (e.g. $3.06/hr cho p3.2xlarge)
-  line_item_operation: string     # e.g. RunInstances, CreateDBInstance
-  usage_density_24h: float        # Mật độ chạy liên tục 0.0-1.0 (CDO tự tính)
-  resource_tags_user_environment: string  # prod | staging | dev | sandbox | ml-research | data-analytics
-  resource_tags_user_owner: string | null
-  resource_tags_user_team: string | null       # null/empty = untagged_spend signal
-  resource_tags_user_cost_center: string | null
+  bill_billing_period_start_date: string  # Ngày bắt đầu chu kỳ lập hóa đơn (Format UTC)
+  bill_payer_account_id: int64            # ID tài khoản AWS gốc thanh toán hóa đơn tổng
+  line_item_usage_account_id: int64       # ID tài khoản AWS thành viên trực tiếp chạy máy
+  line_item_usage_account_name: string    # Tên tài khoản thành viên (VD: staging, dev, prod-core)
+  line_item_line_item_type: string        # Phân loại hạch toán chi phí (VD: Usage, Tax, Fee)
+  line_item_usage_start_date: string      # Thời gian tài nguyên bắt đầu chạy máy trong ngày
+  line_item_usage_end_date: string        # Thời gian tài nguyên kết thúc chạy máy trong ngày
+  line_item_product_code: string          # Mã định danh ngắn của dịch vụ AWS (VD: AmazonRDS)
+  line_item_usage_type: string            # Mã chi tiết cấu hình tài nguyên (VD: BoxUsage:p3.2xlarge)
+  line_item_operation: string             # Thao tác vận hành hạ tầng (VD: RunInstances, CreateDBInstance)
+  line_item_resource_id: string           # *** Khóa chính can thiệp: ARN hoặc ID vật lý của thiết bị ***
+  line_item_usage_amount: float           # Khối lượng tiêu thụ tài nguyên đo đạc vật lý hằng ngày
+  pricing_unit: string                    # Đơn vị hạch toán tính giá tài nguyên (VD: Hrs, GB)
+  line_item_unblended_rate: float         # Đơn giá chạy máy thực tế tại thời điểm hạch toán
+  line_item_unblended_cost: float         # *** Nguồn số liệu dòng tiền tối cao phục vụ AI Detection ***
+  line_item_currency_code: string         # Đơn vị tiền tệ hạch toán đám mây (Mặc định: USD)
+  product_product_name: string            # Tên hiển thị đầy đủ của dịch vụ (VD: Amazon SageMaker)
+  product_region_code: string             # Mã khu vực vật lý đặt máy chủ (VD: us-east-1)
+  product_instance_type: string           # Loại cấu hình chip/máy chủ ảo nếu có (VD: p3.2xlarge)
+  resource_tags_user_team: string         # Thẻ gán tên đội nhóm chịu trách nhiệm (Rỗng = Untagged Spend)
+  resource_tags_user_environment: string  # Thẻ gán môi trường: prod, staging, dev, sandbox, ml-research, data-analytics
+  resource_tags_user_cost_center: string  # Thẻ gán mã trung tâm chi phí hạch toán doanh nghiệp
+  resource_tags_user_owner: string        # Thẻ gán danh tính kỹ sư sở hữu và khởi tạo tài nguyên
 ```
 
-**Athena Query tối ưu** (CDO bắt buộc partition + chỉ quét window cần thiết):
+## Athena Query tối ưu hóa chi phí vận hành
+
+(CDO bắt buộc cấu hình quét theo phân vùng ngày hạch toán, nghiêm cấm quét toàn bộ cơ sở dữ liệu gây lãng phí ngân sách):
 
 ```sql
-SELECT bill_billing_period_start_date, line_item_usage_start_date,
-       line_item_usage_account_id, line_item_product_code,
-       line_item_resource_id, line_item_unblended_cost,
-       resource_tags_user_team, resource_tags_user_environment
+SELECT bill_billing_period_start_date,
+       line_item_usage_account_id,
+       line_item_usage_account_name,
+       line_item_product_code,
+       line_item_resource_id,
+       line_item_unblended_cost,
+       resource_tags_user_team,
+       resource_tags_user_environment
 FROM "cur2_database"."cur2_table"
 WHERE bill_billing_period_start_date = DATE_FORMAT(CURRENT_DATE, '%Y-%m-01 00:00:00')
   AND line_item_usage_start_date >= DATE_ADD('day', -2, CURRENT_DATE)
 ```
 
-> **WHY `unblended_cost` not `usage_amount`**: Daily `usage_amount` dao động nhẹ quanh 24h do nhiễu — bình thường trong CUR. `unblended_cost` là tín hiệu ổn định hơn cho detection (reference: README line 68).
+## WHY `line_item_unblended_cost` instead of `line_item_usage_amount`
+
+Biến số đo đạc vật lý `usage_amount` hằng ngày thường xuyên dao động răng cưa biên độ nhỏ do độ trễ mạng hạch toán (nhiễu tự nhiên trong log CUR). Biến số dòng tiền `line_item_unblended_cost` mang phân phối ổn định, tuyến tính và phản ánh chính xác nhất bản chất thâm hụt ngân sách, giúp mô hình bóc tách đặc trưng sạch hơn.
 
 ---
 
-## 8. Signal 3: `resource_utilization_metrics` — CloudWatch Layer
-
-Tín hiệu hiệu năng vật lý. **Bắt buộc** để phát hiện `idle_resource` (cost cao + utilization thấp) và `runaway_usage` (cost cao + utilization cao liên tục).
-
-| Attribute | Value |
-|---|---|
-| **Type** | CloudWatch Metrics |
-| **Frequency** | PULL 1 lần/ngày (aggregate 24h period) |
-| **Used for** | Xác nhận anomaly, giảm false positive, confidence scoring |
-| **Fallback**: | Nếu CloudWatch không available → AI Engine vẫn chạy CUR-only detection nhưng `confidence *= 0.5` |
-
-```yaml
-utilization_signals:
-  cpu_percent: float              # CPUUtilization (EC2/RDS/ECS) — avg 24h
-  memory_mib: float               # MemoryUtilization (nếu có)
-  network_in_bytes: float         # NetworkIn — aggregate 24h
-  network_out_bytes: float        # NetworkOut — aggregate 24h
-  disk_io_ops: float              # DiskReadOps + DiskWriteOps
-  database_connections: int | null # RDS DatabaseConnections — avg 24h
-  gpu_utilization: float | null   # GPU Core usage (SageMaker ml-research)
-  idle_hours_continuous: int | null # Số giờ liên tục utilization < 5%
-```
-
-> **WHY fallback khi mất CloudWatch**: Reliability principle — CUR data là "đủ" để detect, CloudWatch chỉ "tăng confidence". Không block detection vì thiếu metric phụ (reference: 02_solution_design.md §5 Risk mitigation).
-
----
-
-## 9. Resource Identity Contract
+## 8. Resource Identity Contract
 
 Chuẩn hóa định danh tài nguyên theo OpenTelemetry semantic conventions. Dùng cho multi-tenant routing + RCA drill-down.
 
@@ -246,7 +246,7 @@ resource_identity:
 
 ---
 
-## 10. Resource Lineage Contract
+## 9. Resource Lineage Contract
 
 Truy vết nguồn gốc tài nguyên. Hỗ trợ RCA nhân quả: `Cost spike → deployment abc123 → commit 84fd2a → team-ml`.
 
@@ -264,7 +264,7 @@ resource_lineage:
 
 ---
 
-## 11. Business Context Signals — False Positive Reduction
+## 10. Business Context Signals — False Positive Reduction
 
 Loại bỏ **3 bẫy False Positive** trong dataset: flash-sale, migration, load test (reference: TF2 Dataset README §Bẫy FP).
 
@@ -284,7 +284,7 @@ business_context:
 
 ---
 
-## 12. Time Integrity Contract
+## 11. Time Integrity Contract
 
 Bảo vệ quan hệ nhân quả (causality) trong hệ thống phân tán. **Reject nếu clock skew > 10s**.
 
@@ -296,33 +296,31 @@ time_integrity:
   clock_skew_ms: int              # abs(ingestion - source)
   max_allowed_skew_ms: 10000     # 10 giây
 ```
-
 ---
 
-## 13. Telemetry Quality Contract
+## 12. Telemetry Quality Contract
 
-AI Engine tự đánh giá dữ liệu trước khi ra quyết định. **Nếu `completeness_score < 0.8` → AI forced into DRY-RUN.**
+AI Engine tự động thực thi đánh giá chất lượng nguồn dữ liệu thô do CDO Platform nạp sang trước khi đưa vào luồng suy luận ra quyết định can thiệp.
 
 ```yaml
 telemetry_quality:
   cur_status:
     enum: [HEALTHY, DELAYED, MISSING]
-  cloudwatch_status:
-    enum: [HEALTHY, DEGRADED, MISSING]
   cost_explorer_status:
     enum: [HEALTHY, STALE]
-  completeness_score: float       # Tỷ lệ trường bắt buộc có giá trị hợp lệ (0.0-1.0)
-  freshness_score: float          # 1.0 - (data_age_hours / 24)
-  integrity_score: float          # SHA256 checksum match rate
-  delay_score: float              # Điểm phạt nếu CUR bị trễ > 12h
-  is_forced_dry_run: bool         # Đánh dấu true nếu forced into DRY-RUN, map sang API response (GET /v1/detect/result/{audit_id})
+  completeness_score: float       # Tỷ lệ các trường dữ liệu bắt buộc mang giá trị hợp lệ (0.0-1.0)
+  freshness_score: float          # Độ tươi mới của log hạch toán: 1.0 - (data_age_hours / 24)
+  integrity_score: float          # Tỷ lệ trùng khớp mã băm SHA256 kiểm tra toàn vẹn
+  is_forced_dry_run: bool         # Đánh dấu tự động ép hệ thống lùi về trạng thái Dry-run an toàn
 ```
 
-> **WHY forced DRY-RUN**: Nếu AI Engine detect trên dữ liệu thiếu → sinh False Positive → trigger auto-containment sai → tắt resource production → outage. Forced dry-run là safety net (reference: 01_requirements.md §4 Constraints — NEVER terminate prod). AI Engine sẽ trả về `is_dry_run: true` trong API response để thông báo trạng thái này cho CDO Platform.
+WHY forced DRY-RUN: Đảm bảo nguyên lý an toàn hệ thống tối cao. Nếu nguồn dữ liệu thô đầu vào dính lỗi khiếm khuyết, trễ log hoặc mất tính toàn vẹn khiến chỉ số `completeness_score < 0.8`, AI Engine sẽ ngay lập tức ép hệ thống rơi vào trạng thái DRY-RUN (`is_forced_dry_run = true`).
+
+AI Engine sẽ trả về thông số này trong API Response (`GET /v1/detect/result/{audit_id}`) để cưỡng chế CDO Platform chỉ được phép xuất văn bản cảnh báo, khóa chặt toàn bộ các câu lệnh CLI can thiệp vật lý thật, triệt tiêu hoàn toàn nguy cơ tắt nhầm tài nguyên Production do dữ liệu bẩn.
 
 ---
 
-## 14. Quota Telemetry Contract
+## 13. Quota Telemetry Contract
 
 Hệ thống can thiệp `quota-cap` cần biết headroom trước khi áp trần.
 
@@ -337,7 +335,7 @@ quota_signals:
 
 ---
 
-## 15. Human Feedback Contract — Active Learning Loop
+## 14. Human Feedback Contract — Active Learning Loop
 
 Continual Learning: SRE/Engineer xác nhận qua Slack → AI cập nhật pattern memory.
 
@@ -355,7 +353,7 @@ human_feedback:
 
 ---
 
-## 16. Audit Chain — Tamper-evident Integrity
+## 15. Audit Chain — Tamper-evident Integrity
 
 Chuỗi hash bảo vệ tính toàn vẹn kiểm toán. Audit trail lưu ≥90 ngày (reference: 01_requirements.md §4).
 
@@ -370,7 +368,7 @@ audit_chain:
 
 ---
 
-## 17. Cross-cutting Requirements
+## 16. Cross-cutting Requirements
 
 Mọi signal payload phải comply các quy tắc sau:
 
@@ -385,15 +383,14 @@ Mọi signal payload phải comply các quy tắc sau:
 
 ---
 
-## 18. Telemetry Outage Recovery Matrix
+## 17. Telemetry Outage Recovery Matrix
 
-| Kịch bản | Detection | Hành vi AI Engine |
+| Kịch bản | Cách thức phát hiện | Hành vi xử lý của AI Engine |
 |---|---|---|
-| CUR trễ (chưa cập nhật S3) | CDO gửi `telemetry_delay_event = true` | Tạm hoãn batch. Kiểm tra lại mỗi 1h. Max 4 retries → alert P1. |
-| Mất CloudWatch Metrics | `cloudwatch_status: MISSING` | AI chạy CUR-only detection. `confidence *= 0.5`. Containment = Dry-run/Alert-only. |
-| Pipeline CDO sập hoàn toàn | Sau 26h không nhận dữ liệu | AI phát cảnh báo P1 đỏ tới Slack cả hai nhóm. |
-| Dữ liệu ước tính (`is_estimated`) | `is_estimated = true` | AI giảm `confidence_score`. Không kích hoạt auto-containment. |
-| Cost Explorer rate limit | `cost_explorer_status: STALE` | CDO serve từ DynamoDB cache. AI ghi nhận `stale_data_used: true`. |
+| CUR trễ (Chưa cập nhật trên S3) | CDO Platform gửi tín hiệu request kèm cờ `telemetry_delay_event = true`. | AI Engine tạm hoãn tiến trình batch job của ngày hạch toán đó. Lập lịch tự động kiểm tra lại mỗi 1 giờ. Thử lại tối đa 4 lần, nếu quá thời hạn vẫn mất kết nối sẽ phát cảnh báo P1 khẩn cấp. |
+| Pipeline CDO sập hoàn toàn | Hệ thống không nhận được bất kỳ payload nạp dữ liệu nào từ Tenant quá 26 tiếng kể từ chu kỳ chạy cũ. | AI Engine tự động phát cảnh báo P1 đỏ khẩn cấp trực tiếp tới kênh Slack của cả hai nhóm kỹ thuật gọi nhân sự dậy xử lý infrastructure. |
+| Dữ liệu ước tính từ AWS (`is_estimated`) | Bản ghi dữ liệu thô nhận giá trị cấu hình `is_estimated = true`. | AI Engine tự động hạ điểm tự tin thuật toán (`confidence_score < 0.50`), ép toàn bộ hành động can thiệp sang chế độ an toàn Dry-run/Alert-only, tuyệt đối cấm phát câu lệnh CLI tác động vật lý thật. |
+| Cost Explorer vượt trần giới hạn gọi máy | Trạng thái hạch toán vĩ mô dính cờ `cost_explorer_status: STALE`. | CDO Platform tự động serve dữ liệu từ bảng DynamoDB cache nội bộ. AI Engine ghi nhật ký kiểm toán hệ thống dính nhãn `stale_data_used: true`. |
 
 ---
 

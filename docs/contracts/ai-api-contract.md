@@ -82,34 +82,46 @@ Hỗ trợ cơ chế **Hybrid Ingestion** và **Cờ cưỡng chế** trong cùn
   "is_ad_hoc": "boolean (Optional - Bỏ qua khóa idempotency nếu true, mặc định: false)",
   "aws_cost_explorer_daily": [
     {
-      "unblended_cost": "float (Required - Số tiền phát sinh trong ngày)",
-      "service_code": "string (Required - Mã dịch vụ AWS vĩ mô, VD: AmazonEC2, AmazonRDS)",
-      "region": "string (Required - Khu vực triển khai, VD: ap-southeast-1)",
-      "cost_ratio_to_7d_avg": "float (Required - Tỷ lệ biến động chi phí tức thời so với trung bình 7 ngày qua)",
-      "day_of_week": "int (Required - Thứ trong tuần từ 0-6)",
-      "is_weekend": "boolean (Required - Xác định ngày nghỉ cuối tuần)"
+      "date": "string (Required - Định dạng YYYY-MM-DD)",
+      "linked_account_id": "long (Required - ID tài khoản thành viên AWS)",
+      "linked_account_name": "string (Required - Tên môi trường tài khoản, VD: prod-core)",
+      "service": "string (Required - Tên thương mại dịch vụ AWS)",
+      "service_code": "string (Required - Mã định danh dịch vụ, VD: AmazonRDS)",
+      "region": "string (Required - Vùng triển khai, VD: us-east-1)",
+      "unblended_cost": "float (Required - Số tiền phát sinh thô)",
+      "is_estimated": "boolean (Required - Cờ trạng thái ước tính số liệu của AWS)"
     }
   ],
-  "s3_bucket_uri": "string (Required nếu S3_POINTER - Đường dẫn S3 trỏ tới tệp log CUR, ví dụ: s3://company-cdo-telemetry/cur/2026-06-25-compressed.json.gz)",
+  "s3_bucket_uri": "string (Required nếu S3_POINTER - Đường dẫn S3 trỏ tới tệp log CUR thô nén .json.gz)",
   "aws_cur_line_items": [
     {
-      "line_item_resource_id": "string (Required nếu RAW_JSON - ID vật lý hoặc ARN duy nhất của tài nguyên)",
-      "line_item_usage_type": "string (Required nếu RAW_JSON - Cấu hình chi tiết, VD: BoxUsage:p3.2xlarge)",
-      "line_item_usage_amount": "float (Required nếu RAW_JSON - Khối lượng hoạt động vật lý)",
-      "pricing_unit": "string (Required nếu RAW_JSON - Đơn vị tính giá, VD: Hrs, GB)",
-      "usage_density_24h": "float (Required nếu RAW_JSON - Mật độ chạy máy liên tục trong 24h, từ 0.0 đến 1.0)",
-      "resource_tags_user_environment": "string (Required nếu RAW_JSON - Tag môi trường: prod, staging, dev, sandbox, ml-research, data-analytics)",
-      "resource_tags_user_owner": "string (Nullable - Người sở hữu tài nguyên)",
-      "resource_tags_user_team": "string (Nullable - Squad quản lý)",
-      "resource_tags_user_cost_center": "string (Nullable - Mã trung tâm chi phí)"
+      "bill_billing_period_start_date": "string (Required)",
+      "bill_payer_account_id": "long (Required)",
+      "line_item_usage_account_id": "long (Required)",
+      "line_item_usage_account_name": "string (Required)",
+      "line_item_line_item_type": "string (Required)",
+      "line_item_usage_start_date": "string (Required)",
+      "line_item_usage_end_date": "string (Required)",
+      "line_item_product_code": "string (Required)",
+      "line_item_usage_type": "string (Required)",
+      "line_item_operation": "string (Required)",
+      "line_item_resource_id": "string (Nullable - ARN/ID thiết bị vật lý thật)",
+      "line_item_usage_amount": "float (Required)",
+      "pricing_unit": "string (Required)",
+      "line_item_unblended_rate": "float (Required)",
+      "line_item_unblended_cost": "float (Required)",
+      "line_item_currency_code": "string (Required)",
+      "product_product_name": "string (Required)",
+      "product_region_code": "string (Required)",
+      "product_instance_type": "string (Nullable)",
+      "resource_tags_user_team": "string (Nullable)",
+      "resource_tags_user_environment": "string (Required - Tag môi trường: prod-core, prod-payments, staging, dev, sandbox, ml-research, data-analytics)"
+      "resource_tags_user_cost_center": "string (Nullable)",
+      "resource_tags_user_owner": "string (Nullable)"
     }
   ]
 }
 ```
-
-> [!NOTE]
-> **Định dạng cấu trúc tệp tin CUR tại `s3_bucket_uri`**: CDO cam kết ghi tệp tin lên S3 dưới dạng mảng JSON chứa các bản ghi có schema sau:
-> - `line_item_resource_id` (string), `line_item_usage_type` (string), `line_item_usage_amount` (float), `pricing_unit` (string), `usage_density_24h` (float), và các tags: `resource_tags_user_environment` (string), `resource_tags_user_owner` (string), `resource_tags_user_team` (string), `resource_tags_user_cost_center` (string).
 
 ##### Request Example (Sử dụng S3 Pointer + Chạy khẩn cấp Ad-hoc)
 ```json
@@ -118,15 +130,17 @@ Hỗ trợ cơ chế **Hybrid Ingestion** và **Cờ cưỡng chế** trong cùn
   "is_ad_hoc": true,
   "aws_cost_explorer_daily": [
     {
-      "unblended_cost": 27.84,
+      "date": "2026-03-20",
+      "linked_account_id": 200000000012,
+      "linked_account_name": "staging",
+      "service": "Amazon Relational Database Service",
       "service_code": "AmazonRDS",
       "region": "us-east-1",
-      "cost_ratio_to_7d_avg": 12.4,
-      "day_of_week": 2,
-      "is_weekend": false
+      "unblended_cost": 87.46,
+      "is_estimated": false
     }
   ],
-  "s3_bucket_uri": "s3://company-cdo-telemetry/cur/2026-06-25-compressed.json.gz"
+  "s3_bucket_uri": "s3://company-cdo-telemetry/cur/2026-06-25-raw-compressed.json.gz"
 }
 ```
 
@@ -151,7 +165,6 @@ Hỗ trợ cơ chế **Hybrid Ingestion** và **Cờ cưỡng chế** trong cùn
   "created_at": "2026-06-25T10:00:00Z"
 }
 ```
-
 ---
 
 ### 5.2 Endpoint 2: `GET /v1/detect/result/{audit_id}`
@@ -483,12 +496,26 @@ Hệ thống trả về các mã lỗi HTTP chuẩn, yêu cầu CDO xử lý the
 | **`401 Unauthorized`**| `ERR_AUTH_FAILED` | Xác thực IAM SigV4 thất bại hoặc token hết hạn. | Làm mới thông tin xác thực và thử lại một lần. |
 | **`403 Forbidden`** | `ERR_CROSS_TENANT_DENIED` | Gọi API với `audit_id` hợp lệ nhưng không thuộc về `X-Tenant-Id` của Header. | Cảnh báo bảo mật hệ thống, chặn luồng xử lý. |
 | **`404 Not Found`** | `ERR_AUDIT_NOT_FOUND` | Gọi API với `audit_id` không tồn tại trên hệ thống. | Kiểm tra mã `audit_id` đầu vào, không gọi lại. |
-| **`409 Conflict`** | `ERR_DUP_IDEMPOTENCY` | Trùng khóa `X-Idempotency-Key` khi tiến trình đang chạy. | Polling chờ kết quả, không gửi request mới đè lên. |
+| **`409 Conflict`** | `ERR_DUP_IDEMPOTENCY` | Trùng khóa `X-Idempotency-Key` khi tiến trình đang chạy. | Polling chờ kết quả, không gửi request mới đè lên. Trả về mã lỗi HTTP 409 kèm theo header Retry-After: 30 để CDO Platform tự động cấu hình Worker ngủ (sleep) 30 giây trước khi thực hiện Polling lại kết quả|
 | **`422 Unprocessable Entity`** | `ERR_ROLLBACK_NOT_SUPPORTED` | Gọi Rollback cho tài nguyên không hỗ trợ hoàn tác (ví dụ: môi trường `prod` chỉ gắn tag, hoặc tài nguyên đã bị xóa vật lý). | Báo cáo SRE kiểm tra thủ công, không thử lại. |
 | **`422 Unprocessable Entity`** | `ERR_ALREADY_ROLLED_BACK` | Gọi Rollback cho tài nguyên đã được phục hồi trước đó. | Báo cáo SRE trạng thái hiện tại, tắt tiến trình. |
 | **`429 Too Many Requests`** | `ERR_RATE_LIMITED` | Vượt quá hạn mức gọi API quy định của Tenant. | Áp dụng thuật toán chờ đợi tăng dần (Exponential backoff). |
 | **`500 Internal Error`** | `ERR_LLM_TIMEOUT` | **Bedrock xử lý vượt quá 45 giây (Hard Timeout)**. | AI Engine tự hủy luồng suy luận, ghi nhận kết quả `failed` trong DB. CDO polling phát hiện mã này sẽ **lập tức chuyển sang đường dẫn Fallback (Rule-Based alert)** để cảnh báo SRE bằng quy tắc tĩnh. |
 | **`503 Unavailable`**| `ERR_SERVICE_DOWN` | Nền tảng AI bị sập hoặc Bedrock bị Throttling >60%. | Kích hoạt hệ thống cảnh báo tĩnh Fallback ngay lập tức. |
+
+### 7.1. Bổ sung các Edge Cases & Phòng Vệ Hệ Thống
+
+| HTTP Code | Internal Code | Error Scenario (Trường hợp xảy ra) | CDO Mitigation Action |
+|---|---|---|---|
+| **`400 Bad Request`** | `ERR_AD_HOC_BUDGET_EXCEEDED` | Vượt quá hạn mức 5 lần gọi quét khẩn cấp (`is_ad_hoc: true`) trong ngày của một Tenant. | Chuyển luồng sang chu kỳ Batch 24h tiêu chuẩn, cấm gọi ad-hoc. |
+| **`422 Unprocessable Entity`** | `ERR_RESOURCE_NOT_FOUND` | Gọi tác vụ Rollback/Extend nhưng tài nguyên vật lý đã bị xóa khỏi hạ tầng AWS. | Hủy bỏ lệnh đếm ngược, ghi nhận log Audit Trail trạng thái: `Resource_Deleted_External`. |
+| **`422 Unprocessable Entity`** | `ERR_STATE_CONFLICT` | Xung đột trạng thái can thiệp (Ví dụ: Kỹ sư thao tác đè lệnh lên nhau trên Dashboard). | Tải lại giao diện để cập nhật trạng thái mới nhất từ DynamoDB. |
+
+### 7.2. Quy tắc hạch toán dữ liệu tạm tính (Estimated Data Boundary)
+Khi cờ hạch toán dữ liệu vĩ mô hoặc vi mô nhận giá trị `"is_estimated": true`, AI Engine sẽ áp dụng cơ chế phòng vệ tự động:
+1. Hạ điểm tin cậy thuật toán (`confidence_score`) về mức mặc định `< 0.50`.
+2. Toàn bộ kịch bản xử lý bắt buộc phải gán nhãn `"immediate_action": "tag-for-review"` (Chế độ phòng vệ Alert-only). 
+3. Câu lệnh thực thi hạ tầng thật bắt buộc phải trả về chuỗi rỗng: `"aws_cli_command": ""`, triệt tiêu hoàn toàn khả năng can thiệp tự động nhầm lẫn khi dữ liệu chưa được AWS chốt sổ hóa đơn.
 
 ---
 

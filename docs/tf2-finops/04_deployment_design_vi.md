@@ -12,7 +12,7 @@ CDO platform sử dụng chiến lược triển khai hai lớp để phân tác
 1. **Lớp hạ tầng (AWS Resources)**: Sử dụng **Terraform (v1.5+)** để khởi tạo các tài nguyên bất biến (VPC, ECS cluster, Fargate capacity providers, DynamoDB, S3, IAM roles).
 2. **Lớp ứng dụng (ECS Services & Tasks)**: Sử dụng **Terraform ECS configuration** và **GitHub Actions (CI/CD) deployment pipelines** đối với các trạng thái ứng dụng trong cụm ECS, và cơ chế đóng gói tệp zip tiêu chuẩn để triển khai cho các hàm Lambda.
 
-Terraform sở hữu nền tảng AWS: mạng, các bucket lakehouse, siêu dữ liệu Glue/Athena, Step Functions, Lambda wrapper, các bảng DynamoDB, role IAM, ECS control plane, các Fargate capacity providers, ECR repository, nền tảng ECS Task/Task Execution roles, các điều kiện cần thiết cho load-balancer nội bộ và phân phối secrets. Trạng thái mong muốn của ECS trong thời gian chạy được quản lý thông qua cấu hình Terraform ECS và các pipeline triển khai GitHub Actions (CI/CD), do đó các định nghĩa tác vụ ứng dụng (task definitions) có thể di chuyển độc lập với các module hạ tầng trong khi vẫn phụ thuộc vào đầu ra của Terraform.
+Terraform sở hữu nền tảng AWS: mạng, các bucket lakehouse, siêu dữ liệu Glue/Athena, Step Functions, Lambda wrapper, các bảng DynamoDB, role IAM, ECS control plane, các Fargate capacity providers, ECR repository, nền tảng ECS Task/Task Execution roles, các điều kiện cần thiết cho load-balancer nội bộ và phân phối secrets. CDO sở hữu việc triển khai hạ tầng host ECS (VPC, subnets, ALB, tasks sizing, auto scaling, security groups, task IAM roles, queues, và DynamoDB state stores), trong khi AIOps sở hữu việc build container image, quản lý hợp đồng, và logic mô hình. Trạng thái mong muốn của ECS trong thời gian chạy được quản lý thông qua cấu hình Terraform ECS và các pipeline triển khai GitHub Actions (CI/CD), do đó các định nghĩa tác vụ ứng dụng (task definitions) có thể di chuyển độc lập với các module hạ tầng trong khi vẫn phụ thuộc vào đầu ra của Terraform.
 
 ### 1.2 Module structure
 
@@ -110,7 +110,7 @@ Sau mỗi lần deploy, pipeline chạy smoke test bằng dữ liệu synthetic 
 2. Chạy Lambda ingest với dữ liệu CUR/Cost Explorer synthetic.
 3. Kiểm tra dữ liệu được ghi vào S3 raw/curated zone.
 4. Kiểm tra Glue/Athena có thể query dữ liệu curated.
-5. Gọi AI Engine chạy trên ECS thông qua Internal ALB.
+5. Gọi endpoint AI Engine dùng chung `https://ai-engine.tf-2.internal/` chạy trên ECS Fargate qua Internal ALB sử dụng xác thực IAM SigV4.
 6. Kiểm tra alert routing tạo đúng payload cho Finance và Engineering.
 7. Kiểm tra containment vẫn chạy ở dry-run mode.
 8. Kiểm tra run state và audit record được ghi vào DynamoDB.
@@ -145,7 +145,7 @@ Cổng destructive-change nghiêm ngặt hơn đối với các tài nguyên có
 
 Trước khi cập nhật container trong ECS, pipeline sẽ khởi chạy một tập lệnh kiểm tra độ tương thích:
 1. Đối chiếu model version đăng ký từ AIOps với cấu hình ECS hiện tại.
-2. Kiểm tra JSON schema của API contract đầu vào và đầu ra tại endpoint `/detect` của AI Engine.
+2. Kiểm tra JSON schema của API contract đầu vào và đầu ra tại endpoint `/v1/detect` của AI Engine.
 3. Nếu schema không tương thích, quá trình build sẽ bị dừng ngay lập tức trước khi tác động vào cụm ECS, đảm bảo tính nhất quán của hệ thống.
 
 Việc kiểm tra khả năng tương thích không đánh giá chất lượng mô hình hoặc kiểm tra dữ liệu huấn luyện của AIOps. Nó chỉ xác thực hợp đồng vận hành mà CDO phụ thuộc vào: sức khỏe endpoint, request schema, response schema, các trường bắt buộc, trường phiên bản mô hình, hành vi timeout và các chế độ lỗi. Nếu AI Engine không khả dụng hoặc không tương thích, việc triển khai CDO chỉ có thể tiếp tục đối với các thay đổi hạ tầng mà không kích hoạt các đường dẫn áp dụng containment.

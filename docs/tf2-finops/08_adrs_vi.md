@@ -145,3 +145,23 @@
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
   - Fargate luôn hoạt động cho tất cả các tác vụ: Bị từ chối vì nó dẫn đến chi phí tính toán nhàn rỗi quá mức trong các đợt chạy hàng loạt lớn hoặc chạy huấn luyện lại mô hình.
   - Fargate Spot cho tất cả các tác vụ: Bị từ chối vì sự gián đoạn spot trên các tác vụ API/explainer sẽ làm gián đoạn tính khả dụng của bảng điều khiển và các SLO cảnh báo thời gian thực.
+
+---
+
+## ADR-009 - Điểm cuối AI Engine dùng chung cho Task Force (Shared Task Force AI Engine endpoint)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-24
+- **Bối cảnh (Context)**: Task Force 2 vận hành hai nền tảng FinOps CDO độc lập (CDO-01 và CDO-02) đại diện cho các đơn vị kinh doanh khác nhau. Để giảm thiểu chi phí vận hành và đơn giản hóa việc quản lý mô hình, chúng tôi cần một kiến trúc triển khai cho AIOps AI Engine để host một lần duy nhất nhưng vẫn phục vụ cả hai nền tảng CDO một cách an toàn và hiệu quả.
+- **Quyết định (Decision)**: Triển khai một điểm cuối AI Engine dùng chung duy nhất được host trên ECS Fargate trong một VPC dùng chung, có thể truy cập nội bộ thông qua `https://ai-engine.tf-2.internal/` với xác thực IAM SigV4. Sự cô lập đa người thuê (multi-tenant) được duy trì thông qua header `X-Tenant-Id` của yêu cầu để phân vùng dữ liệu và các yêu cầu.
+- **Phân chia trách nhiệm (Responsibility Split)**:
+  - **CDO** sở hữu việc triển khai hạ tầng host: Mạng VPC (subnets, route tables, VPC endpoints), bộ cân bằng tải nội bộ (Internal Application Load Balancer - ALB), cấu hình bản ghi DNS, cấu hình cụm ECS cluster, chính sách tự động mở rộng quy mô tác vụ (scaling policies), các Security Groups, các ECS Task Execution và IAM Roles, hàng đợi xử lý SQS, và kho lưu trữ trạng thái chạy/idempotency trên DynamoDB.
+  - **AIOps** sở hữu logic ứng dụng bên trong container: Mã nguồn mô hình AI, quy trình đóng gói và phát hành container image (ECR image payload), logic Phân tích Nguyên nhân Gốc rễ (RCA) và khuyến nghị khắc phục, thực thi rules engine dự phòng cục bộ, tuân thủ hợp đồng API nội bộ, và theo dõi baseline đánh giá (evaluation baseline).
+- **Hệ quả (Consequence)**:
+  - Pro: Giảm đáng kể chi phí vận hành bằng cách chỉ host một cụm ECS Fargate dùng chung duy nhất thay vì các cụm riêng biệt cho từng nền tảng CDO.
+  - Pro: Đơn giản hóa việc quản lý phát hành và cập nhật mô hình cho AIOps vì họ chỉ cần xuất bản một phiên bản duy nhất của container image.
+  - Pro: Truy cập điểm cuối trực tiếp bằng DNS nội bộ AWS (`https://ai-engine.tf-2.internal/`) đảm bảo lưu lượng truy cập không bao giờ đi qua internet công cộng, đáp ứng các NFR bảo mật.
+  - Trade-off: Yêu cầu sự phối hợp chặt chẽ giữa CDO và AIOps để cấu hình kích thước tác vụ và tự động co giãn, cũng như cấu hình nghiêm ngặt các header tenant để tránh rò rỉ dữ liệu giữa các bên.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Mỗi nền tảng CDO có một AI Engine riêng biệt (Separate AI Engine per CDO Platform): Bị từ chối do chi phí tài nguyên trùng lặp và chi phí bảo trì cao cho việc quản lý phiên bản mô hình và triển khai container.
+  - Điểm cuối HTTP công cộng với API Gateway: Bị từ chối vì xác thực dựa trên IAM SigV4 qua bộ cân bằng tải nội bộ riêng tư mang lại bảo mật truyền tải mạnh mẽ hơn và độ trễ thấp hơn mà không để lộ điểm cuối ra internet.

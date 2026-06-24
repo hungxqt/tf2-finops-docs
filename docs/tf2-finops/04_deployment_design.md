@@ -12,7 +12,7 @@ The CDO platform uses a dual-layer deployment strategy to separate infrastructur
 1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, ECS cluster, Fargate capacity providers, DynamoDB, S3, IAM roles).
 2. **Workload Layer (ECS Services & Tasks)**: Deployed using **Terraform ECS configuration** and **GitHub Actions (CI/CD) deployment pipelines**, and native zip deployment files for Lambda functions.
 
-Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda wrappers, DynamoDB tables, IAM roles, ECS control plane, Fargate capacity providers, ECR repositories, ECS Task/Task Execution roles, internal load-balancer prerequisites, and secrets plumbing. Runtime ECS desired state is managed through the Terraform ECS configuration and GitHub Actions (CI/CD) deployment pipelines, so application task definitions can move independently from infrastructure modules while still depending on Terraform outputs.
+Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda wrappers, DynamoDB tables, IAM roles, ECS control plane, Fargate capacity providers, ECR repositories, ECS Task/Task Execution roles, internal load-balancer prerequisites, and secrets plumbing. CDO owns the ECS hosting infrastructure deployment (VPC, subnets, ALB, tasks sizing, auto scaling, security groups, task IAM roles, queues, and DynamoDB state stores), while AIOps owns the container image builds, contract management, and model logic. Runtime ECS desired state is managed through the Terraform ECS configuration and GitHub Actions (CI/CD) deployment pipelines, so application task definitions can move independently from infrastructure modules while still depending on Terraform outputs.
 
 ### 1.2 Module structure
 
@@ -111,7 +111,7 @@ The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 2. Run the ingestion Lambda against synthetic CUR/Cost Explorer data.
 3. Confirm raw and curated data are written to S3.
 4. Confirm Glue/Athena can query the curated cost dataset.
-5. Call the ECS-hosted AI Engine through the Internal ALB.
+5. Call the shared ECS-hosted AI Engine endpoint `https://ai-engine.tf-2.internal/` through the Internal ALB using IAM SigV4 authentication.
 6. Confirm alert routing produces Finance/Engineering payloads.
 7. Confirm containment stays in dry-run mode unless the target is dev/sandbox.
 8. Confirm run state and audit records are written to DynamoDB.
@@ -144,7 +144,7 @@ The destructive-change gate is stricter for stateful resources. S3 buckets, Dyna
 
 Before ECS updates are allowed, a pre-deployment script runs validation checks:
 1. Compares the AIOps model version registry against the current ECS target configuration.
-2. Performs JSON schema validation on the AI Engine `/detect` request/response API contracts.
+2. Performs JSON schema validation on the AI Engine `/v1/detect` request/response API contracts.
 3. If schemas mismatch, the build fails before applying ECS changes, ensuring deployment compatibility.
 
 The compatibility check does not evaluate model quality or inspect AIOps training data. It verifies only the operational contract CDO depends on: endpoint health, request schema, response schema, required fields, model version field, timeout behavior, and failure modes. If the AI Engine is unavailable or incompatible, CDO deployment can proceed only for infrastructure changes that do not enable containment apply paths.

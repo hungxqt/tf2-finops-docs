@@ -74,6 +74,8 @@ All detected anomalies are routed directly to the squads responsible for the tar
 - **Content Focus**: Technical resource ID (ARN), service type, environment (Dev/Sandbox/Prod), tag compliance status, proposed rollback path, and a link to approve or snooze the containment action.
 - **Frequency**: Near real-time (within 30 minutes of pipeline completion).
 
+*Note on telemetry data*: The telemetry data processed for detection strictly excludes performance utilization metrics (CPU, Memory, connections). CloudWatch metrics are used solely for CDO platform operational health monitoring and dashboard rendering.
+
 ### 3.3 Example alert payload
 The Alert Routing Lambda uses a structured JSON contract. The schema below represents a typical alert payload sent to notification channels:
 
@@ -105,7 +107,7 @@ The Alert Routing Lambda uses a structured JSON contract. The schema below repre
   "containment": {
     "proposed_action": "stop_instance",
     "execution_mode": "dry-run",
-    "idempotency_key": "123456789012:2026-06-22T00:00:00Z",
+    "idempotency_key": "tenant_id:2026-06-22",
     "audit_record_uri": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
   }
 }

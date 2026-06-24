@@ -74,6 +74,8 @@ Tất cả các bất thường được phát hiện được định tuyến t
 - **Trọng tâm nội dung**: ID tài nguyên kỹ thuật (ARN), loại dịch vụ, môi trường (Dev/Sandbox/Prod), trạng thái tuân thủ tag, đường dẫn rollback được đề xuất và một liên kết để phê duyệt hoặc tạm ẩn (snooze) hành động containment.
 - **Tần suất**: Gần như thời gian thực (trong vòng 30 phút sau khi pipeline hoàn thành).
 
+*Ghi chú về dữ liệu telemetry*: Dữ liệu telemetry truyền cho AI Engine phục vụ phát hiện bất thường là dữ liệu chi phí CUR-only và loại bỏ hoàn toàn các metric hiệu năng (CPU, memory, connections). Các metric CloudWatch chỉ phục vụ cho lớp giám sát vận hành của CDO platform và hiển thị dashboard.
+
 ### 3.3 Payload cảnh báo mẫu (Example alert payload)
 Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schema dưới đây đại diện cho một payload cảnh báo điển hình được gửi đến các kênh thông báo:
 
@@ -105,7 +107,7 @@ Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schem
   "containment": {
     "proposed_action": "stop_instance",
     "execution_mode": "dry-run",
-    "idempotency_key": "123456789012:2026-06-22T00:00:00Z",
+    "idempotency_key": "tenant_id:2026-06-22",
     "audit_record_uri": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
   }
 }

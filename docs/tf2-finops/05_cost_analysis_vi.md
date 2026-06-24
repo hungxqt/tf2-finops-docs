@@ -179,6 +179,7 @@ Metric này đo lường hiệu quả chi phí của toàn bộ vòng quyết đ
 | **Monthly budget alert 70%** | `Cần bằng chứng: ngân sách capstone có nhận biết ECS × 70%` | CloudWatch alarm -> SNS Engineering | Nhóm CDO xem xét các mẫu sử dụng |
 | **Monthly budget alert 90%** | `Cần bằng chứng: ngân sách capstone có nhận biết ECS × 90%` | Alarm + email leo thang tới mentor | CDO + Mentor cùng xem xét |
 | **Monthly budget hard stop 100%** | `Cần bằng chứng: ngân sách capstone được phê duyệt` | Vô hiệu hóa scheduler và chặn các job worker task không thiết yếu | Fail-safe tự động ngăn ngừa chi phí tăng vọt |
+| **Ngân sách token Bedrock** | <50 USD/tháng (giới hạn 1.67 USD/ngày) | Các mức độ fallback: Cấp 1 (80% ngân sách ngày) hạ cấp Nova Pro sang Nova Lite; Cấp 2 (100% ngân sách ngày) hạ cấp về Rules Engine; Cấp 3 (120% ngân sách tháng) tạm dừng xử lý. | Đồng quản trị CDO + AIOps |
 | **Per-tenant S3 quota** | 100 GB/tenant curated data | S3 bucket quota + alarm | Ngăn ngừa bùng nổ dữ liệu của một tenant duy nhất |
 | **Athena query daily limit** | 200 GB scanned/ngày | Service Quotas + alarm | Giới hạn chi phí truy vấn ad-hoc |
 | **Lambda concurrent execution** | 10 concurrent | Reserved concurrency limit | Ngăn ngừa lambda storm |
@@ -193,6 +194,8 @@ Metric này đo lường hiệu quả chi phí của toàn bộ vòng quyết đ
 - Top 5 nhân tố thúc đẩy chi phí (service breakdown, bao gồm ECS/Fargate, ALB, VPC endpoints, CloudWatch, Athena)
 - % sử dụng ngân sách
 - Chi phí thời gian chạy AI được host tách biệt với chi phí phát triển mô hình của AIOps
+
+*Ghi chú về metric hiệu năng: Các metric hiệu năng (CPU, Memory, database connections, SQS backlogs) được thu thập nghiêm ngặt chỉ nhằm mục đích giám sát sức khỏe vận hành của CDO platform (CloudWatch Container Insights, alarm và Grafana) và không bao giờ được gửi sang AI Engine để phát hiện bất thường.*
 
 ---
 
