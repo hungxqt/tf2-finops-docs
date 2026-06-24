@@ -67,7 +67,7 @@ graph TB
         S3Dashboard[S3 Static Dashboard Assets]
         CloudFront[CloudFront HTTPS Ingress]
         Cognito[Cognito User Pool & Hosted UI]
-        LambdaEdge[Lambda@Edge Auth Validator]
+        LambdaEdge["Lambda@Edge Auth Validator"]
     end
 
     %% Ingestion flows
@@ -271,7 +271,7 @@ graph TB
         CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
         CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
-        LambdaEdge[Lambda@Edge Auth Validator] -->|Validate cookie JWT| CloudFront
+        LambdaEdge["Lambda@Edge Auth Validator"] -->|Validate cookie JWT| CloudFront
     end
 ```
 
