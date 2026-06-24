@@ -31,7 +31,9 @@ Cấu trúc thư mục mã nguồn được phân chia rõ ràng giữa các mod
 │   │   ├── glue-catalog/         # Khởi tạo Glue databases và tables
 │   │   ├── step-functions/       # Định nghĩa các trạng thái workflow của Step Functions
 │   │   ├── lambdas/              # Các mã nguồn Lambda (CUR puller, routing, containment)
-│   │   └── dynamodb/             # Bảng DynamoDB lưu run state, idempotency, và audit logs
+│   │   ├── dynamodb/             # Bảng DynamoDB lưu run state, idempotency, và audit logs
+│   │   ├── dashboard/            # Bản phân phối CloudFront, bucket lưu trữ tĩnh S3 với OAC, và Lambda@Edge xác thực viewer-request
+│   │   └── cognito/              # Cognito User Pool, Client, các Group (finance-readonly, engineering-operator, cdo-admin), Hosted UI
 │   └── environments/
 │       ├── sandbox/              # File biến cấu hình sandbox (.tfvars)
 │       ├── staging/              # File biến cấu hình staging
@@ -60,6 +62,8 @@ Pipeline chịu trách nhiệm cho các thành phần sau:
 * S3 raw/curated zone, Glue Data Catalog và Athena query resources.
 * DynamoDB lưu run state và audit log.
 * Private API Gateway, các hàm API/Worker Lambda container, ECR, SQS queues, và các role execution Lambda.
+* Cấu hình Cognito User Pool, User Groups, và App Client.
+* S3 dashboard bucket lưu trữ tĩnh, phân phối CloudFront, Origin Access Control (OAC), và các hàm Lambda@Edge xác thực viewer-request.
 * IAM roles và cấu hình theo từng môi trường.
 
 ```mermaid
@@ -138,7 +142,7 @@ Thiết kế CI/CD này giúp hạ tầng của TF2 FinOps Watch được triể
 
 Bên cạnh việc quét mã nguồn tĩnh, các kho lưu trữ ECR được bật cấu hình **Scan on Push**. Mọi image do AIOps đẩy lên sẽ được tự động quét lỗi bảo mật. Việc deploy container sẽ bị chặn lại nếu image chứa các lỗ hổng bảo mật nghiêm trọng. Pipeline CI/CD xác thực với tài khoản AWS thông qua giao thức **OpenID Connect (OIDC)**, loại bỏ việc lưu trữ cố định các AWS Access Keys trên GitHub.
 
-Cổng bảo mật cũng kiểm tra các plan Terraform, cấu hình triển khai Lambda, dependency của Lambda và image container. Các bước kiểm tra bắt buộc bao gồm `terraform fmt`, `terraform validate`, TFLint, quét IaC bằng Checkov hoặc tương đương, quét image bằng Trivy, quét secret bằng Gitleaks và kiểm tra chính sách ngăn chặn việc expose AI Engine ra công cộng. Bất kỳ phát hiện CRITICAL nào cũng chặn triển khai trừ khi có ngoại lệ capstone được ghi chép và phê duyệt.
+Cổng bảo mật cũng kiểm tra các plan Terraform, cấu hình triển khai Lambda, dependency của Lambda và image container. Các bước kiểm tra bắt buộc bao gồm `terraform fmt`, `terraform validate`, TFLint, quét IaC bằng Checkov hoặc tương đương, quét image bằng Trivy, quét secret bằng Gitleaks và kiểm tra chính sách ngăn chặn việc expose AI Engine ra công cộng. Cổng này cũng thực thi kiểm tra các cấu hình Cognito (bao gồm thời gian tồn tại của cookie JWT, cấu hình phiên làm việc bảo mật, và quyền miền Hosted UI) cũng như mã nguồn Lambda@Edge để đảm bảo toàn bộ lưu lượng truy cập dashboard được xác thực. Bất kỳ phát hiện CRITICAL nào cũng chặn triển khai trừ khi có ngoại lệ capstone được ghi chép và phê duyệt.
 
 ### 3.2 Destructive-change review
 

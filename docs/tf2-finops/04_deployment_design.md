@@ -30,7 +30,9 @@ The repository is organized to separate infrastructure modules from environmenta
 │   │   ├── glue-catalog/         # Glue databases and tables
 │   │   ├── step-functions/       # Step Functions workflow definitions
 │   │   ├── lambdas/              # Lambda functions (CUR puller, routing, containment)
-│   │   └── dynamodb/             # Run state, idempotency, and audit tables
+│   │   ├── dynamodb/             # Run state, idempotency, and audit tables
+│   │   ├── dashboard/            # CloudFront distribution, S3 static hosting bucket with OAC, and Lambda@Edge viewer-request auth
+│   │   └── cognito/              # Cognito User Pool, Client, Groups (finance-readonly, engineering-operator, cdo-admin), Hosted UI
 │   └── environments/
 │       ├── sandbox/              # Sandbox environment variables (.tfvars)
 │       ├── staging/              # Staging environment variables
@@ -59,6 +61,8 @@ The pipeline manages infrastructure and platform changes for:
 * S3 raw/curated zones, Glue Data Catalog, Athena query resources.
 * DynamoDB run state and audit tables.
 * Private API Gateway, API/Worker Lambda container functions, ECR, SQS queues, and Lambda execution roles.
+* Cognito User Pool, User Groups, and App Client configurations.
+* S3 dashboard static hosting bucket, CloudFront distribution, Origin Access Control (OAC), and Lambda@Edge viewer-request auth functions.
 * IAM roles and environment-specific configuration required by the CDO platform.
 
 ```mermaid
@@ -137,7 +141,7 @@ A deployment is accepted only when the workflow passes validation, Terraform app
 
 In addition to static code analysis, ECR repositories are configured with **Scan on Push** enabled. Any image uploaded by AIOps is automatically scanned. Container deployment is blocked if the image contains severe CVEs. CI pipelines authenticate to AWS using **OpenID Connect (OIDC)**, eliminating the need to store static AWS Access Keys in GitHub.
 
-The security gate also checks Terraform plans, Lambda deployment configurations, Lambda dependencies, and container images. Required checks include `terraform fmt`, `terraform validate`, TFLint, Checkov or equivalent IaC scanning, Trivy image scan, Gitleaks secret scan, and policy checks that prevent public AI Engine exposure. Any CRITICAL finding blocks deployment unless a documented capstone exception is approved.
+The security gate also checks Terraform plans, Lambda deployment configurations, Lambda dependencies, and container images. Required checks include `terraform fmt`, `terraform validate`, TFLint, Checkov or equivalent IaC scanning, Trivy image scan, Gitleaks secret scan, and policy checks that prevent public AI Engine exposure. It also enforces validation of Cognito configurations (including JWT cookie lifetimes, secure session configurations, and Hosted UI domain permissions) and Lambda@Edge code to ensure all dashboard traffic is authenticated. Any CRITICAL finding blocks deployment unless a documented capstone exception is approved.
 
 ### 3.2 Destructive-change review
 

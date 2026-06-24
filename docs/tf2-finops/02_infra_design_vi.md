@@ -66,6 +66,8 @@ graph TB
         Email[SES Email Target]
         S3Dashboard[S3 Static Dashboard Assets]
         CloudFront[CloudFront HTTPS Ingress]
+        Cognito[Cognito User Pool & Hosted UI]
+        LambdaEdge[Lambda@Edge Auth Validator]
     end
 
     %% Ingestion flows
@@ -99,8 +101,12 @@ graph TB
     AILambdaAPI -->|10. Query results| DDB
     
     %% Dashboard presentation
+    CloudFront -->|Redirect for login| Cognito
+    Cognito -->|Auth Code & Cookie| CloudFront
+    CloudFront -->|Forward request| LambdaEdge
+    LambdaEdge -->|Validate cookie JWT| CloudFront
     CloudFront -->|Serve Static Files & JSON| FinanceUsers[Finance Users]
-    S3Dashboard -->|Deliver Assets| CloudFront
+    S3Dashboard -->|Deliver Assets via OAC| CloudFront
     SF -->|Write precomputed JSON summaries| S3Dashboard
     SF -->|Write run summaries| DDB
 ```
@@ -262,8 +268,10 @@ graph TB
     subgraph "Channels & Presentation"
         AlertLambda -->|Slack Alert| Slack[Slack Channels]
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
-        CloudFront[CloudFront HTTPS] -->|Serve UI| S3Dashboard2[S3 Static Dashboard]
+        CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
+        CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
+        LambdaEdge[Lambda@Edge Auth Validator] -->|Validate cookie JWT| CloudFront
     end
 ```
 
@@ -293,8 +301,10 @@ Các thành phần hạ tầng sau đây được triển khai tại vùng `ap-s
 | Kho lưu trữ container (Container Registry) | Amazon ECR | Lưu trữ các hình ảnh container Docker được gắn phiên bản cho các mô hình của AIOps, được tham chiếu trong triển khai bằng mã băm digest hình ảnh không thay đổi. | 0,10 USD mỗi GB/tháng (500 MB đầu tiên miễn phí). |
 | Nhà cung cấp bí mật (Secrets Provider) | Secrets Manager | Quản lý an toàn các khóa API, thông tin xác thực cơ sở dữ liệu và Slack webhook, được truy cập động qua AWS SDK bên trong các hàm Lambda. | 0,40 USD mỗi bí mật/tháng + 0,05 USD cho mỗi 10.000 yêu cầu. |
 | Private VPC Traffic | VPC Endpoints | Cho phép truy cập an toàn, riêng tư vào các dịch vụ AWS (ECR, S3, DynamoDB, KMS, Logs, Secrets Manager) từ bên trong các subnet VPC riêng tư. | ~7,20 USD trên mỗi endpoint/tháng cho mỗi AZ + phí xử lý dữ liệu. |
-| Bảng điều khiển Tài chính (Finance Dashboard) | Amazon S3 + CloudFront | Bảng điều khiển web tĩnh nội bộ nhẹ được lưu trữ dưới dạng tài sản tĩnh trong Amazon S3 và phân phối qua Amazon CloudFront. Bảng điều khiển đọc các bản tóm tắt thân thiện với tài chính được tính toán trước từ các đối tượng S3 JSON hoặc bản ghi DynamoDB. | Chi phí lưu trữ S3 và phí yêu cầu HTTPS/truyền dữ liệu CloudFront (thường dưới 5 USD/tháng). QuickSight được giữ lại như một tùy chọn BI trong tương lai. |
-| Kênh cảnh báo (Alert Channels) | Amazon SNS / Slack API | Cung cấp các đường định tuyến riêng biệt cho cảnh báo (cảnh báo Tài chính qua Slack/Email, cảnh báo Kỹ thuật qua Slack/Jira). | SNS miễn phí tới 100 nghìn thông báo email/tháng; Slack API miễn phí. |
+| Bảng điều khiển Tài chính (Finance Dashboard) | Amazon S3 + CloudFront | Bảng điều khiển web tĩnh nội bộ nhẹ được lưu trữ dưới dạng tài sản tĩnh trong S3 và phân phối qua CloudFront. Tài sản được bảo vệ bằng OAC (Origin Access Control) và được xác thực bởi Lambda@Edge. | Phí CloudFront truyền dữ liệu/request, lưu trữ S3, và OAC (thường dưới 3 USD/tháng). |
+| Dashboard Auth Gateway | Amazon Cognito | Triển khai Cognito User Pool, Hosted UI, và các nhóm (finops-finance-readonly, finops-engineering-operator, finops-cdo-admin) để xác thực và ủy quyền người dùng bảng điều khiển. | Tính năng User Pool miễn phí tối đa 50.000 người dùng hoạt động hàng tháng (MAUs). |
+| Viewer-Request Auth Gate | Lambda@Edge | Hàm xử lý viewer-request kiểm tra secure HTTP-only cookies và xác thực chữ ký JWT đối với Cognito JWKS trước khi chuyển tiếp yêu cầu đến bucket S3 riêng tư. | ~0,60 USD trên mỗi triệu lượt gọi + chi phí thời gian thực thi. |
+| Kênh cảnh báo (Alert Channels) | Amazon SNS / Slack API | Cung cấp các đường định tuyến riêng biệt cho cảnh báo (cảnh báo Tá chính qua Slack/Email, cảnh báo Kỹ thuật qua Slack/Jira). | SNS miễn phí tới 100 nghìn thông báo email/tháng; Slack API miễn phí. |
 | Tác nhân thực thi containment (Containment Worker) | AWS Lambda | Giả lập vai trò (assume role) trong các tài khoản thành viên để áp dụng nhãn (tag) hoặc tắt các tài nguyên dev/sandbox, thực thi nghiêm ngặt trong các chế độ dry-run hoặc apply. | Thanh toán theo mức sử dụng. |
 
 > [!NOTE]

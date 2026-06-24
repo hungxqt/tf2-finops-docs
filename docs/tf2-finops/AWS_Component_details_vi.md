@@ -69,6 +69,8 @@ Tài liệu này ghi chép các hợp phần thuộc sở hữu của CDO, bao g
 | 28 | Kho lưu trữ ECR (ECR Repository) | Amazon ECR | Lưu trữ các hình ảnh container AI Engine của AIOps được triển khai bằng cách ghim digest (digest pinning). |
 | 29 | Hàng đợi SQS/DLQ của AI Engine | Amazon SQS | Quản lý các hàng đợi tách rời: hàng đợi yêu cầu và hàng đợi thư rác (DLQ). |
 | 30 | Các kho lưu trữ DynamoDB của AI Engine | Amazon DynamoDB | Các bảng trạng thái bền vững cho kết quả thực thi, tính không lặp lại (idempotency) và bất thường. |
+| 31 | Dashboard Auth Gateway (Cổng xác thực Dashboard) | Amazon Cognito | Xác thực người dùng dashboard và cung cấp phân quyền dựa trên nhóm (Finance chỉ đọc so với các điều hành viên Engineering). |
+| 32 | Viewer-Request Auth Gate (Cổng xác thực yêu cầu Viewer) | Lambda@Edge | Trình xử lý viewer-request kiểm tra các cookie bảo mật HTTP-only và xác thực chữ ký JWT với Cognito JWKS trước khi chuyển tiếp yêu cầu đến bucket S3 riêng tư. |
 
 ## Các Hợp phần Loại trừ
 
@@ -878,6 +880,42 @@ Lưu trữ các khóa khóa chạy, bản ghi không lặp lại, kết quả ph
 ### Đầu ra (Output)
 
 - Truy vấn độ trễ thấp phục vụ việc thăm dò của Step Functions và dashboard S3 + CloudFront.
+
+## 31. Amazon Cognito
+
+### Vai trò (Role)
+
+Xác thực người dùng và cung cấp thư mục người dùng.
+
+### Mục đích (Purpose)
+
+Xác thực người dùng dashboard thông qua Cognito Hosted UI an toàn (Luồng mã cấp quyền với PKCE - Authorization Code Flow with PKCE) và xác định các nhóm người dùng (`finops-finance-readonly`, `finops-engineering-operator`, `finops-cdo-admin`) để ủy quyền cho các thao tác trên dashboard.
+
+### Đầu vào (Input)
+
+- Thông tin đăng nhập tương tác của người dùng được nhập trong Cognito Hosted UI.
+
+### Đầu ra (Output)
+
+- Các mã JWT ID, Access, và Refresh chứa thông tin xác nhận nhóm (group claims), được lưu trữ dưới dạng cookie bảo mật.
+
+## 32. Lambda@Edge Viewer Request Auth
+
+### Vai trò (Role)
+
+Bộ lọc ủy quyền ở cấp độ Edge (Edge-level authorization filter).
+
+### Mục đích (Purpose)
+
+Chặn các yêu cầu dashboard tại sự kiện viewer request của CloudFront, phân tích cú pháp các cookie JWT, kiểm tra chữ ký với Cognito JWKS, và xác minh thời gian hết hạn của phiên làm việc. Từ chối truy cập hoặc chuyển hướng đăng nhập nếu phiên làm việc không hợp lệ.
+
+### Đầu vào (Input)
+
+- Các cookie và tiêu đề viewer request gửi đến.
+
+### Đầu ra (Output)
+
+- Chuyển tiếp yêu cầu đến origin S3 riêng tư với xác thực OAC (nếu được ủy quyền) hoặc chuyển hướng 302 đến Cognito Hosted UI.
 
 ## Luồng Dữ liệu ở Cấp độ Hợp đồng (Contract-Level Data Flows)
 

@@ -34,6 +34,8 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Observability - CloudWatch & X-Ray** | Logs, metrics, trace analyzer, and dashboard charges | Lambda logs, Step Functions traces, API Gateway logs, queue metrics, and platform dashboards | Shared and variable; can become a top cost driver. |
 | **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for AI Engine API Lambda | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
 | **Dashboard - S3 + CloudFront** | S3 & CloudFront pricing | Finance stakeholder dashboard access | S3 storage and CloudFront HTTPS request/data transfer fees. |
+| **Amazon Cognito (Auth)** | Free tier up to 50,000 MAUs; then $0.0055/MAU | User directory and Hosted UI auth gateway for dashboard access | Shared platform cost; free for capstone scale. |
+| **Lambda@Edge Viewer-Request Auth** | $0.60 per 1 million requests + duration ($0.0000500125/GB-sec) | Edge validation of JWT signatures against Cognito JWKS | Variable dashboard request cost; very low for target user base. |
 | **Alerting - SNS/SES/Slack integration** | Request/message charges | Finance and Engineering alert routes | Variable but expected low. |
 | **Total CDO platform forecast** | Mixed fixed and variable | CDO infra plus CDO-hosted AI Engine runtime | `Evidence needed: recalculated after Lambda memory size, endpoint count, and run volume are finalized`. |
 
@@ -131,6 +133,8 @@ This section must be filled only after running the platform with tagged AWS reso
 | VPC Endpoints | `Evidence needed: endpoint count × hourly charge` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Private AWS service access. |
 | CloudWatch/X-Ray | `Evidence needed: log volume and metric count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Lambda, Step Functions, SQS, API Gateway. |
 | KMS/Secrets Manager | `Evidence needed: CMK and secret count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Data, audit, AI Engine secret, webhooks. |
+| Amazon Cognito | Free tier up to 50,000 MAUs | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | User pool and login authentication for the dashboard. |
+| Lambda@Edge Viewer-Request Auth | `Evidence needed: request count and execution duration` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Edge authorization filtering for S3/CloudFront. |
 | **Total** | `Evidence needed: forecast total` | `Evidence needed: actual total` | `Evidence needed` | Do not publish a final number until measured. |
 
 **Measurement methodology**:

@@ -28,6 +28,18 @@ A lightweight internal web dashboard hosted as static assets in Amazon S3 and de
 
 QuickSight is retained as a future BI option for larger Finance teams or executive reporting, but it is not the default MVP dashboard because the capstone prioritizes low recurring cost and no per-reader BI seat fees.
 
+### Cognito Access Control
+Access to the S3 + CloudFront dashboard is strictly controlled and authenticated via Amazon Cognito:
+- **Authentication**: Users must log in via the Cognito Hosted UI using the secure Authorization Code Flow.
+- **Session Management**: Session tokens (ID, access, and refresh tokens) are exchanged and stored as secure cookies (HTTPS-only, SameSite=Strict, Secure flags) with a short lifetime.
+- **Private S3 Origin**: The S3 bucket hosting static assets is completely private. Direct public access is blocked using Origin Access Control (OAC), so the dashboard can only be reached through CloudFront.
+- **Viewer-Request Authorization**: A Lambda@Edge viewer-request function intercepts all requests to CloudFront. It validates Cognito JWT tokens before serving static files or JSON summaries.
+- **Group-Based Authorization**:
+  - `finops-finance-readonly`: Members can view spend trends, anomaly summaries, Finance alerts, and audit links. Finance users are strictly restricted to read-only views and must never see raw rollback scripts, CLI commands, or execution buttons.
+  - `finops-engineering-operator`: Members can view technical anomaly detail, access execution role contexts, and use approved Extend/Snooze or Rollback/Restore controls.
+  - `finops-cdo-admin`: Members have full administrative access to manage user pools, groups, dashboard access policies, synthetic-data visibility, and operator settings.
+
+
 ---
 
 ## 2. Dashboard views
@@ -174,7 +186,6 @@ To ensure the CDO platform remains fully finance-readable and requires no SQL kn
 
 ## 5. Open questions
 
-- [ ] **Cognito Integration vs. Basic Auth**: Should access control to the S3 + CloudFront static site be managed via AWS Cognito OIDC integration or a lightweight CloudFront Lambda@Edge Basic Auth mechanism?
 - [ ] **Slack Webhook Rate Limiting**: What is the maximum number of daily slack messages allowed per squad channel to prevent alert fatigue?
 - [ ] **Manual Approval UI**: For non-production apply-mode containment actions that require human-in-the-loop sign-off, should the approval buttons be hosted on the dashboard itself or embedded directly in the Slack interactive message?
 - [ ] **QuickSight BI Integration Roadmap**: At what point in the platform scale-up (e.g., >10 Finance users or >100 AWS accounts) should the company transition from the S3 + CloudFront static dashboard to Amazon QuickSight Enterprise?

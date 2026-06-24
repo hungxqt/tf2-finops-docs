@@ -120,6 +120,18 @@ Các hành động containment tại các tài khoản thành viên được kí
 
 Mỗi chính sách tin cậy role chéo tài khoản đều bao gồm một ID bên ngoài (external ID), điều kiện tài khoản nguồn và yêu cầu gắn thẻ session để nhật ký kiểm toán có thể ánh xạ từng hành động trở lại lượt chạy CDO. Các role trên production bao gồm các lệnh deny rõ ràng đối với việc chấm dứt tài nguyên, các hoạt động lưu trữ mang tính phá hủy và đột biến IAM. Các role trên non-production có thể cho phép các hành động containment hạn chế chỉ khi yêu cầu đi vào bao gồm một `execution_mode` được phê duyệt, tag môi trường, ID bất thường và ID quyết định chính sách. Nếu bất kỳ trường nào trong số đó bị thiếu, containment worker sẽ ghi lại sự kiện kiểm toán bị từ chối và thoát ra mà không thử lại.
 
+### 2.4 Xác thực & Ủy quyền Bảng điều khiển (Cognito)
+
+Kiểm soát truy cập cho Bảng điều khiển Tài chính tĩnh S3 + CloudFront được thực thi thông qua tích hợp với Amazon Cognito và ủy quyền viewer-request của Lambda@Edge:
+- **Bảo vệ OAC của CloudFront**: Bucket S3 chứa các tài nguyên bảng điều khiển hoàn toàn riêng tư. Truy cập công cộng trực tiếp bị chặn bằng Origin Access Control (OAC). Đường dẫn truy cập duy nhất là qua phân phối CloudFront, nơi thực thi xác thực.
+- **Hosted UI Code Flow**: Người dùng truy cập các endpoint Hosted UI qua các redirect của CloudFront. Quá trình xác thực được xử lý bằng Authorization Code Flow với PKCE. Cognito cấp các mã JWT token (ID, Access, và Refresh) sau khi đăng nhập thành công.
+- **Lưu trữ Token an toàn**: Ứng dụng trao đổi authorization code lấy token, lưu trữ chúng dưới dạng secure cookies (các cờ `Secure`, `HttpOnly`, `SameSite=Strict`) với vòng đời phiên ngắn 1 giờ.
+- **Xác thực Token bằng Lambda@Edge**: Hàm Lambda@Edge viewer-request của CloudFront chặn mọi yêu cầu, phân tách JWT cookie, kiểm tra chữ ký đối với endpoint JWKS của Cognito và xác thực các claim (hết hạn, audience, issuer). Token không hợp lệ hoặc hết hạn sẽ kích hoạt tự động redirect về trang đăng nhập Hosted UI.
+- **Chính sách truy cập theo nhóm (Group-Based Access Policies)**:
+  - `finops-finance-readonly`: Thành viên được ủy quyền xem trực quan xu hướng chi tiêu, tóm tắt bất thường và các bản ghi lịch sử kiểm toán. Giao diện UI chặn hiển thị các lệnh CLI, rollback script thô hoặc các nút kích hoạt thực thi containment.
+  - `finops-engineering-operator`: Thành viên được ủy quyền truy cập chi tiết kỹ thuật, xem các lệnh thực thi `rollback_script_encapsulated` thô, và kích hoạt các nút điều khiển gia hạn (`POST /v1/action/extend`) và rollback (`POST /v1/action/rollback`) đã được phê duyệt.
+  - `finops-cdo-admin`: Thành viên được cấp quyền quản lý chính sách truy cập, điều chỉnh phân bổ người dùng vào nhóm và cấu hình các cờ kiểm soát nền tảng toàn cục.
+
 ## 3. Secrets Management
 
 ### 3.1 Secrets Inventory
@@ -234,7 +246,7 @@ Mọi hành động kiểm soát do CDO platform thực hiện đều được g
 }
 ```
 
-Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại DynamoDB và S3, với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Telemetry gửi tới AI Engine để phát hiện bất thường là dữ liệu chi phí CUR-only và tuyệt đối không bao gồm các tín hiệu hiệu năng CloudWatch. Hệ thống log và metrics của CloudWatch chỉ phục vụ cho việc giám sát vận hành của CDO và cảnh báo SRE.
+Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại DynamoDB và S3, với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Telemetry gửi tới AI Engine để phát hiện bất thường là dữ liệu chi phí CUR-only và tuyệt đối không bao gồm các tín hiệu hiệu năng CloudWatch. Hệ thống log và metrics của CloudWatch chỉ phục vụ cho việc giám sát vận hành của CDO và cảnh báo SRE. Mọi hoạt động xác thực bảng điều khiển (đăng nhập thành công, đăng xuất, làm mới phiên hết hạn), lỗi xác thực (đăng nhập thất bại, chữ ký token không hợp lệ, vi phạm cửa sổ replay) và các nỗ lực truy cập nhóm không được ủy quyền (như người dùng Finance readonly cố gắng gọi một hành động của operator) đều được ghi nhật ký ngay lập tức vào CloudWatch Logs và truyền về S3 để lưu giữ lịch sử kiểm toán.
 
 ### 5.2 Storage + Retention
 

@@ -120,6 +120,18 @@ Containment actions in member accounts are triggered via cross-account IAM Role 
 
 Every cross-account role trust policy includes an external ID, source account condition, and session tagging requirement so audit logs can map each action back to a CDO run. Production roles include explicit deny statements for termination, destructive storage operations, and IAM mutation. Non-production roles may allow limited containment actions only when the incoming request includes an approved `execution_mode`, environment tag, anomaly ID, and policy decision ID. If any of those fields are missing, the containment worker records a denied audit event and exits without retrying.
 
+### 2.4 Dashboard Authentication & Authorization (Cognito)
+
+Access control for the static S3 + CloudFront Finance Dashboard is enforced through integration with Amazon Cognito and Lambda@Edge viewer-request authorization:
+- **CloudFront OAC Protection**: The S3 bucket containing dashboard assets is completely private. Direct public access is blocked using Origin Access Control (OAC). The only access path is through the CloudFront distribution, which enforces authentication.
+- **Hosted UI Code Flow**: Users access the Hosted UI endpoints via CloudFront redirects. Authentication is processed using the Authorization Code Flow with PKCE. Cognito issues ID, Access, and Refresh JWT tokens upon successful login.
+- **Secure Token Storage**: The application exchanges the authorization code for tokens, storing them as secure cookies (`Secure`, `HttpOnly`, `SameSite=Strict` flags) with a short 1-hour session lifetime.
+- **Lambda@Edge Token Validation**: The CloudFront viewer-request Lambda@Edge function intercepts all requests, parses JWT cookies, checks signatures against the Cognito JWKS endpoint, and validates claims (expiration, audience, issuer). Invalid or expired tokens trigger automatic redirects to the Hosted UI login page.
+- **Group-Based Access Policies**:
+  - `finops-finance-readonly`: Members are authorized for read-only visualization of spend trends, anomaly summaries, and audit trail records. The UI blocks rendering of CLI commands, raw rollback scripts, or containment execution triggers.
+  - `finops-engineering-operator`: Members are authorized to access technical detail, view the raw `rollback_script_encapsulated` execution commands, and trigger approved snoozing (`POST /v1/action/extend`) and rollback (`POST /v1/action/rollback`) controls.
+  - `finops-cdo-admin`: Members are granted permissions to manage access policies, adjust user group assignments, and configure global platform control flags.
+
 ## 3. Secrets Management
 
 ### 3.1 Secrets Inventory
@@ -234,7 +246,7 @@ Every action taken by the CDO platform is documented. For containment actions, t
 }
 ```
 
-The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in DynamoDB and S3, with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still produce audit records because Finance needs to see what the platform would have done and why the action remained safe. AI model training datasets are not logged by CDO; CDO logs only invocation metadata, returned decision fields, and operational evidence references needed for alerting and containment. Telemetry data sent to the AI Engine for detection is strictly CUR-only and excludes CloudWatch performance utilization signals. CloudWatch logs and metrics are used solely for CDO platform operational observability and SRE alerts.
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in DynamoDB and S3, with the integrity hash calculated as `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Telemetry gửi tới AI Engine để phát hiện bất thường là dữ liệu chi phí CUR-only và tuyệt đối không bao gồm các tín hiệu hiệu năng CloudWatch. Hệ thống log và metrics của CloudWatch chỉ phục vụ cho việc giám sát vận hành của CDO và cảnh báo SRE. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
 
 ### 5.2 Storage + Retention
 

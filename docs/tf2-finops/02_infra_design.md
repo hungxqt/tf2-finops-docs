@@ -66,6 +66,8 @@ graph TB
         Email[SES Email Target]
         S3Dashboard[S3 Static Dashboard Assets]
         CloudFront[CloudFront HTTPS Ingress]
+        Cognito[Cognito User Pool & Hosted UI]
+        LambdaEdge[Lambda@Edge Auth Validator]
     end
 
     %% Ingestion flows
@@ -99,8 +101,12 @@ graph TB
     AILambdaAPI -->|10. Query results| DDB
     
     %% Dashboard presentation
+    CloudFront -->|Redirect for login| Cognito
+    Cognito -->|Auth Code & Cookie| CloudFront
+    CloudFront -->|Forward request| LambdaEdge
+    LambdaEdge -->|Validate cookie JWT| CloudFront
     CloudFront -->|Serve Static Files & JSON| FinanceUsers[Finance Users]
-    S3Dashboard -->|Deliver Assets| CloudFront
+    S3Dashboard -->|Deliver Assets via OAC| CloudFront
     SF -->|Write precomputed JSON summaries| S3Dashboard
     SF -->|Write run summaries| DDB
 ```
@@ -262,8 +268,10 @@ graph TB
     subgraph "Channels & Presentation"
         AlertLambda -->|Slack Alert| Slack[Slack Channels]
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
-        CloudFront[CloudFront HTTPS] -->|Serve UI| S3Dashboard2[S3 Static Dashboard]
+        CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
+        CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
+        LambdaEdge[Lambda@Edge Auth Validator] -->|Validate cookie JWT| CloudFront
     end
 ```
 
@@ -293,7 +301,9 @@ The following infrastructure components are deployed in `ap-southeast-1` to oper
 | Container Registry | Amazon ECR | Hosts versioned Docker container images for AIOps models, referenced in deployment by immutable image digest hashes. | $0.10 per GB/month (first 500 MB free). |
 | Secrets Provider | Secrets Manager | Securely manages API keys, DB credentials, and Slack webhooks, accessed dynamically via the AWS SDK inside Lambda functions. | $0.40 per secret/month + $0.05 per 10,000 requests. |
 | Private VPC Traffic | VPC Endpoints | Enables secure, private access to AWS services (ECR, S3, DynamoDB, KMS, Logs, Secrets Manager) from within private VPC subnets. | ~$7.20 per endpoint/month per AZ + data processing charges. |
-| Finance Dashboard | Amazon S3 + CloudFront | A lightweight internal web dashboard hosted as static assets in Amazon S3 and delivered through Amazon CloudFront. The dashboard reads precomputed finance-readable summaries from S3 JSON objects or DynamoDB records. | S3 storage and CloudFront HTTPS request/data transfer fees (typically <$5/month). QuickSight is retained only as a future BI option. |
+| Finance Dashboard | Amazon S3 + CloudFront | A lightweight internal web dashboard hosted as static assets in S3 and delivered through CloudFront. Assets are secured via OAC (Origin Access Control) and verified by Lambda@Edge. | CloudFront egress/request fees, S3 storage, and OAC (typically <$3/month). |
+| Dashboard Auth Gateway | Amazon Cognito | Deploys Cognito User Pool, Hosted UI, and groups (finops-finance-readonly, finops-engineering-operator, finops-cdo-admin) to authenticate and authorize dashboard users. | User Pool feature is free up to 50,000 monthly active users (MAUs). |
+| Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. | ~$0.60 per million invocations + execution duration charges. |
 | Alert Channels | Amazon SNS / Slack API | Delivers separate routing paths for alerts (Finance alerts via Slack/Email, Eng alerts via Slack/Jira). | SNS is free up to 100k email notifications/month; Slack API is free. |
 | Containment Worker | AWS Lambda | Assumes roles in member accounts to apply tags or shut down dev/sandbox resources, strictly executing in `dry-run` or `apply` modes. | Pay-per-use. |
 

@@ -55,10 +55,10 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
   - If Bedrock times out (45s Bedrock limit, returning `ERR_LLM_TIMEOUT`) or the service is down (`ERR_SERVICE_DOWN`), the pipeline immediately falls back to static rule execution and alerts SRE.
   - Check DynamoDB anomaly records table to verify the record has been written with a cryptographic audit trail chain link calculated as `sha256(current_payload + previous_hash)`.
 
-### Step 5 - Update CDO dashboard
-- **Action**: The aggregation Lambda is triggered to rebuild the dashboard assets.
-- **Internal Action**: Aggregations are compiled into static S3 JSON files, and a CloudFront cache invalidation is executed.
-- **Verification**: Open the dashboard URL in a browser and verify that the daily spend chart displays the anomalous cost peak overlay.
+### Step 5 - Authenticate and access CDO dashboard (Cognito Hosted UI)
+- **Action**: Open the dashboard CloudFront URL in a browser. Verify you are automatically redirected to the Cognito Hosted UI login screen. Log in using a Finance user account (associated with the `finops-finance-readonly` group).
+- **Internal Action**: CloudFront forwards the request after the Lambda@Edge auth layer intercepts the request, validates the Cognito JWT token, and passes the request to the private S3 bucket. The dashboard parses the JWT group claim.
+- **Verification**: Confirm the daily spend trends and anomaly overlays render successfully, but the Extend/Snooze and Rollback action controls are completely disabled or hidden.
 
 ### Step 6 - Route alerts
 - **Action**: Check the notification channels.
@@ -67,15 +67,15 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
   - Slack: Verify that a notification message has arrived in the `#squad-prediction-models` channel containing the resource ARN, cost delta, and dashboard link.
   - SES/SNS: Verify that the Finance mailing list received an email summary of the cost spike.
 
-### Step 7 - Execute dry-run containment and countdown control
-- **Action**: Inspect the containment audit trail and countdown controls.
-- **Internal Action**: The containment engine executes policy checks on the target resource. Since the resource is marked under production rules, the engine executes in dry-run mode (Safety Value: `Never` auto-contain on production). In non-prod/dev environments, the engine may apply containment (Safety Value: `After countdown` or `Yes with policy approval`). Operators can snooze the containment countdown by invoking `POST /v1/action/extend`.
-- **Verification**: Verify that the targeted AWS EC2 instance remains running, but the DynamoDB audit log table has a new record showing a proposed action `stop_instance` with `execution_mode: dry-run`.
+### Step 7 - Execute dry-run containment and countdown control (Cognito-authorized)
+- **Action**: Log out of the Finance session and log back in as an Engineering Operator (member of the `finops-engineering-operator` group). Locate the active anomaly on the dashboard and click the "Snooze/Extend" button.
+- **Internal Action**: The dashboard interface executes a `POST /v1/action/extend` API request. The backend Lambda@Edge and API layer validates the active JWT cookie, checks group membership, and permits the operation.
+- **Verification**: Verify that the targeted AWS EC2 instance remains running, but the DynamoDB audit log table has a new record showing a proposed action `stop_instance` with `execution_mode: dry-run`. Confirm that the countdown timer displays the new extended expiration time.
 
 ### Step 8 - Execute rollback simulation (POST /v1/action/rollback)
-- **Action**: Revert the simulated containment state from the dashboard interface or API.
-- **Internal Action**: The administrator clicks the "Revert" button on the CDO dashboard, which invokes the `POST /v1/action/rollback` endpoint to execute the rollback steps defined in the audit record (e.g., restoring original tag state).
-- **Verification**: Check CLI logs and DynamoDB records to confirm the audit state changes to `RollbackCompleted`.
+- **Action**: While logged in as an Engineering Operator, click the "Revert/Rollback" button on the CDO dashboard. Try the same action while logged in as a Finance user to verify rejection.
+- **Internal Action**: The dashboard invokes the `POST /v1/action/rollback` endpoint with the Cognito session credentials. The backend checks Cognito group claims, verifies tenant context, and triggers the tag reversion.
+- **Verification**: Check CLI logs and DynamoDB records to confirm the audit state changes to `RollbackCompleted` with the operator's Cognito user ID logged in the `actor` field. Confirm that the Finance user's attempt yields HTTP `403 Forbidden` and writes an `unauthorized_action_blocked` audit entry.
 
 ---
 
@@ -134,6 +134,6 @@ Architectural justifications for common challenging questions:
 ## 5. Open questions
 
 - [ ] **Slack Webhook Integration Security**: Should we transition from static Slack incoming webhooks to a secure Slack App utilizing AWS Secrets Manager OAuth tokens for increased routing control?
-- [ ] **Cognito OIDC Custom Domain**: Will the Finance team require AWS Cognito OIDC user authentication with single sign-on (SSO) integration for dashboard access?
+- [ ] **Cognito OIDC Single Sign-On (SSO)**: Should we integrate the Cognito User Pool with the corporate Okta/O365 identity provider for single sign-on (SSO) instead of maintaining a standalone user directory?
 - [ ] **Athena Query Limits**: What hard limits should be configured on Athena query data usage per day to prevent runaway billing from ad-hoc analysis?
 - [ ] **Bedrock Model Token Budget**: What token limits should be set per tenant in Secrets Manager configurations to prevent Bedrock cost overruns during massive anomaly spikes? (`Evidence needed: Bedrock cost/token model benchmarks`)

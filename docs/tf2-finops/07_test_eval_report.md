@@ -177,6 +177,14 @@ The containment engine must generate an audit log entry for every action attempt
 14. `retention_period_days`: Number representing retention duration (must be >= 90 days).
 15. `audit_chain`: Tamper-evident ledger linking structure containing `event_hash` (`sha256(current_payload + previous_hash)`) and `previous_hash` of the append-only ledger.
 
+### 5.4 Dashboard Auth & Cognito Group Validation
+
+- **Hosted UI Redirection Test**: Verifies that any unauthenticated access request to the CloudFront dashboard URL is intercepted by the Lambda@Edge auth layer and redirected (302 redirect) to the Cognito Hosted UI login endpoint.
+- **Finance Group Read-Only Access Test**: Validates that users belonging to the `finops-finance-readonly` Cognito user group are authenticated successfully but are restricted to read-only views on the dashboard. Probes to execute containment actions (Extend or Rollback) via POST requests to `/v1/action/extend` or `/v1/action/rollback` are rejected with HTTP `403 Forbidden` / `ERR_INSUFFICIENT_PERMISSIONS`.
+- **Engineering Group Action Authorization Test**: Verifies that users in the `finops-engineering-operator` and `finops-cdo-admin` Cognito user groups can successfully trigger Extend/Rollback actions on the dashboard, confirming the JWT tokens contain correct group claims when forwarded to the action API endpoints.
+- **Session Expiration & Token Lifetime Test**: Validates that expired sessions (JWT token older than the 15-minute lifetime config) or tampered JWT cookie signatures are rejected by Lambda@Edge, causing immediate session termination and redirecting the user to re-authenticate.
+- **Audit Logging for Auth Events**: Confirms that login/logout events, token validation failures, and unauthorized action attempts (e.g., Finance user attempting to rollback) are captured in the DynamoDB and S3 audit trail logs (e.g., logging `auth_success`, `auth_failure`, or `unauthorized_action_blocked`).
+
 ---
 
 ## 6. E2E demo scenario

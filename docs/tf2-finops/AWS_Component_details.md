@@ -61,7 +61,7 @@ This document documents the CDO-owned components, including the Private API Gate
 | 20 | DynamoDB Run State and Audit | Amazon DynamoDB | Stores run locks, idempotency, audit index, and dashboard materialized data. |
 | 21 | Secrets Provider | AWS Secrets Manager | Stores secret references used by Lambda and alerting integrations. |
 | 22 | IAM Cross-Account Roles | AWS IAM / STS | Allows controlled read and containment access into member accounts. |
-| 23 | Finance Dashboard | Amazon S3 + CloudFront | Presents static web-based finance-readable views without SQL; QuickSight is retained as a future BI option. |
+| 23 | Finance Dashboard | Amazon S3 + CloudFront | Presents static web-based finance-readable views without SQL; assets are secured via OAC (Origin Access Control) and verified by Lambda@Edge. |
 | 24 | Alert Channels | Amazon SNS, Slack API, SES | Sends Finance, Engineering, Platform, and Security notifications. |
 | 25 | CloudWatch Monitoring | CloudWatch Logs, Metrics, Alarms | Observes workflow failures, stale data, and delivery failures. |
 | 26 | AI Engine Lambda Container Functions | AWS Lambda | Runs AI API inference and asynchronous detection tasks using AIOps container images. |
@@ -69,6 +69,8 @@ This document documents the CDO-owned components, including the Private API Gate
 | 28 | ECR Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
 | 29 | AI Engine SQS/DLQ | Amazon SQS | Manages decoupling queues: requests queue, DLQ, and retry. |
 | 30 | AI Engine DynamoDB Stores | Amazon DynamoDB | Persistent state tables for execution results, idempotency, and anomalies. |
+| 31 | Dashboard Auth Gateway | Amazon Cognito | Authenticates dashboard users and provides group-based authorization (readonly Finance vs Engineering operators). |
+| 32 | Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. |
 
 ## Excluded Components
 
@@ -878,6 +880,42 @@ Stores the run locks, idempotency records, anomaly detection outputs, and contai
 ### Output
 
 - Low-latency lookups for Step Functions polling and the S3 + CloudFront dashboard.
+
+## 31. Amazon Cognito
+
+### Role
+
+User authentication and directory provider.
+
+### Purpose
+
+Authenticates dashboard users via secure Cognito Hosted UI (Authorization Code Flow with PKCE) and defines user groups (`finops-finance-readonly`, `finops-engineering-operator`, `finops-cdo-admin`) to authorize dashboard operations.
+
+### Input
+
+- Interactive user credentials entered in the Cognito Hosted UI.
+
+### Output
+
+- ID, Access, and Refresh JWT tokens containing group claims, stored as secure cookies.
+
+## 32. Lambda@Edge Viewer Request Auth
+
+### Role
+
+Edge-level authorization filter.
+
+### Purpose
+
+Intercepts dashboard requests at the CloudFront viewer request event, parses JWT cookies, checks signatures against Cognito JWKS, and verifies session expiration. Denies access or redirects to login if the session is invalid.
+
+### Input
+
+- Incoming viewer request headers and cookies.
+
+### Output
+
+- Request forwarding to private S3 origin with OAC validation (if authorized) or 302 redirect to Cognito Hosted UI.
 
 ## Contract-Level Data Flows
 

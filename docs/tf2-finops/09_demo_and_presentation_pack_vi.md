@@ -55,10 +55,10 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
   - Nếu Bedrock bị quá thời hạn phản hồi (giới hạn cứng Bedrock Bedrock API 45 giây, trả về `ERR_LLM_TIMEOUT`) hoặc dịch vụ bị dừng (`ERR_SERVICE_DOWN`), pipeline lập tức kích hoạt rules engine tĩnh và cảnh báo đội ngũ SRE.
   - Kiểm tra bảng bản ghi bất thường DynamoDB để xác minh bản ghi mới được ghi nhận với chuỗi liên kết kiểm toán mã hóa (cryptographic audit trail chain) tính toán theo công thức `sha256(current_payload + previous_hash)`.
 
-### Bước 5 - Cập nhật bảng điều khiển CDO (Step 5 - Update CDO dashboard)
-- **Hành động (Action)**: Lambda tổng hợp dữ liệu được kích hoạt để xây dựng lại các tài nguyên bảng điều khiển.
-- **Hành động nội bộ (Internal Action)**: Các dữ liệu tổng hợp được biên dịch thành các tệp S3 JSON tĩnh, và một invalidation bộ nhớ đệm CloudFront được thực thi.
-- **Xác minh (Verification)**: Mở URL bảng điều khiển trong trình duyệt và xác minh rằng biểu đồ chi tiêu hàng ngày hiển thị điểm bất thường chi phí được phủ lên.
+### Bước 5 - Xác thực và truy cập bảng điều khiển CDO (Cognito Hosted UI) (Step 5 - Authenticate and access CDO dashboard)
+- **Hành động (Action)**: Mở URL CloudFront của bảng điều khiển trong trình duyệt. Xác minh bạn tự động được chuyển hướng đến màn hình đăng nhập Cognito Hosted UI. Đăng nhập bằng tài khoản người dùng Finance (liên kết với nhóm `finops-finance-readonly`).
+- **Hành động nội bộ (Internal Action)**: CloudFront chuyển tiếp yêu cầu sau khi lớp xác thực Lambda@Edge chặn yêu cầu, xác thực token Cognito JWT và gửi đến bucket S3 riêng tư. Giao diện dashboard phân tích thông tin claim nhóm trong mã JWT.
+- **Xác minh (Verification)**: Xác nhận biểu đồ xu hướng chi tiêu hàng ngày và các điểm bất thường được hiển thị thành công, nhưng các nút kiểm soát hành động (Extend/Snooze và Rollback) hoàn toàn bị vô hiệu hóa hoặc ẩn đi.
 
 ### Bước 6 - Định tuyến cảnh báo (Step 6 - Route alerts)
 - **Hành động (Action)**: Kiểm tra các kênh thông báo.
@@ -67,15 +67,15 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
   - Slack: Xác minh rằng một tin nhắn thông báo đã đến kênh `#squad-prediction-models` chứa ARN tài nguyên, chi phí chênh lệch và liên kết bảng điều khiển.
   - SES/SNS: Xác minh rằng danh sách gửi thư của Finance đã nhận được email tóm tắt về đột biến chi phí.
 
-### Bước 7 - Thực thi containment ở chế độ giả lập và kiểm soát thời gian đếm ngược (Step 7 - Execute dry-run containment and countdown control)
-- **Hành động (Action)**: Kiểm tra nhật ký kiểm toán containment và các kiểm soát đếm ngược.
-- **Hành động nội bộ (Internal Action)**: Containment engine thực thi kiểm tra chính sách trên tài nguyên mục tiêu. Vì tài nguyên nằm dưới quy tắc sản xuất (production), engine sẽ thực thi ở chế độ dry-run (Giá trị An toàn: `Never` - không bao giờ tự động áp dụng containment trên production). Đối với môi trường dev/sandbox, engine có thể áp dụng containment (Giá trị An toàn: `After countdown` hoặc `Yes with policy approval`). Quản trị viên có thể hoãn/snooze thời gian đếm ngược bằng cách gọi endpoint `POST /v1/action/extend`.
-- **Xác minh (Verification)**: Xác minh rằng instance EC2 AWS mục tiêu vẫn đang chạy, nhưng bảng nhật ký kiểm toán DynamoDB có một bản ghi mới hiển thị hành động được đề xuất `stop_instance` với `execution_mode: dry-run`.
+### Bước 7 - Thực thi containment ở chế độ giả lập và kiểm soát đếm ngược (được xác thực bởi Cognito) (Step 7 - Execute dry-run containment and countdown control)
+- **Hành động (Action)**: Đăng xuất khỏi phiên làm việc Finance và đăng nhập lại bằng tài khoản điều hành viên Kỹ thuật (thuộc nhóm `finops-engineering-operator`). Tìm bất thường đang hoạt động trên dashboard và nhấp vào nút "Snooze/Extend".
+- **Hành động nội bộ (Internal Action)**: Giao diện dashboard thực hiện yêu cầu API `POST /v1/action/extend`. Lớp Lambda@Edge và API backend xác thực cookie JWT đang hoạt động, kiểm tra tư cách thành viên nhóm, và cho phép thực hiện thao tác.
+- **Xác minh (Verification)**: Xác minh instance EC2 AWS mục tiêu vẫn đang chạy, nhưng bảng nhật ký kiểm toán DynamoDB có một bản ghi mới hiển thị hành động đề xuất `stop_instance` với `execution_mode: dry-run`. Xác nhận đồng hồ đếm ngược hiển thị thời gian hết hạn mới đã được kéo dài.
 
 ### Bước 8 - Thực thi giả lập hoàn tác (Step 8 - Execute rollback simulation - POST /v1/action/rollback)
-- **Hành động (Action)**: Khôi phục trạng thái containment giả lập từ giao diện bảng điều khiển hoặc API.
-- **Hành động nội bộ (Internal Action)**: Quản trị viên nhấp vào nút "Revert" trên bảng điều khiển CDO, hành động này sẽ gọi endpoint `POST /v1/action/rollback` để thực thi các bước rollback được xác định trong bản ghi kiểm toán (ví dụ: khôi phục trạng thái tag ban đầu).
-- **Xác minh (Verification)**: Kiểm tra nhật ký CLI và các bản ghi DynamoDB để xác nhận trạng thái kiểm toán thay đổi thành `RollbackCompleted`.
+- **Hành động (Action)**: Trong khi đăng nhập dưới quyền điều hành viên Kỹ thuật, nhấp vào nút "Revert/Rollback" trên dashboard. Hãy thử thực hiện cùng thao tác khi đăng nhập bằng tài khoản Finance để xác minh việc từ chối quyền.
+- **Hành động nội bộ (Internal Action)**: Dashboard gọi endpoint `POST /v1/action/rollback` cùng thông tin phiên đăng nhập Cognito. Backend kiểm tra thông tin claim nhóm Cognito, xác minh ngữ cảnh bên thuê (tenant context), và kích hoạt hoàn tác tag.
+- **Xác minh (Verification)**: Kiểm tra nhật ký CLI và bản ghi DynamoDB để xác nhận trạng thái kiểm toán thay đổi thành `RollbackCompleted` với ID người dùng Cognito của điều hành viên được ghi lại trong trường `actor`. Xác nhận nỗ lực của người dùng Finance sẽ trả về lỗi HTTP `403 Forbidden` và tạo ra bản ghi kiểm toán `unauthorized_action_blocked`.
 
 ---
 
@@ -133,7 +133,7 @@ Các lập luận kiến trúc cho các câu hỏi thử thách phổ biến:
 
 ## 5. Câu hỏi mở (Open questions)
 
-- [ ] **Bảo mật tích hợp Slack Webhook (Slack Webhook Integration Security)**: Chúng ta có nên chuyển đổi từ Slack incoming webhooks tĩnh sang một ứng dụng Slack an toàn sử dụng các mã thông báo OAuth của AWS Secrets Manager để tăng kiểm soát định tuyến không?
-- [ ] **Tên miền tùy chỉnh cho Cognito OIDC (Cognito OIDC Custom Domain)**: Nhóm Finance có yêu cầu xác thực người dùng AWS Cognito OIDC tích hợp đăng nhập một lần (SSO) để truy cập bảng điều khiển không?
+- [ ] **Bảo mật tích hợp Slack Webhook (Slack Webhook Integration Security)**: Chúng ta có nên chuyển đổi từ Slack incoming webhooks tĩnh sang một ứng dụng Slack an sau sử dụng các mã thông báo OAuth của AWS Secrets Manager để tăng kiểm soát định tuyến không?
+- [ ] **Đăng nhập một lần với Cognito OIDC (Cognito OIDC Single Sign-On - SSO)**: Chúng ta có nên tích hợp Cognito User Pool với nhà cung cấp danh tính Okta/O365 của doanh nghiệp để đăng nhập một lần (SSO) thay vì duy trì danh bạ người dùng độc lập không?
 - [ ] **Giới hạn truy vấn Athena (Athena Query Limits)**: Giới hạn cứng nào nên được cấu hình cho việc sử dụng dữ liệu truy vấn Athena mỗi ngày để ngăn chặn hóa đơn tăng đột biến do phân tích tự do?
 - [ ] **Ngân sách Token cho mô hình Bedrock (Bedrock Model Token Budget)**: Giới hạn token nào nên được thiết lập cho mỗi tenant trong cấu hình Secrets Manager để tránh chi phí Bedrock vượt trội khi gặp số lượng lớn bất thường chi phí đột biến? (`Cần bằng chứng: đo kiểm chi phí Bedrock/token theo baseline thực tế`)
