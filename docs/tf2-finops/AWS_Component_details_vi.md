@@ -906,7 +906,7 @@ Chặn các yêu cầu dashboard tại sự kiện viewer request của CloudFro
 
 | Trường | Chi tiết |
 | --- | --- |
-| Các hợp phần CDO chịu trách nhiệm | Step Functions, Lambda Yêu cầu AI Engine, Lambda Worker AI Engine, DynamoDB, nhật ký kiểm toán S3, SQS |
+| Các hợp phần CDO chịu trách nhiệm | Step Functions, Hàm Lambda AI Engine, DynamoDB, nhật ký kiểm toán S3, SQS |
 | Các hợp phần loại trừ | Trọng số mô hình AI Engine, các tác vụ huấn luyện AI, tập dữ liệu huấn luyện mô hình, và logic bên trong mô hình AI |
 | Đầu vào | Khung thời gian chi phí đã chuẩn hóa, ID lượt chạy (run ID), phạm vi tài khoản, phiên bản hợp đồng, khung thời gian bằng chứng (evidence window) |
 | Đầu ra | Phiên bản mô hình, ID bất thường, độ tin cậy, độ nghiêm trọng, chi tiêu kỳ vọng, chi tiêu thực tế, chênh lệch (delta), giải thích, định tuyến được đề xuất, chế độ ngăn chặn được đề xuất, URI bằng chứng |

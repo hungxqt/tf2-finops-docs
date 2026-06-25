@@ -41,7 +41,11 @@ Quyền truy cập vào bảng điều khiển S3 + CloudFront được kiểm s
   - `finops-cdo-admin`: Thành viên có toàn quyền quản trị để quản lý user pool, nhóm, chính sách truy cập bảng điều khiển, khả năng hiển thị dữ liệu giả lập, và các cấu hình vận hành.
 
 ### Backend API Endpoint
-Để hỗ trợ các hành động tương tác trên dashboard (như nút "Rollback" và luồng xác thực remediation `/v1/verify`), Frontend không gọi trực tiếp đến các hàm Lambda. Thay vào đó, một cổng **AWS API Gateway (HTTP API)** hoặc **AWS Lambda Function URLs** (được bảo mật thông qua Cognito IAM/JWT Authorizers) được cấu hình. Frontend gửi các yêu cầu HTTP tới endpoint này (đại diện cho các tuyến đường như `POST /v1/decide`, `POST /v1/audit/{audit_id}/rollback`, và `POST /v1/verify`), sau đó được định tuyến đến các hàm Lambda Containment hoặc State tương ứng. Điều này đảm bảo đường truyền truyền thông frontend-backend được an toàn, xác thực và không bị bỏ ngỏ mà không có endpoint công khai.
+Để hỗ trợ các hành động tương tác trên dashboard (như hoàn tác thủ công, xác minh can thiệp hoặc truy xuất quyết định bất thường), frontend không gọi trực tiếp nhiều microservices hoặc các hàm Lambda CDO riêng biệt. Thay vào đó, nền tảng CDO cấu hình một **AWS Lambda Function URL** bảo mật trực tiếp trên **hàm Lambda của AI Engine** (AI Engine Lambda function).
+
+Function URL duy nhất này được ánh xạ đằng sau phân phối CloudFront dưới dạng origin cho các hành vi dẫn đường `/v1/*`. Frontend gửi các yêu cầu HTTPS trực tiếp tới CloudFront (dưới dạng các tuyến đường như `POST /v1/decide`, `POST /v1/verify`, `GET /v1/status/{id}`, và `POST /v1/audit/{audit_id}/rollback`), cổng gateway sẽ xác thực các Cognito JWT session token tại ranh giới CloudFront/Lambda@Edge trước khi chuyển tiếp yêu cầu đến Function URL của AI Engine Lambda.
+
+Tất cả các hàm Lambda khác do CDO sở hữu (như Lambda Thu nhận, Lambda Trạng thái, và Lambda Ngăn chặn) đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions; các hàm này không có endpoint công khai hoặc Function URL riêng biệt. Mô hình endpoint serverless này loại bỏ chi phí vận hành API Gateway vật lý và vượt qua giới hạn timeout 30 giây của API Gateway (cho phép thời gian thực thi lên đến 15 phút cho các vòng lặp xác minh đồng bộ).
 
 
 ---

@@ -56,7 +56,7 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
   - Kiểm tra bucket kiểm toán có thẩm quyền S3 để xác minh bản ghi mới được ghi nhận với chuỗi liên kết kiểm toán mã hóa (cryptographic audit trail chain) tính toán theo công thức `sha256(current_payload + previous_hash)`.
 
 ### Bước 5 - Nhận Kế hoạch Can thiệp (Ngữ nghĩa logic POST /v1/decide) (Step 5 - Get Intervention Plan)
-- **Hành động (Action)**: Khi trạng thái hoàn thành, Step Functions gọi hàm AI Engine worker Lambda (đại diện cho ngữ nghĩa `/v1/decide`) để nhận báo cáo phân tích nguyên nhân gốc rễ (RCA) và kế hoạch hành động containment.
+- **Hành động (Action)**: Khi trạng thái hoàn thành, Step Functions gọi hàm Lambda của AI Engine (đại diện cho ngữ nghĩa `/v1/decide`) để nhận báo cáo phân tích nguyên nhân gốc rễ (RCA) và kế hoạch hành động containment.
 - **Tham số yêu cầu (Request Parameters)**: Các headers `X-Correlation-Id` và `X-Tenant-Id`.
 - **Xác minh (Verification)**: Xác minh rằng AI Engine trả về kế hoạch chứa mã lệnh AWS CLI chính xác (ví dụ: `aws ec2 create-tags` ở chế độ dry-run) và payload lệnh hoàn tác rollback tương ứng.
 

@@ -41,7 +41,11 @@ Access to the S3 + CloudFront dashboard is strictly controlled and authenticated
   - `finops-cdo-admin`: Members have full administrative access to manage user pools, groups, dashboard access policies, synthetic-data visibility, and operator settings.
 
 ### Backend API Endpoint
-To support interactive actions on the dashboard (such as the "Rollback" button and the remediation verification flow `/v1/verify`), the Frontend does not call the Lambdas directly. Instead, an **AWS API Gateway (HTTP API)** or **AWS Lambda Function URLs** (secured via Cognito IAM/JWT Authorizers) is provisioned. The frontend makes HTTP requests to this endpoint (representing routes like `POST /v1/decide`, `POST /v1/audit/{audit_id}/rollback`, and `POST /v1/verify`), which are then routed to the respective Containment or State Lambdas. This ensures the frontend-backend communication path is secure, authenticated, and not left floating without a public endpoint.
+To support interactive dashboard actions (such as manual rollbacks, remediation verification via `/v1/verify`, or fetching anomaly decisions via `/v1/decide`), the frontend does not call multiple backend microservices or separate CDO Lambdas. Instead, the CDO platform provisions a secure **AWS Lambda Function URL** directly on the **AI Engine Lambda container function**. 
+
+This singular Function URL is mapped behind the unified CloudFront distribution as the origin for the `/v1/*` path behaviors. The frontend makes secure HTTPS requests directly to CloudFront (under routes like `POST /v1/decide`, `POST /v1/verify`, `GET /v1/status/{id}`, and `POST /v1/audit/{audit_id}/rollback`), which validates the Cognito JWT session token at the CloudFront/Lambda@Edge boundary before forwarding the request to the AI Engine Lambda Function URL. 
+
+All other CDO-owned Lambdas (such as the Ingestion Lambda, State Lambda, and Containment Lambda) remain strictly internal helper resources orchestrated by the Step Functions workflow; they do not have public endpoints or separate Function URLs. This serverless endpoint model eliminates physical API Gateway overhead, bypasses the 30-second API Gateway timeout constraint (allowing up to 15-minute execution limits for verification loops), and ensures secure end-to-end authentication.
 
 
 ---

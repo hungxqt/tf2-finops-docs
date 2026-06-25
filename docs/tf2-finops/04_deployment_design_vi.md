@@ -248,5 +248,5 @@ Các báo động triển khai cốt lõi bao gồm lỗi Step Functions, tỷ l
 
 ## Related documents
 
-- [`02_infra_design_vi.md`](02_infra_design_vi.md) - Các hàm AI Engine Request và Worker Lambda container, và định tuyến SQS/DLQ.
+- [`02_infra_design_vi.md`](02_infra_design_vi.md) - Hàm AI Engine Lambda container, và định tuyến SQS/DLQ cho cảnh báo.
 - [`03_security_design_vi.md`](03_security_design_vi.md) - Thiết lập role execution Lambda, các VPC endpoint, và security groups.

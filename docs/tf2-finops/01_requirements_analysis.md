@@ -43,7 +43,7 @@ The CDO platform must meet the following non-functional requirements (NFRs) to e
 | Dashboard readability | Finance-friendly UI, zero SQL knowledge required | CFO's team must understand cost anomalies without technical queries. |
 | Cost per run | Minimize; tracked with `Evidence needed: CDO pipeline run costs` | Ensures the platform itself is cost-effective. |
 | Security baseline | IAM least-privilege, multi-account read-only access | Core boundary: NEVER terminate prod, delete data, or modify IAM. |
-| AI Engine hosting uptime | ≥99.5% availability for the hosted model functions | CDO hosted AI Engine functions (Request and Worker Lambdas) must be reliable for direct execution. |
+| AI Engine hosting uptime | ≥99.5% availability for the hosted model functions | CDO-hosted AI Engine Lambda container function must be reliable for direct execution. |
 | Cost data contract coverage | CUR + Cost Explorer + CloudWatch resource_utilization_metrics (cpu_percent, memory_mib, network_in_bytes, network_out_bytes, disk_io_ops, database_connections, gpu_utilization, idle_hours_continuous) | Ensures CDO sends cost details along with CloudWatch metrics for anomaly detection (supporting idle_resource and runaway_usage patterns), with a fallback to CUR-only mode (confidence *= 0.5) when metrics are missing. |
 | Idempotency | One accepted run per account and cost window | Prevents duplicate alerts, duplicate AI Engine calls, and double-counted dashboard materializations. |
 | Alert explainability | Every anomaly alert includes confidence, severity, evidence window, owner route, and explanation | Finance and Engineering must be able to decide whether the alert is valid and what to do next. |

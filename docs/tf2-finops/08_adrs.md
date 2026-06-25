@@ -213,7 +213,7 @@
 
 ## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway
 
-- **Status**: Partially Superseded by ADR-015
+- **Status**: Superseded by ADR-018
 - **Date**: 2026-06-24
 - **Context**: The current CDO flow is a scheduled batch workflow driven by EventBridge Scheduler and Step Functions. The AI API contract v1.1 requires `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` logical contract semantics, but the architecture does not need a separate Private REST API Gateway when Step Functions is the only orchestrating caller.
 - **Decision**: Avoid deploying a physical Private REST API Gateway for the default scheduled batch workflow, since Step Functions acts as the sole orchestrating caller. Instead, the contract's `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, and `/v1/verify` interfaces are implemented purely as logical contract semantics. Under the hood, Step Functions invokes the AI Engine Request Lambda directly for `/v1/detect`, which validates the payload and queues it in SQS, returning a fast execution token. The AI Engine Worker Lambda processes the queue asynchronously, storing findings in DynamoDB and S3. The Step Functions workflow polls `/v1/status/{correlation_id}` until completed, then invokes `/v1/decide` to generate the remediation plan, executes any approved containment actions, and invokes `/v1/verify` to validate the outcome. The rollback endpoint `/v1/audit/{audit_id}/rollback` is called for manual reversions. Private API Gateway is rejected in the baseline CDO platform to reduce unnecessary overhead, remaining only as an optional design choice for future multi-client deployments.
@@ -269,8 +269,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-06-25
-- **Context**: The AI Engine Request Lambda v1.1.0 contract has shifted from an asynchronous detection model (returning `202 Accepted` and requiring polling on `/v1/status/{correlation_id}`) to a synchronous detection model (returning `200 OK` with the final `anomalies_list` directly in the response). This API contract change makes the old SQS execution queue and polling logic obsolete for the primary detection loop.
-- **Decision**: Adopt the synchronous `/v1/detect` endpoint directly in the CDO Step Functions orchestration workflow, invoking the Request Lambda synchronously. Remove SQS/DLQ from the primary detection loop (retaining SQS only for alerting retries/backoff). This supersedes the detection flow portions of ADR-012.
+- **Context**: The AI Engine Lambda runtime v1.1.0 contract has shifted from an asynchronous detection model (returning `202 Accepted` and requiring polling on `/v1/status/{correlation_id}`) to a synchronous detection model (returning `200 OK` with the final `anomalies_list` directly in the response). This API contract change makes the old SQS execution queue and polling logic obsolete for the primary detection loop.
+- **Decision**: Adopt the synchronous `/v1/detect` endpoint directly in the CDO Step Functions orchestration workflow, invoking the AI Engine Lambda runtime synchronously. Remove SQS/DLQ from the primary detection loop (retaining SQS only for alerting retries/backoff). This supersedes the detection flow portions of ADR-012.
 - **Consequence**:
   - Pro: Eliminates Step Functions polling loops for detection status, reducing execution complexity and states.
   - Pro: Removes the SQS queue and Dead Letter Queue from the critical path of cost ingestion and detection scoring, lowering runtime costs and platform operations overhead.
@@ -300,7 +300,7 @@
 
 ## ADR-017 - Lambda Function URLs for dashboard backend API endpoints
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-018
 - **Date**: 2026-06-25
 - **Context**: The CDO platform requires secure, authenticated HTTP/HTTPS endpoints for interactive dashboard controls (e.g., manual rollbacks or remediation verification) to trigger backend Containment and State Lambdas. We must decide between provisioning an AWS API Gateway (HTTP API) or utilizing native AWS Lambda Function URLs.
 - **Decision**: Deploy **AWS Lambda Function URLs** to expose the backend Containment and State Lambdas directly. Secure these endpoints by routing them through the CloudFront distribution and validating Cognito session tokens (JWT) using the existing `Lambda@Edge` authentication gateway or inside the target Lambda code.
@@ -312,6 +312,24 @@
   - Trade-off: Each function gets a unique, randomly generated URL. This is mitigated by mapping them behind a unified CloudFront distribution as separate backend origin paths (e.g., `/api/containment/*` and `/api/state/*`).
 - **Alternatives considered**:
   - AWS API Gateway (HTTP API): Rejected because the hard 30-second integration timeout poses a risk for synchronous verification loops, and to avoid unnecessary deployment complexity in the serverless control plane.
+
+---
+
+## ADR-018 - Single AIOps Lambda container serves AI API contract operations
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: Previous architecture documentation implied a split Request/Worker Lambda model with SQS buffering for AI Engine anomaly detection, and also suggested separate API Gateway backend functions for the interactive dashboard actions. The platform requires architectural consistency, simplification of deployment, and clear division of responsibility between the CDO platform team and the AIOps model team.
+- **Decision**: Align the CDO platform integration to target a single AIOps-provided ECR image deployed as one AWS Lambda container function. This singular runtime hosts all logical contract operations (`/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, and `/health`). CDO manages the hosting platform (VPC networking, ECR image digest pinning, IAM execution roles, reserved concurrency limits, and monitoring), while AIOps owns the container logic (the model, API logic, confidence scores, and explanations). SQS and DLQ are completely removed from the AI Engine execution loop and are used solely as retry buffers for alert routing. To support interactive dashboard actions, the AI Engine Lambda function is exposed via a secure AWS Lambda Function URL mapped behind the unified CloudFront distribution under the `/v1/*` path behavior. All other CDO-owned Lambdas (Ingestion, State, and Containment) are strictly internal functions orchestrated by the Step Functions workflow and do not have public endpoints or separate Function URLs.
+- **Consequence**:
+  - Pro: Eliminates deployment complexity and runtime synchronization issues of maintaining multiple container function definitions and configurations.
+  - Pro: Clear separation of concerns: CDO owns hosting infrastructure, security, VPC networking, and execution policies; AIOps owns model code, API logic, and detection outcomes.
+  - Pro: Eliminates SQS queue lag and dead-letter queue complexity from the critical path of cost anomaly detection.
+  - Trade-off: The singular Lambda execution role must be granted permissions to read curated S3 data and cache anomalies in DynamoDB, requiring careful resource-level restrictions.
+- **Alternatives considered**:
+  - Keep separate Request and Worker Lambda container configurations: Rejected because maintaining two Lambda deployments for the same model image introduces redundant Terraform resource definitions, dual Cold Starts, and complex async polling code.
+  - Deploy a Private REST API Gateway facade: Rejected for the scheduled batch execution flow to minimize resource overhead, since Step Functions can invoke the Lambda container function directly and securely.
+
 
 
 

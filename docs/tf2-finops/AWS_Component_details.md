@@ -906,7 +906,7 @@ Intercepts dashboard requests at the CloudFront viewer request event, parses JWT
 
 | Field | Detail |
 | --- | --- |
-| Responsible CDO components | Step Functions, AI Engine Request Lambda, AI Engine Worker Lambda, DynamoDB, S3 audit trail, SQS |
+| Responsible CDO components | Step Functions, AI Engine Lambda, DynamoDB, S3 audit trail, SQS |
 | Excluded components | AI Engine model weights, AI training jobs, model training datasets, and AI model internal logic |
 | Input | Normalized cost window, run ID, account scope, contract version, evidence window |
 | Output | Model version, anomaly ID, confidence, severity, expected spend, actual spend, delta, explanation, recommended route, recommended containment mode, evidence URI |

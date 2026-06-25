@@ -56,7 +56,7 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
   - Check the S3 authoritative audit bucket to verify the record has been written with a cryptographic audit trail chain link calculated as `sha256(current_payload + previous_hash)`.
 
 ### Step 5 - Get Intervention Plan (Logical POST /v1/decide semantics)
-- **Action**: Once the status is complete, Step Functions invokes the AI Engine worker Lambda (representing `/v1/decide` semantics) to retrieve the Root Cause Analysis (RCA) and containment action plan.
+- **Action**: Once the status is complete, Step Functions invokes the AI Engine Lambda function (representing `/v1/decide` semantics) to retrieve the Root Cause Analysis (RCA) and containment action plan.
 - **Request Parameters**: `X-Correlation-Id` and `X-Tenant-Id` headers.
 - **Verification**: Verify that the AI Engine returns a plan containing the exact AWS CLI commands (e.g. `aws ec2 create-tags` in dry-run mode) and corresponding rollback CLI commands.
 

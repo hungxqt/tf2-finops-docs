@@ -31,7 +31,7 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Secrets Manager** | $0.40/secret/month + request charges | AI Engine credentials, webhooks, contract signing key, external IDs | Shared fixed plus request volume. |
 | **KMS** | $1.00/CMK/month + request charges | Data, audit, secrets, encryption keys | Shared fixed; consolidation requires Security approval. |
 | **Observability - CloudWatch, Prometheus, OTel & X-Ray** | Logs, metrics, trace analyzer, ADOT/OTel collector, and dashboard charges | Lambda logs, Step Functions traces, queue metrics, performance metrics (CPU, Memory, database utilization), and platform dashboards | Shared and variable; ADOT and telemetry collection can become a top cost driver. |
-| **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for AI Engine Request Lambda | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
+| **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for the AI Engine Lambda container function | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
 | **Dashboard - S3 + CloudFront** | S3 & CloudFront pricing | Finance stakeholder dashboard access | S3 storage and CloudFront HTTPS request/data transfer fees. |
 | **Amazon Cognito (Auth)** | Free tier up to 50,000 MAUs; then $0.0055/MAU | User directory and Hosted UI auth gateway for dashboard access | Shared platform cost; free for capstone scale. |
 | **Lambda@Edge Viewer-Request Auth** | $0.60 per 1 million requests + duration ($0.0000500125/GB-sec) | Edge validation of JWT signatures against Cognito JWKS | Variable dashboard request cost; very low for target user base. |
@@ -206,7 +206,7 @@ After completing the 2-week capstone with actual baseline, the following recomme
 
 | Recommendation | When to Apply | Estimated Savings | Conditions |
 |---|---|---|---|
-| **Compute Savings Plans** | After 3-month baseline | 20-30% on stable execution baseline | Applicable to Lambda executions (including AI Engine API and Worker Lambdas). |
+| **Compute Savings Plans** | After 3-month baseline | 20-30% on stable execution baseline | Applicable to Lambda executions (including the AI Engine Lambda container function and other CDO adapter Lambdas). |
 | **S3 Intelligent-Tiering** | Immediately | 10-15% storage cost | Replace manual lifecycle rules |
 | **DynamoDB Reserved Capacity** | After 6-month baseline | 40-60% DDB cost | When provisioned is cheaper than on-demand |
 | **VPC Endpoint consolidation** | When multi-workload exists | 50% endpoint cost | Share endpoints across platforms |

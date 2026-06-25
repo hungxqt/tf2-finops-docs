@@ -324,11 +324,13 @@ Required ADR entries (minimum, each as `## ADR-NNN - <Short title>`):
 - `## ADR-009 - Shared Task Force AI Engine endpoint` — Shared AI endpoint decision (superseded by ADR-010).
 - `## ADR-010 - AWS Lambda container image hosting for AI Engine inference` — Lambda container hosting decision.
 - `## ADR-011 - Private REST API Gateway over internal ALB` — Private REST API Gateway decision (superseded by ADR-012).
-- `## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway` — Direct invocation flow decision (superseded by ADR-015).
+- `## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway` — Direct invocation flow decision (superseded by ADR-018).
 - `## ADR-013 - S3 + CloudFront dashboard over QuickSight for MVP` — Dashboard technology decision.
 - `## ADR-014 - Athena DDL validation to Terraform Glue schema with Partition Projection` — Use Athena DDL for validation and Terraform + Partition Projection for production schemas.
 - `## ADR-015 - Synchronous AI detect contract over async SQS status polling` — Synchronous /v1/detect contract decision.
 - `## ADR-016 - S3 authoritative audit and idempotency store` — S3 authoritative audit and idempotency decision.
+- `## ADR-017 - Lambda Function URLs for dashboard backend API endpoints` — Lambda Function URLs decision (superseded by ADR-018).
+- `## ADR-018 - Single AIOps Lambda container serves AI API contract operations` — Architecture alignment to a single Lambda container runtime.
 
 Each ADR must include these fields (matching template format exactly):
 

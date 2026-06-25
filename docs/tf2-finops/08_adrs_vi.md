@@ -212,7 +212,7 @@
 
 ## ADR-012 - Gọi trực tiếp Lambda/SQS cho AI Engine thay vì qua Private API Gateway (Direct Lambda/SQS AI Engine invocation over Private API Gateway)
 
-- **Trạng thái (Status)**: Partially Superseded by ADR-015
+- **Trạng thái (Status)**: Superseded by ADR-018
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Luồng chạy CDO hiện tại là một quy trình xử lý theo lô (batch workflow) được lập lịch, điều phối bởi EventBridge Scheduler và Step Functions. Hợp đồng API v1.1 của AI yêu cầu các ngữ nghĩa hợp đồng logic `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback`, nhưng kiến trúc không cần đến một Private REST API Gateway riêng biệt khi Step Functions là caller điều phối duy nhất.
 - **Quyết định (Decision)**: Tránh triển khai một Private REST API Gateway vật lý cho luồng chạy lô (batch workflow) lập lịch mặc định, do Step Functions đóng vai trò là caller điều phối duy nhất. Thay vào đó, các giao diện `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, và `/v1/verify` được triển khai thuần túy dưới dạng ngữ nghĩa hợp đồng logic (logical contract semantics). Dưới hạ tầng, Step Functions gọi trực tiếp AI Engine Request Lambda cho `/v1/detect`, hàm này xác thực dữ liệu và đẩy vào hàng đợi SQS để trả về token thực thi nhanh. AI Engine Worker Lambda sẽ xử lý bất đồng bộ hàng đợi, lưu kết quả phát hiện bất thường vào DynamoDB và S3. Quy trình Step Functions thực hiện polling `/v1/status/{correlation_id}` cho đến khi hoàn tất, sau đó gọi `/v1/decide` để lập kế hoạch can thiệp, thực thi các hành động can thiệp đã phê duyệt, và gọi `/v1/verify` để xác minh kết quả. Endpoint rollback `/v1/audit/{audit_id}/rollback` được gọi khi cần hoàn tác thủ công. Private API Gateway bị từ chối trong nền tảng CDO cơ sở để giảm tải chi phí và độ phức tạp dư thừa, chỉ tồn tại như một lựa chọn thiết kế tùy chọn cho việc triển khai đa client trong tương lai.
@@ -268,8 +268,8 @@
 
 - **Trạng thái (Status)**: Accepted
 - **Ngày (Date)**: 2026-06-25
-- **Bối cảnh (Context)**: Hợp đồng của AI Engine Request Lambda phiên bản v1.1.0 đã chuyển dịch từ mô hình phát hiện bất đồng bộ (trả về `202 Accepted` và yêu cầu polling trên `/v1/status/{correlation_id}`) sang mô hình phát hiện đồng bộ (trả về `200 OK` với danh sách dị thường `anomalies_list` cuối cùng trực tiếp trong phản hồi). Thay đổi hợp đồng API này khiến cho hàng đợi thực thi SQS và logic polling cũ trở nên lỗi thời đối với vòng lặp phát hiện chính.
-- **Quyết định (Decision)**: Sử dụng trực tiếp endpoint `/v1/detect` đồng bộ trong workflow điều phối Step Functions của CDO, gọi Request Lambda một cách đồng bộ. Loại bỏ SQS/DLQ khỏi vòng lặp phát hiện chính (chỉ giữ lại SQS cho mục đích retry/backoff cảnh báo). Quyết định này thay thế các phần về luồng phát hiện của ADR-012.
+- **Bối cảnh (Context)**: Hợp đồng của AI Engine Lambda runtime phiên bản v1.1.0 đã chuyển dịch từ mô hình phát hiện bất đồng bộ (trả về `202 Accepted` và yêu cầu polling trên `/v1/status/{correlation_id}`) sang mô hình phát hiện đồng bộ (trả về `200 OK` với danh sách dị thường `anomalies_list` cuối cùng trực tiếp trong phản hồi). Thay đổi hợp đồng API này khiến cho hàng đợi thực thi SQS và logic polling cũ trở nên lỗi thời đối với vòng lặp phát hiện chính.
+- **Quyết định (Decision)**: Sử dụng trực tiếp endpoint `/v1/detect` đồng bộ trong workflow điều phối Step Functions của CDO, gọi AI Engine Lambda runtime một cách đồng bộ. Loại bỏ SQS/DLQ khỏi vòng lặp phát hiện chính (chỉ giữ lại SQS cho mục đích retry/backoff cảnh báo). Quyết định này thay thế các phần về luồng phát hiện của ADR-012.
 - **Hệ quả (Consequence)**:
   - Pro: Loại bỏ các vòng lặp polling của Step Functions để kiểm tra trạng thái phát hiện, giảm độ phức tạp và số lượng trạng thái thực thi.
   - Pro: Loại bỏ hàng đợi SQS và Dead Letter Queue khỏi đường dẫn tới hạn của quá trình thu thập chi phí và chấm điểm phát hiện, giảm chi phí chạy thực tế và chi phí vận hành nền tảng.
@@ -299,7 +299,7 @@
 
 ## ADR-017 - Sử dụng AWS Lambda Function URL cho các API endpoint của backend dashboard (Lambda Function URLs for dashboard backend API endpoints)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-018
 - **Ngày (Date)**: 2026-06-25
 - **Bối cảnh (Context)**: Nền tảng CDO yêu cầu các endpoint HTTP/HTTPS bảo mật, được xác thực để phục vụ các hành động tương tác trên dashboard (ví dụ: kích hoạt rollback thủ công hoặc xác minh can thiệp) nhằm gọi các hàm Containment Lambda và State Lambda ở backend. Chúng tôi cần quyết định giữa việc triển khai AWS API Gateway (HTTP API) hoặc sử dụng tính năng AWS Lambda Function URL gốc.
 - **Quyết định (Decision)**: Triển khai **AWS Lambda Function URL** để cung cấp trực tiếp các endpoint cho các hàm Containment Lambda và State Lambda ở backend. Bảo mật các endpoint này bằng cách định tuyến chúng qua phân phối CloudFront hiện tại và xác thực Cognito session token (JWT) thông qua cổng auth `Lambda@Edge` có sẵn hoặc xác thực trực tiếp trong mã nguồn Lambda.
@@ -312,5 +312,19 @@
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
   - AWS API Gateway (HTTP API): Bị từ chối vì giới hạn timeout tích hợp 30 giây cứng có thể gây lỗi kết nối cho các tác vụ kiểm tra đồng bộ kéo dài, và để tránh thêm các thành phần hạ tầng không cần thiết vào mặt phẳng điều khiển serverless.
 
+---
 
+## ADR-018 - Sử dụng một container Lambda duy nhất của AIOps để phục vụ các hoạt động hợp đồng AI API (Single AIOps Lambda container serves AI API contract operations)
 
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Các tài liệu kiến trúc trước đây đã đề xuất mô hình phân tách hàm Request/Worker Lambda với cơ chế đệm SQS cho việc phát hiện bất thường của AI Engine, đồng thời gợi ý sử dụng các hàm backend API Gateway riêng biệt cho các tương tác trên dashboard. Hệ thống yêu cầu sự nhất quán về mặt kiến trúc, đơn giản hóa quy trình triển khai và phân định rõ ràng trách nhiệm giữa đội ngũ nền tảng CDO và đội ngũ mô hình AIOps.
+- **Quyết định (Decision)**: Nhất quán hóa việc tích hợp nền tảng CDO để hướng tới một hình ảnh ECR duy nhất do AIOps cung cấp được triển khai dưới dạng một hàm Lambda container của AWS. Môi trường chạy duy nhất này sẽ phục vụ tất cả các hoạt động hợp đồng logic (`/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, và `/health`). CDO quản lý nền tảng hosting (mạng VPC, ghim mã băm hình ảnh ECR digest, vai trò thực thi IAM, giới hạn reserved concurrency, và giám sát), trong khi AIOps sở hữu logic bên trong container (mô hình, logic API, điểm số tin cậy và các văn bản giải thích). SQS và DLQ hoàn toàn bị loại bỏ khỏi vòng lặp thực thi của AI Engine và chỉ được sử dụng làm vùng đệm retry cho alert routing. Để hỗ trợ các hành động tương tác trên dashboard, hàm Lambda của AI Engine được công khai qua một AWS Lambda Function URL bảo mật được ánh xạ đằng sau phân phối CloudFront duy nhất dưới dạng hành vi dẫn đường `/v1/*`. Tất cả các hàm Lambda khác do CDO sở hữu (Lambda Thu nhận, Lambda Trạng thái, và Lambda Ngăn chặn) đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions và không có endpoint công khai hoặc Function URL riêng biệt.
+- **Hệ quả (Consequence)**:
+  - Pro: Loại bỏ độ phức tạp khi triển khai và các vấn đề đồng bộ hóa runtime của việc duy trì nhiều định nghĩa và cấu hình hàm container.
+  - Pro: Phân định rõ ràng trách nhiệm: CDO sở hữu hạ tầng hosting, bảo mật, mạng VPC và chính sách thực thi; AIOps sở hữu mã nguồn mô hình, logic API và kết quả phát hiện.
+  - Pro: Loại bỏ độ trễ của hàng đợi SQS và độ phức tạp của dead-letter queue khỏi đường dẫn tới hạn của việc phát hiện bất thường chi phí.
+  - Trade-off: Vai trò thực thi Lambda duy nhất phải được cấp quyền đọc dữ liệu S3 đã được chuẩn hóa và cache các dị thường trong DynamoDB, đòi hỏi các giới hạn tài nguyên nghiêm ngặt.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Giữ nguyên các cấu hình container Request và Worker Lambda riêng biệt: Bị từ chối vì việc duy trì hai triển khai Lambda cho cùng một image mô hình sẽ tạo ra các định nghĩa tài nguyên Terraform dư thừa, gây ra hai lần Cold Start và yêu cầu mã polling bất đồng bộ phức tạp.
+  - Triển khai một Private REST API Gateway facade: Bị từ chối đối với luồng batch theo lịch trình để giảm thiểu chi phí hạ tầng, do Step Functions có thể gọi trực tiếp hàm Lambda container một cách an toàn và bảo mật.

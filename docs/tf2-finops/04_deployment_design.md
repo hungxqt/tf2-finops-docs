@@ -247,5 +247,5 @@ Core deployment alarms cover Step Functions failure, Lambda error rate, AI Engin
 
 ## Related documents
 
-- [`02_infra_design.md`](02_infra_design.md) - AI Engine Request and Worker Lambda container functions, and SQS/DLQ routing.
+- [`02_infra_design.md`](02_infra_design.md) - AI Engine Lambda container function, and alert SQS/DLQ routing.
 - [`03_security_design.md`](03_security_design.md) - Lambda Execution Role configurations, VPC endpoints, and security groups.

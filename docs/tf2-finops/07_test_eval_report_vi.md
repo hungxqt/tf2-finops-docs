@@ -207,7 +207,7 @@ Bản demo End-to-End chứng minh toàn bộ quy trình thu thập, phát hiệ
 ### 7.1 Các điểm thâm nhập thử nghiệm (Penetration touch points)
 
 - **S3 Bucket Access Control**: Các thử nghiệm xác minh rằng S3 bucket của CUR và S3 bucket của nhật ký kiểm toán từ chối tất cả các yêu cầu bắt nguồn từ bên ngoài VPC endpoint policies và các vai trò IAM được chỉ định.
-- **Lambda Invocation Isolation**: Xác minh rằng việc gọi trực tiếp các hàm Request và Worker Lambda bị chặn đối với bất kỳ danh tính IAM nào thiếu quyền `lambda:InvokeFunction` rõ ràng.
+- **Lambda Invocation Isolation**: Xác minh rằng việc gọi trực tiếp hàm Lambda của AI Engine bị chặn đối với bất kỳ danh tính IAM nào thiếu quyền `lambda:InvokeFunction` rõ ràng.
 - **Containment IAM Restrictions**: Xác minh rằng các role execution Lambda được sử dụng cho các hành động containment bị chặn không cho phép sửa đổi các chính sách IAM, xóa dữ liệu S3 hoặc tắt các khối lượng công việc sản xuất quan trọng.
 
 ### 7.2 Quét lỗ hổng bảo mật (Vulnerability scan)
