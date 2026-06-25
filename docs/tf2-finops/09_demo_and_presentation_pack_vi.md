@@ -14,7 +14,7 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
 
 ### Bước 1 - Chèn bất thường chi phí giả lập (Step 1 - Inject synthetic cost anomaly)
 - **Hành động (Action)**: Chạy kịch bản chèn giả lập để đưa các bản ghi chi phí vào S3 raw billing bucket.
-- **Thông số kỹ thuật Telemetry (Telemetry Specifications)**: Dữ liệu telemetry là dạng hybrid, kết hợp dữ liệu chi phí (S3 CUR partition pulls và Cost Explorer API queries) với dữ liệu đo lường hiệu suất CloudWatch (`resource_utilization_metrics` như CPU utilization, bộ nhớ, kết nối cơ sở dữ liệu và I/O đĩa). Nếu thiếu dữ liệu đo lường hiệu suất CloudWatch, hệ thống tự động kích hoạt chế độ dự phòng CUR-only, làm giảm một nửa độ tin cậy phát hiện (`confidence *= 0.5`) và giới hạn các biện pháp can thiệp ở chế độ dry-run/cảnh báo thuần túy.
+- **Thông số kỹ thuật Telemetry (Telemetry Specifications)**: Nguồn thu nhận dữ liệu đo lường mặc định sử dụng dữ liệu CUR đã hoàn chỉnh thông qua phân vùng S3 (Loại thu nhận dữ liệu: `S3_POINTER`). Nếu việc truyền tải dữ liệu CUR bị trễ (được phát hiện qua kiểm tra độ trễ của hệ thống), nền tảng CDO sẽ đặt tham số yêu cầu `telemetry_delay_event = true` và chuyển sang chế độ dự phòng gọi API Cost Explorer hàng ngày. Dữ liệu telemetry là dạng hybrid, kết hợp dữ liệu chi phí với dữ liệu đo lường hiệu suất CloudWatch (`resource_utilization_metrics` như CPU utilization, bộ nhớ, kết nối cơ sở dữ liệu và I/O đĩa). Nếu thiếu dữ liệu đo lường hiệu suất CloudWatch, hệ thống tự động kích hoạt chế độ dự phòng CUR-only, thiết lập `data_confidence = LOW` và giới hạn các biện pháp can thiệp ở chế độ dry-run/cảnh báo thuần túy.
 - **Payload**: Một lô các bản ghi EC2 giả lập hiển thị mức tăng chi phí đột ngột gấp 10 lần trên một cụm instance GPU không được quản lý (ví dụ: chi tiêu 500 USD cho EC2 g5.4xlarge).
 - **Xác minh (Verification)**: Kiểm tra đường dẫn tệp S3 raw zone: `s3://cdo-raw-cost-bucket/exports/year=2026/month=06/`.
 
@@ -32,14 +32,16 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
   - `X-Correlation-Id`: UUID theo dõi luồng thực thi.
   - `X-Payload-SHA256`: Mã băm SHA256 của payload yêu cầu để kiểm tra tính toàn vẹn.
   - `X-Request-Timestamp`: Nhãn thời gian định dạng ISO 8601.
+  - `telemetry_delay_event`: Cờ Boolean (`true` nếu CUR bị trễ và chế độ dự phòng Cost Explorer hàng ngày đang hoạt động, ngược lại là `false`).
 - **Payload yêu cầu**:
   - Schema URL: `telemetry://finops-watch/v3`.
-  - Ingestion Type: `RAW_JSON` cho truy vấn Cost Explorer API (<10MB) hoặc `S3_POINTER` cho dữ liệu CUR trong S3 (<500MB).
+  - Data Ingestion Type: `S3_POINTER` trỏ đến dữ liệu CUR trong S3 (nguồn phát hiện mặc định), hoặc `RAW_JSON` chứa kết quả truy vấn Cost Explorer API hàng ngày (chỉ dự phòng khi CUR bị trễ, tức là `telemetry_delay_event = true`).
   - Control Flags: `is_ad_hoc` (bỏ qua kiểm tra idempotency 24h cho các quét khẩn cấp), `is_estimated` (chi tiêu ước tính từ CE, làm giảm độ tin cậy và bỏ qua tự động containment), `is_forced_dry_run` (nếu độ hoàn thiện dữ liệu telemetry < 0.8, bắt buộc chạy chế độ dry-run).
   - Dữ liệu Telemetry: Chi phí, metadata, và các chỉ số hiệu suất CloudWatch (với cơ chế tự động chuyển sang chế độ CUR-only nếu thiếu dữ liệu hiệu suất).
 - **Xác minh (Verification)**: Kiểm tra nhật ký thực thi Lambda để tìm phản hồi đồng bộ thành công chứa:
   - `success`: `true`
   - `correlation_id` (UUID theo dõi)
+  - `data_confidence`: `"HIGH"` (chỉ ra lượt chạy CUR + hiệu suất hoàn chỉnh) hoặc `"LOW"` (chỉ ra chế độ dự phòng do trễ dữ liệu CUR hoặc dữ liệu telemetry bị suy giảm)
   - `anomalies_detected`: `true`
   - `anomalies_list` (chứa các đối tượng bất thường chi tiết)
 
@@ -48,6 +50,7 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
 - **Hành động nội bộ (Internal Action)**: Nền tảng CDO đánh giá phản hồi đồng bộ. Nếu `anomalies_detected` là true, nó ghi trạng thái thực thi và nhật ký kiểm toán vào kho lưu trữ có thẩm quyền S3 (dưới `s3://company-cdo-telemetry/`) có kích hoạt Object Lock, và cập nhật DynamoDB dashboard cache.
 - **Payload kết quả (lưu trữ trong S3/DynamoDB)**:
   - `correlation_id`: Khớp với UUID thực thi.
+  - `data_confidence`: Mức độ tin cậy của dữ liệu telemetry (`HIGH` hoặc `LOW`).
   - `anomalies_list`: Mảng chứa các bất thường chi phí phát hiện được với các trường: `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, `alert_routing`.
 - **Xác minh & Biện pháp an toàn (Verification & Fail-safes)**:
   - Nếu phát hiện trùng lặp khóa idempotency, AI Engine trả về cấu trúc phản hồi xung đột (đại diện cho ngữ nghĩa HTTP `409`).
@@ -58,19 +61,19 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
 ### Bước 5 - Nhận Kế hoạch Can thiệp (Ngữ nghĩa logic POST /v1/decide) (Step 5 - Get Intervention Plan)
 - **Hành động (Action)**: Khi trạng thái hoàn thành, Step Functions gọi hàm Lambda của AI Engine (đại diện cho ngữ nghĩa `/v1/decide`) để nhận báo cáo phân tích nguyên nhân gốc rễ (RCA) và kế hoạch hành động containment.
 - **Tham số yêu cầu (Request Parameters)**: Các headers `X-Correlation-Id` và `X-Tenant-Id`.
-- **Xác minh (Verification)**: Xác minh rằng AI Engine trả về kế hoạch chứa mã lệnh AWS CLI chính xác (ví dụ: `aws ec2 create-tags` ở chế độ dry-run) và payload lệnh hoàn tác rollback tương ứng.
+- **Xác minh (Verification)**: Xác minh rằng AI Engine trả về kế hoạch chứa mã lệnh AWS CLI chính xác (ví dụ: `aws ec2 create-tags` ở chế độ dry-run), payload lệnh hoàn tác rollback tương ứng, và khối cấu hình `rollback_payload.boto3_equivalent`.
 
 ### Bước 6 - Xác thực và truy cập bảng điều khiển CDO (Cognito Hosted UI) (Step 6 - Authenticate and access CDO dashboard)
 - **Hành động (Action)**: Mở URL CloudFront của bảng điều khiển trong trình duyệt. Xác minh bạn tự động được chuyển hướng đến màn hình đăng nhập Cognito Hosted UI. Đăng nhập bằng tài khoản người dùng Finance (liên kết với nhóm `finops-finance-readonly`).
 - **Hành động nội bộ (Internal Action)**: CloudFront chuyển tiếp yêu cầu sau khi lớp xác thực Lambda@Edge chặn yêu cầu, xác thực token Cognito JWT và gửi đến bucket S3 riêng tư. Giao diện dashboard phân tích thông tin claim nhóm trong mã JWT.
-- **Xác minh (Verification)**: Xác nhận biểu đồ xu hướng chi tiêu hàng ngày và các điểm bất thường được hiển thị thành công, nhưng các nút kích hoạt thực thi Kế hoạch Hành động và các nút hoàn tác Rollback hoàn toàn bị vô hiệu hóa hoặc ẩn đi. Nếu khóa ngân sách lỗi (error budget lock) đang hoạt động (tỷ lệ rollback thủ công vượt quá 1% trong 30 ngày), xác minh rằng một banner đỏ cảnh báo nổi bật hiển thị tenant đang ở chế độ `LOCKED_MODE`.
+- **Xác minh (Verification)**: Xác nhận biểu đồ xu hướng chi tiêu hàng ngày và các điểm bất thường được hiển thị thành công, nhưng các nút kích hoạt thực thi Kế hoạch Hành động và các nút hoàn tác Rollback hoàn toàn bị vô hiệu hóa hoặc ẩn đi. Nếu khóa ngân sách lỗi (error budget lock) đang hoạt động (prod >1%, staging >10%, dev/sandbox bị vô hiệu hóa), xác minh rằng một banner đỏ cảnh báo nổi bật hiển thị tenant đang ở chế độ `LOCKED_MODE` với lý do khóa là `error_budget_exceeded_threshold`.
 
 ### Bước 7 - Định tuyến cảnh báo (Step 7 - Route alerts)
 - **Hành động (Action)**: Kiểm tra các kênh thông báo.
 - **Hành động nội bộ (Internal Action)**: Alert Routing Lambda kiểm tra mức độ nghiêm trọng của bất thường và các tag sở hữu của squad.
 - **Xác minh (Verification)**: 
-  - Slack: Xác minh rằng một tin nhắn thông báo đã đến kênh `#squad-prediction-models` chứa ARN tài nguyên, chi phí chênh lệch, correlation ID và liên kết bảng điều khiển.
-  - SES/SNS: Xác minh rằng danh sách gửi thư của Finance đã nhận được email tóm tắt về đột biến chi phí và đề xuất kế hoạch hành động.
+  - Slack: Xác minh rằng một tin nhắn thông báo đã đến kênh `#squad-prediction-models` chứa ARN tài nguyên, chi phí chênh lệch, độ tin cậy dữ liệu, correlation ID và liên kết bảng điều khiển.
+  - SES/SNS: Xác minh rằng danh sách gửi thư của Finance đã nhận được email tóm tắt về đột biến chi phí, giải thích độ tin cậy dữ liệu, và đề xuất kế hoạch hành động.
 
 ### Bước 8 - Thực thi containment ở chế độ giả lập (được xác thực bởi Cognito) (Step 8 - Execute dry-run containment)
 - **Hành động (Action)**: Đăng xuất khỏi phiên làm việc Finance và đăng nhập lại bằng tài khoản điều hành viên Kỹ thuật (thuộc nhóm `finops-engineering-operator`). Tìm bất thường đang hoạt động trên dashboard và nhấp vào nút "Execute Plan" (Thực thi Kế hoạch).
@@ -83,9 +86,14 @@ Kịch bản này hướng dẫn người thuyết trình cách trình diễn to
 - **Xác minh (Verification)**: Xác minh API trả về trạng thái kết quả `DONE`, `RETRY`, hoặc `ROLLBACK` và ghi nhận kết quả xác thực.
 
 ### Bước 10 - Thực thi hoàn tác thủ công/tự động (Ngữ nghĩa logic POST /v1/audit/{audit_id}/rollback) (Step 10 - Execute manual/auto rollback)
-- **Hành động (Action)**: Trong khi đăng nhập dưới quyền điều hành viên Kỹ thuật, nhấp vào nút "Revert/Rollback" trên dashboard, hoặc khi xác thực kết quả can thiệp trả về `ROLLBACK` kích hoạt tự động hoàn tác.
-- **Hành động nội bộ (Internal Action)**: Dashboard/workflow kích hoạt Lambda xử lý rollback (đại diện cho ngữ nghĩa `/v1/audit/{audit_id}/rollback`) cùng thông tin phiên đăng nhập Cognito. Backend kiểm tra thông tin claim nhóm Cognito, xác minh ngữ cảnh bên thuê (tenant context), và kích hoạt hoàn tác tag.
-- **Xác minh (Verification)**: Kiểm tra nhật ký CLI và bản ghi S3/DynamoDB để xác nhận trạng thái kiểm toán thay đổi thành `RollbackCompleted` với ID người dùng Cognito của điều hành viên được ghi lại trong trường `actor`. Xác nhận nỗ lực của người dùng Finance sẽ trả về lỗi phân quyền (đại diện cho lỗi HTTP `403 Forbidden` dưới dạng dữ liệu logic) và tạo ra bản ghi kiểm toán `unauthorized_action_blocked`. Nếu tỷ lệ rollback thủ công vượt quá 1% trong chu kỳ 30 ngày, xác minh tenant bị khóa vào trạng thái `LOCKED_MODE` (bắt buộc mọi quyết định sau đó chạy dry-run).
+- **Hành động (Action)**: Trong khi đăng nhập dưới quyền điều hành viên Kỹ thuật, nhấp vào nút "Revert/Rollback" trên dashboard. Thử thực hiện hành động tương tự khi đăng nhập bằng tài khoản Finance để xác minh việc từ chối.
+- **Hành động nội bộ (Internal Action)**: Giao diện dashboard kích hoạt Lambda xử lý rollback (đại diện cho ngữ nghĩa `/v1/audit/{audit_id}/rollback`) cùng thông tin phiên đăng nhập Cognito. CDO backend kiểm tra thông tin claim nhóm Cognito, xác minh ngữ cảnh bên thuê (tenant context), đọc cấu hình `rollback_payload.boto3_equivalent` đã được lưu cache từ S3, thực thi các hành động rollback trực tiếp thông qua Boto3 (đảm bảo thực thi ngay cả khi AI Engine ngoại tuyến), sau đó thông báo cho endpoint kiểm toán hoàn tác của AI Engine.
+- **Xác minh (Verification)**: Kiểm tra nhật ký CLI và bản ghi S3/DynamoDB để xác nhận trạng thái kiểm toán thay đổi thành `RollbackCompleted` (trả về `audit_recorded = true`) với ID người dùng Cognito của điều hành viên được ghi lại trong trường `actor`. Xác nhận nỗ lực của người dùng Finance sẽ trả về lỗi phân quyền (đại diện cho lỗi HTTP `403 Forbidden` dưới dạng dữ liệu logic) và tạo ra bản ghi kiểm toán `unauthorized_action_blocked`. Nếu tỷ lệ rollback thủ công vượt quá ngưỡng môi trường (prod 1%, staging 10%), xác minh tenant bị khóa vào trạng thái `LOCKED_MODE` (bắt buộc mọi quyết định sau đó chạy dry-run).
+
+### Bước 11 - Xác minh truyền tải callback (Step 11 - Verify callback delivery)
+- **Hành động (Action)**: Giám sát nhật ký của endpoint nhận callback trong quá trình chạy bất đồng bộ.
+- **Hành động nội bộ (Internal Action)**: Khi AI Engine hoàn thành phân tích, nó truyền các bản cập nhật trạng thái đến endpoint callback của CDO.
+- **Xác minh (Verification)**: Xác nhận việc phân phối callback được ghi nhận là dữ liệu đo lường vận hành của hệ thống. Xác minh rằng nếu việc gửi callback thất bại, hệ thống sẽ thực hiện lịch trình thử lại (0 giây, 30 giây, 120 giây) và ghi nhận `CALLBACK_EXHAUSTED` khi thất bại hoàn toàn mà không làm gián đoạn kết quả phát hiện đồng bộ chính.
 
 ---
 
@@ -123,9 +131,9 @@ Các điểm bán hàng chính của kiến trúc data lakehouse tập trung và
 Các lập luận kiến trúc cho các câu hỏi thử thách phổ biến:
 
 - **Làm thế nào để xử lý độ trễ xuất dữ liệu CUR của AWS (lên tới 24 giờ)? (How do you handle AWS CUR data export lag?)**
-  - *Phản hồi*: Mặc dù các bản xuất CUR có độ trễ cố định, chu kỳ lập lịch 24 giờ của chúng tôi (ADR-001) được thiết kế để căn chỉnh với chu kỳ này. Để thu hẹp khoảng cách cho các cảnh báo thời gian thực quan trọng, data plane của chúng tôi kết hợp các bản xuất CUR với các cuộc gọi hàng ngày đến AWS Cost Explorer API, nơi cung cấp các dữ liệu tổng hợp chi phí có độ trễ thấp hơn.
+  - *Phản hồi*: Pipeline thu nhận dữ liệu mặc định của nền tảng CDO lấy các bản xuất CUR parquet đã hoàn chỉnh từ S3 bằng cách sử dụng phân vùng (`định dạng S3_POINTER`, khẳng định `telemetry_delay_event = false` và trả về `data_confidence = HIGH`). Nếu các kiểm tra độ trễ của hệ thống phát hiện việc trễ dữ liệu CUR, pipeline CDO sẽ đặt tham số yêu cầu `telemetry_delay_event = true`, kích hoạt cơ chế truy vấn dự phòng đối với các chỉ số từ AWS Cost Explorer API hàng ngày, và AI Engine sẽ trả về `data_confidence = LOW` để cảnh báo cho các bên liên quan về sự suy giảm độ tươi mới của dữ liệu.
 - **Làm thế nào để xử lý các cảnh báo giả của AI Engine (mở rộng quy mô bình thường bị phân loại là bất thường)? (How do you handle AI Engine false positives?)**
-  - *Phản hồi*: Tư thế containment ưu tiên an toàn của chúng tôi (ADR-005) đảm bảo rằng không có hành động hủy hoại tự động nào được thực hiện trên các tài nguyên sản xuất. Hơn nữa, các squad kỹ thuật nhận được cảnh báo Slack và dashboard hiển thị chi tiết kế hoạch can thiệp được đề xuất. Điều hành viên Kỹ thuật có thể xem xét thủ công và bấm nút "Execute Plan" (Thực thi Kế hoạch), hoặc hoàn tác hành động nếu phát hiện cảnh báo giả. Ngoài ra, dữ liệu telemetry phát hiện là dạng hybrid (CUR + Cost Explorer + CloudWatch utilization metrics), giúp nâng cao độ chính xác phân loại. Nếu thiếu dữ liệu CloudWatch, hệ thống tự động chuyển sang chế độ CUR-only, làm giảm một nửa độ tin cậy phát hiện (`confidence *= 0.5`) và khóa containment ở chế độ dry-run hoặc cảnh báo, ngăn chặn các hành động sai lệch.
+  - *Phản hồi*: Tư thế containment ưu tiên an toàn của chúng tôi (ADR-005) đảm bảo rằng không có hành động hủy hoại tự động nào được thực hiện trên các tài nguyên sản xuất. Hơn nữa, các squad kỹ thuật nhận được cảnh báo Slack và dashboard hiển thị chi tiết kế hoạch can thiệp được đề xuất. Điều hành viên Kỹ thuật có thể xem xét thủ công và bấm nút "Execute Plan" (Thực thi Kế hoạch), hoặc hoàn tác hành động nếu phát hiện cảnh báo giả. Ngoài ra, dữ liệu telemetry phát hiện là dạng hybrid (CUR + Cost Explorer + CloudWatch utilization metrics), giúp nâng cao độ chính xác phân loại. Nếu thiếu dữ liệu CloudWatch, hệ thống tự động chuyển sang chế độ CUR-only, thiết lập `data_confidence = LOW` và khóa containment ở chế độ dry-run hoặc cảnh báo, ngăn chặn các hành động sai lệch. Nếu hành động hoàn tác được kích hoạt, hệ thống sẽ theo dõi tỷ lệ hoàn tác và thực thi khóa ngân sách lỗi phân tầng: prod khóa ở mức >=1%, staging khóa ở mức >=10%, và dev/sandbox không bao giờ khóa, đồng thời hiển thị banner `LOCKED_MODE` trên dashboard với lý do khóa là `error_budget_exceeded_threshold`.
 - **Điều gì xảy ra nếu một lỗi phần mềm kích hoạt containment tự động trên các tài nguyên sản xuất? (What happens if a bug triggers automated containment on production assets?)**
   - *Phản hồi*: Containment trong môi trường sản xuất được khóa cứng ở chế độ dry-run ở cả cấp chính sách IAM và cấp thời gian chạy (runtime) của Lambda (Giá trị An toàn: `Never`). Ngay cả trong trường hợp hỏng cơ sở dữ liệu hoặc lỗi mã nguồn, các vai trò IAM được gán cho Lambda thực thi containment không sở hữu các quyền cần thiết để xóa, hủy hoặc tắt các tài nguyên sản xuất.
 - **Nền tảng xử lý tình trạng throttling API của AWS Cost Explorer như thế nào trong quá trình mở rộng quy mô? (How does the platform handle AWS Cost Explorer API throttling during scaling?)**
@@ -133,11 +141,11 @@ Các lập luận kiến trúc cho các câu hỏi thử thách phổ biến:
 - **Điều gì xảy ra nếu bảng điều khiển bị mất đồng bộ với các tài nguyên AWS thực tế? (What happens if the dashboard becomes out-of-sync with actual AWS resources?)**
   - *Phản hồi*: Các tài nguyên tĩnh của bảng điều khiển được cập nhật ngay lập tức vào cuối mỗi lần chạy pipeline. Một invalidation CloudFront được kích hoạt bằng lập trình để xóa các bộ nhớ đệm ở cạnh. Một nút "Sync Now" cũng được cung cấp trên giao diện để truy vấn trực tiếp các bản ghi DynamoDB.
 - **Bảo mật hoàn tác được thực thi như thế nào để ngăn chặn các thay đổi tài nguyên trái phép? (How is rollback security enforced to prevent unauthorized resource changes?)**
-  - *Phản hồi*: Việc thực thi hoàn tác gọi Lambda adapter hoàn tác, kích hoạt endpoint `/v1/audit/{audit_id}/rollback`. Nó yêu cầu các quyền IAM và xác minh MFA tương tự. Mỗi yêu cầu rollback được xác thực phân quyền qua Cognito, xác minh ngữ cảnh tenant và ghi nhật ký kiểm toán vào kho lưu trữ WORM trong S3. Nếu tỷ lệ rollback thủ công vượt quá 1% trong chu kỳ 30 ngày, hệ thống tự động kích hoạt khóa ngân sách lỗi (`LOCKED_MODE`), bắt buộc mọi hành động can thiệp tiếp theo chạy dry-run/cảnh báo cho đến khi sự cố được khắc phục.
+  - *Phản hồi*: Việc thực thi hoàn tác được xác thực bằng cách sử dụng xác thực Cognito JWT token, xác minh ngữ cảnh bên thuê (tenant context) và được ghi nhật ký vào kho lưu trữ WORM trong S3. CDO backend đọc cấu hình `rollback_payload.boto3_equivalent` đã được lưu cache từ pha decide và thực thi trực tiếp các cuộc gọi AWS Boto3 tiêu chuẩn, đảm bảo rằng việc khôi phục vẫn được thực thi bình thường ngay cả khi AI Engine ngoại tuyến. Kết quả thực thi sau đó được báo cáo lại cho endpoint kiểm toán hoàn tác. Để ngăn chặn các cuộc tấn công phát lại (replay attacks) và xử lý độ trễ thanh toán, chúng tôi tách biệt các kiểm tra clock skew: lệch thời gian yêu cầu API > 300 giây sẽ bị từ chối (`ERR_REPLAY_DETECTED`), trong khi độ trễ dữ liệu CUR lên tới 36 giờ được chấp nhận.
 - **Ai sở hữu triển khai và vòng đời vận hành Lambda container của AI Engine dùng chung? (Who owns the Lambda container deployment and operational lifecycle of the shared AI Engine?)**
   - *Phản hồi*: CDO sở hữu việc triển khai hạ tầng host (VPC, subnets, Lambda functions, giới hạn concurrency, role execution, queues, và DynamoDB state stores) để đảm bảo tính sẵn sàng, bảo mật của hệ thống và kiểm soát thực thi IAM. AIOps sở hữu logic mô hình AI, logic RCA/khuyến nghị, thực thi rules engine dự phòng cục bộ, tuân thủ hợp đồng API nội bộ, và build container image.
 - **Điều gì xảy ra nếu AI Engine gặp lỗi, quá thời gian phản hồi, hoặc nhận được các yêu cầu trùng lặp? (What happens if the AI Engine fails, times out, or receives duplicate requests?)**
-  - *Phản hồi*: Nếu AI Engine phát hiện các khóa idempotency trùng lặp, nó trả về cấu trúc phản hồi xung đột (đại diện cho ngữ nghĩa HTTP `409`), hoặc cấu trúc không khớp (đại diện cho ngữ nghĩa HTTP `400` với mã lỗi `ERR_IDEMPOTENCY_MISMATCH`) nếu các payload khác nhau. Nếu Bedrock bị hết thời gian chờ (giới hạn cứng 45s của Bedrock API, trả về mã lỗi `ERR_LLM_TIMEOUT`) hoặc dịch vụ bị lỗi (`ERR_SERVICE_DOWN`), pipeline CDO sẽ lập tức chuyển sang thực thi rules engine tĩnh và kích hoạt cảnh báo SRE, đảm bảo một trạng thái containment an toàn tuyệt đối.
+  - *Phản hồi*: Nếu AI Engine phát hiện các khóa idempotency trùng lặp, nó trả về cấu trúc phản hồi xung đột (đại diện cho ngữ nghĩa HTTP `409`), hoặc cấu trúc không khớp (đại diện cho ngữ nghĩa HTTP `400` với mã lỗi `ERR_IDEMPOTENCY_MISMATCH`) nếu các payload khác nhau. Nếu Bedrock bị hết thời gian chờ (giới hạn cứng 45s của Bedrock API, trả về mã lỗi `ERR_LLM_TIMEOUT`) hoặc dịch vụ bị lỗi (`ERR_SERVICE_DOWN`), pipeline CDO sẽ lập tức chuyển sang thực thi rules engine tĩnh và kích hoạt cảnh báo SRE, đảm bảo một trạng thái containment an toàn tuyệt đối. Nếu AI Engine ngoại tuyến trong quá trình thực hiện hành động hoàn tác, CDO backend sẽ tự động thực hiện hoàn tác bằng cấu hình `rollback_payload.boto3_equivalent` đã lưu cache và báo cáo trạng thái thực thi lên endpoint kiểm toán, trả về `audit_recorded = true`.
 
 ---
 

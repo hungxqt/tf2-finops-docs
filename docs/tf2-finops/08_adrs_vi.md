@@ -71,7 +71,7 @@
 
 ## ADR-004 - Truy cập dữ liệu qua CUR S3 kết hợp với Cost Explorer API (CUR S3 plus Cost Explorer API data access)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-019
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Nền tảng yêu cầu cả các chỉ số chi phí chi tiết ở cấp tài nguyên (có cấu trúc cao) và các truy vấn dữ liệu chi phí hàng ngày để bắt các mô hình bất thường.
 - **Quyết định (Decision)**: Kết hợp AWS Data Exports (CUR 2.0) được phân phối tới S3 với các truy vấn trực tiếp đến AWS Cost Explorer API. CUR được sử dụng cho việc phân tích sâu lịch sử, phân tích phân vùng và các xu hướng trên bảng điều khiển, trong khi Cost Explorer API phục vụ như cơ chế truy vấn hàng ngày chính cho các lượt chạy theo lịch. Để tránh vượt quá giới hạn tần suất nghiêm ngặt **5 requests/second** của Cost Explorer, CDO thực hiện cache kết quả truy vấn vào DynamoDB; AI Engine tiêu thụ dữ liệu cost đã cache này khi cần dữ liệu baseline 7 ngày và 30 ngày thay vì gọi trực tiếp Cost Explorer API.
@@ -268,7 +268,7 @@
 
 - **Trạng thái (Status)**: Accepted
 - **Ngày (Date)**: 2026-06-25
-- **Bối cảnh (Context)**: Hợp đồng của AI Engine Lambda runtime phiên bản v1.1.0 đã chuyển dịch từ mô hình phát hiện bất đồng bộ (trả về `202 Accepted` và yêu cầu polling trên `/v1/status/{correlation_id}`) sang mô hình phát hiện đồng bộ (trả về `200 OK` với danh sách dị thường `anomalies_list` cuối cùng trực tiếp trong phản hồi). Thay đổi hợp đồng API này khiến cho hàng đợi thực thi SQS và logic polling cũ trở nên lỗi thời đối với vòng lặp phát hiện chính.
+- **Bối cảnh (Context)**: Hợp đồng của AI Engine Lambda runtime phiên bản v1.3.0 đã chuyển dịch từ mô hình phát hiện bất đồng bộ (trả về `202 Accepted` và yêu cầu polling trên `/v1/status/{correlation_id}`) sang mô hình phát hiện đồng bộ (trả về `200 OK` với danh sách dị thường `anomalies_list` cuối cùng trực tiếp trong phản hồi). Thay đổi hợp đồng API này khiến cho hàng đợi thực thi SQS và logic polling cũ trở nên lỗi thời đối với vòng lặp phát hiện chính.
 - **Quyết định (Decision)**: Sử dụng trực tiếp endpoint `/v1/detect` đồng bộ trong workflow điều phối Step Functions của CDO, gọi AI Engine Lambda runtime một cách đồng bộ. Loại bỏ SQS/DLQ khỏi vòng lặp phát hiện chính (chỉ giữ lại SQS cho mục đích retry/backoff cảnh báo). Quyết định này thay thế các phần về luồng phát hiện của ADR-012.
 - **Hệ quả (Consequence)**:
   - Pro: Loại bỏ các vòng lặp polling của Step Functions để kiểm tra trạng thái phát hiện, giảm độ phức tạp và số lượng trạng thái thực thi.
@@ -276,7 +276,7 @@
   - Pro: Nhận phản hồi tức thì về sự thành công, correlation ID và danh sách các dị thường trực tiếp từ một payload gọi duy nhất.
   - Trade-off: Thời gian gọi đồng bộ của Step Functions tăng lên, nhưng vẫn nằm trong giới hạn thực thi 15 phút an toàn của AWS Lambda (vì quá trình phân tích CUR và thực thi mô hình Bedrock Nova hoàn tất trong 30-45 giây).
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
-  - Giữ lại cơ chế polling SQS bất đồng bộ: Bị từ chối vì hợp đồng API v1.1.0 được đóng băng giữa CDO và AIOps bắt buộc phân phối phản hồi đồng bộ cho route `/v1/detect` để đơn giản hóa việc tích hợp phía client và giảm thiểu sự phình to của hạ tầng AWS.
+  - Giữ lại cơ chế polling SQS bất đồng bộ: Bị từ chối vì hợp đồng API v1.3.0 được đóng băng giữa CDO và AIOps bắt buộc phân phối phản hồi đồng bộ cho route `/v1/detect` để đơn giản hóa việc tích hợp phía client và giảm thiểu sự phình to của hạ tầng AWS.
 
 ---
 
@@ -327,4 +327,42 @@
   - Trade-off: Vai trò thực thi Lambda duy nhất phải được cấp quyền đọc dữ liệu S3 đã được chuẩn hóa và cache các dị thường trong DynamoDB, đòi hỏi các giới hạn tài nguyên nghiêm ngặt.
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
   - Giữ nguyên các cấu hình container Request và Worker Lambda riêng biệt: Bị từ chối vì việc duy trì hai triển khai Lambda cho cùng một image mô hình sẽ tạo ra các định nghĩa tài nguyên Terraform dư thừa, gây ra hai lần Cold Start và yêu cầu mã polling bất đồng bộ phức tạp.
-  - Triển khai một Private REST API Gateway facade: Bị từ chối đối với luồng batch theo lịch trình để giảm thiểu chi phí hạ tầng, do Step Functions có thể gọi trực tiếp hàm Lambda container một cách an toàn và bảo mật.
+  - Triển khai một Private REST API Gateway facade: Bị từ chối đối với luồng batch theo lịch trình để giảm thiểu chi phí hạ tầng, do Step Functions có thể gọi trực tiếp hàm Lambda container một cách an sau và bảo mật.
+
+---
+
+## ADR-019 - Phát hiện dựa trên CUR là chính kết hợp dự phòng có điều kiện qua Cost Explorer
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Hợp đồng AI API v1.3.0 thay đổi `aws_cost_explorer_daily` từ đầu vào luôn bắt buộc thành phương án dự phòng có điều kiện chỉ được sử dụng khi dữ liệu CUR bị trễ. Nền tảng CDO cũng cần các tên bucket đo lường độc nhất trên toàn cầu để nhiều nhóm CDO có thể triển khai song song mà không bị xung đột tên S3.
+- **Quyết định (Decision)**: Sử dụng dữ liệu CUR trong S3 làm nguồn phát hiện mặc định theo lịch trình. Thiết lập `telemetry_delay_event = true` và chỉ đưa dữ liệu hàng ngày của Cost Explorer vào khi CUR không được hoàn tất trong vòng 36 giờ được chấp nhận của timestamp dữ liệu. Thực thi các URI đối tượng đo lường dưới dạng `s3://tf2-cdo{NN}-telemetry-{region}/...json.gz`.
+- **Hệ quả (Consequence)**:
+  - Pro: Giảm số lượng gọi API Cost Explorer trong luồng thông thường và tránh dữ liệu tổng hợp trùng lặp khi CUR đã hoàn tất.
+  - Pro: Đồng bộ hóa hồ dữ liệu CDO với nguồn xuất hóa đơn có thẩm quyền trong khi vẫn bảo toàn phương án dự phòng vận hành khi CUR bị trễ.
+  - Pro: Ngăn ngừa xung đột lỗi `BucketAlreadyExists` của S3 giữa các nhóm CDO.
+  - Note: Các bản ghi dự phòng từ Cost Explorer có độ chắc chắn thấp hơn và phải được hiển thị là `data_confidence = LOW`.
+  - Note: Triển khai shared skeleton giữa các nhóm yêu cầu quyền truy cập bucket sử dụng ký tự đại diện (wildcard) có giới hạn hoặc cơ chế AssumeRole STS chéo tài khoản với `ExternalId`.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Giữ Cost Explorer làm đầu vào chính hàng ngày: Bị từ chối vì v1.3.0 làm cho Cost Explorer trở thành tùy chọn có điều kiện và CUR là nguồn có thẩm quyền khi hoàn tất.
+  - Loại bỏ hoàn toàn Cost Explorer: Bị từ chối vì việc phân phối CUR có thể bị trễ và luồng demo cần một lộ trình dự phòng được kiểm soát.
+  - Sử dụng chung một tên bucket: Bị từ chối vì tên bucket S3 là độc nhất trên toàn cầu và các triển khai CDO song song sẽ bị xung đột.
+
+---
+
+## ADR-020 - CDO sở hữu bộ đệm rollback và khóa ngân sách lỗi phân cấp theo môi trường
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Hợp đồng AI API v1.3.0 đã chuyển giao trách nhiệm thực thi rollback sang CDO để rollback vẫn khả dụng ngay cả khi AI Engine không hoạt động. Hợp đồng cũng thay đổi hành vi khóa ngân sách lỗi từ một ngưỡng phẳng duy nhất sang các ngưỡng riêng biệt theo môi trường.
+- **Quyết định (Decision)**: Cache `rollback_payload.boto3_equivalent` ngay sau khi gọi `/v1/decide`, thực thi rollback từ bộ đệm do CDO sở hữu, và gọi `POST /v1/audit/{audit_id}/rollback` chỉ để thông báo kết quả cho AI Engine ghi nhận. Áp dụng `LOCKED_MODE` ở tỷ lệ rollback 1% đối với prod/prod-core/prod-payments, 10% đối với staging, và không tự động khóa đối với dev/sandbox/ml-research/data-analytics.
+- **Hệ quả (Consequence)**:
+  - Pro: Quá trình rollback không còn phụ thuộc vào kết nối trực tiếp đến AI Engine khi xảy ra sự cố.
+  - Pro: Giữ an toàn ngăn chặn nghiêm ngặt hơn trên môi trường sản xuất (production) trong khi tránh khóa ngoài không cần thiết trên môi trường dev và sandbox.
+  - Pro: Bảo toàn phản hồi AI và cập nhật kiểm toán sau khi CDO hoàn tất rollback.
+  - Note: CDO phải bảo mật bộ đệm rollback vì nó chứa lệnh thực thi boto3.
+  - Note: Hành vi tự động reset của staging phải được giám sát để tránh che giấu các vấn đề chất lượng lặp đi lặp lại.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Để AI Engine thực thi rollback trực tiếp: Bị từ chối vì CDO sở hữu thông tin xác thực tài khoản thành viên và quyền containment.
+  - Gọi AI Engine để tạo lại hướng dẫn rollback trong khi thực hiện rollback: Bị từ chối vì rollback vẫn phải hoạt động được ngay cả khi AI Engine ngoại tuyến.
+  - Giữ nguyên một ngưỡng khóa 1% khóa phẳng cho tất cả môi trường: Bị từ chối vì v1.3.0 loại bỏ rõ ràng tự động khóa ở dev/sandbox và tăng dung sai của staging lên 10%.

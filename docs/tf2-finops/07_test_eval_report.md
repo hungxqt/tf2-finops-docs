@@ -61,7 +61,7 @@ In the event of an SLO breach, the following escalation and remediation protocol
 Data Ingestion verification focuses on retrieving and parsing cost data from AWS Data Exports (CUR 2.0) and AWS Cost Explorer API:
 - **Raw Ingestion**: The raw ingestion Lambda retrieves parquet/CSV files from the billing S3 bucket and verifies that schema definitions match the defined layout.
 - **Cost Explorer Queries**: Validates that mock responses from the Cost Explorer API match historical expectations and are mapped to normalized cost windows.
-- **Glue Catalog & Athena Partition Projection (ADR-014)**: Test procedures cover both phase stages. First, tests verify schema validation using Athena SQL DDL during initial schema design against synthetic CUR files. Second, tests verify that Glue Data Catalog table definitions are correctly applied via Terraform IaC, and that client-side Athena Partition Projection dynamically resolves S3 raw partitions at query execution time without runtime crawler dependencies, allowing queries to aggregate cost metrics by service, region, account, and resource tags without syntax errors. Under the hybrid telemetry design, CUR and Cost Explorer data are combined with CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and dashboards.
+- **Glue Catalog & Athena Partition Projection (ADR-014)**: Test procedures cover both phase stages. First, tests verify schema validation using Athena SQL DDL during initial schema design against synthetic CUR files. Second, tests verify that Glue Data Catalog table definitions are correctly applied via Terraform IaC, and that client-side Athena Partition Projection dynamically resolves S3 raw partitions at query execution time without runtime crawler dependencies, allowing queries to aggregate cost metrics by service, region, account, and resource tags without syntax errors. Under the hybrid telemetry design, CUR and Cost Explorer data are combined with CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, setting `data_confidence = LOW` and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and dashboards.
 
 ### 3.2 Scheduled run idempotency
 
@@ -82,8 +82,12 @@ The pipeline runs on a scheduled cadence (ADR-001) triggered by EventBridge Sche
 ### 4.1 AI contract
 
 The contract-based interface between the CDO platform and the AIOps-provided AI Engine is validated for strict schema adherence:
-- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD:batch_type`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` directly to the AI Engine Lambda function using IAM invocation permissions (`lambda:InvokeFunction`). The test verifies that the request payload conforms to the hybrid telemetry schema (containing CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics`). If CloudWatch metrics are simulated as missing, the test verifies that the Lambda handles the fallback behavior by halving the confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only mode.
+- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD:batch_type`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` directly to the AI Engine Lambda function using IAM invocation permissions (`lambda:InvokeFunction`). The test verifies that the request payload conforms to the hybrid telemetry schema (containing CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics`). If CloudWatch metrics are simulated as missing, the test verifies that the Lambda handles the fallback behavior by setting `data_confidence = LOW` and forcing dry-run/alert-only mode.
 - **Response Format Verification**: The test validates that the AI Engine Lambda returns a synchronous payload containing the required parameters: `success`, `correlation_id`, `anomalies_detected`, and `anomalies_list` (containing `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, `alert_routing`).
+- **Ingest Validation with Finalized CUR-only Data**: Verifies that when the ingestion run processes finalized CUR data on-time, the request payload asserts `telemetry_delay_event = false` and the response contains `data_confidence = HIGH`.
+- **Fallback Validation with CUR Delayed**: Verifies that if CUR data delivery is delayed, the request flags `telemetry_delay_event = true` (signaling that daily Cost Explorer query fallback is active) and the response returns `data_confidence = LOW`.
+- **S3 Bucket URI Schema Validation**: Verifies that the `s3_bucket_uri` parameter is validated against the regex pattern `s3://tf2-cdo{NN}-telemetry-{region}/...json.gz` (where `{NN}` represents the team sequence and `{region}` represents the AWS region code, such as `ap-southeast-1`), throwing schema validation errors for malformed URIs.
+- **Raw CPU Telemetry Check**: Confirms that the CDO platform sends the raw `cpu_utilization_hourly` array without precomputing SRE metrics like `idle_hours_continuous` on the CDO backend.
 
 ### 4.2 AI Engine timeout
 
@@ -128,12 +132,13 @@ If the AI Engine is completely unreachable (e.g., Lambda invocation failure or L
 
 ### 4.9 Extend & Rollback Semantics Tests
 
-- **Decide Action Plan Test**: Simulates the orchestrator calling the AI Engine Lambda (representing `POST /v1/decide` semantics) to retrieve the intervention plan. The test verifies that the returned plan contains `dry_run_mode`, `applied_payload` (with `aws_cli_command`), and `rollback_payload` (with `aws_cli_rollback_command`), along with Cognito-group-based access rules and the `X-Containment-Status: LOCKED` header if the tenant's rollback rate is breached.
+- **Decide Action Plan Test**: Simulates the orchestrator calling the AI Engine Lambda (representing `POST /v1/decide` semantics) to retrieve the intervention plan. The test verifies that the returned plan contains `dry_run_mode`, `applied_payload` (with `aws_cli_command`), and `rollback_payload` (with `aws_cli_rollback_command` and `boto3_equivalent`), along with Cognito-group-based access rules and the `X-Containment-Status: LOCKED` header if the tenant's rollback rate is breached.
 - **Rollback Action Test**: Simulates triggering manual rollback on the dashboard by calling the rollback endpoint (representing `POST /v1/audit/{audit_id}/rollback` semantics). The test verifies that:
   - The handler validates authorization, `rolled_back_by` email, and matching `X-Tenant-Id`.
-  - It successfully initiates rollback, returns `rollback_initiated = true`, updates the false positive count, and recalculates `new_error_budget_burned_pct`.
-  - If the error budget burn exceeds 1%, it verifies that the tenant is transitioned to `LOCKED_MODE` (the `containment_locked = true` flag is returned).
+  - It successfully initiates rollback, returns `audit_recorded = true` (instead of `rollback_initiated = true`), updates the false positive count, and recalculates `new_error_budget_burned_pct`.
   - The event status is logged to the audit trail as `ROLLED_BACK`.
+- **Rollback Caching & Offline Fallback Test**: Verifies that the CDO backend caches the `rollback_payload.boto3_equivalent` configuration from the decide phase. The test simulates an AI Engine offline/unreachable scenario and verifies that the CDO platform backend successfully executes the rollback via standard Boto3 calls using the cached configuration, and then reports the execution results to the rollback audit endpoint.
+- **Error Budget Lock Tests**: Asserts that containment lock triggers at a rollback rate of >=1% in production (prod), >=10% in staging, and never (disabled) in dev/sandbox environments, utilizing the `error_budget_exceeded_threshold` lock reason.
 
 ### 4.10 Contract Error Codes & Validation Tests
 
@@ -142,6 +147,14 @@ If the AI Engine is completely unreachable (e.g., Lambda invocation failure or L
   - **Payload Mismatch (`400 Bad Request` Semantics)**: Re-submitting a request with an existing idempotency key but a different request payload returns a mismatch response structure (representing HTTP `400` with error code `ERR_IDEMPOTENCY_MISMATCH` semantics).
 - **Multi-Tenant Access Restriction (`403 Forbidden` Semantics)**: Probes querying results or triggering actions with a mismatched `X-Tenant-Id` are blocked immediately with access denied structures (representing HTTP `403` / `ERR_CROSS_TENANT_DENIED` semantics).
 - **Bedrock Timeout Fallback**: When a mock Bedrock call exceeds the 45-second hard timeout, the system validates that the AI Engine Lambda terminates the task and returns a `failed` state with error code `ERR_LLM_TIMEOUT`. CDO intercepts this failure and shifts immediately to the static fallback rules engine.
+- **Clock Skew & Telemetry Timestamp Tests**:
+  - **Request Clock Skew Reject**: Verifies that requests with an API request timestamp drift (clock skew) greater than 300 seconds are rejected with error code `ERR_REPLAY_DETECTED`.
+  - **CUR Data Lag Accept**: Confirms that CUR data with an ingestion timestamp delay up to 36 hours is accepted and processed successfully, as it falls within the expected daily billing latency.
+
+### 4.11 Callback retry schedule tests
+
+- **Retry Interval Verification**: Validates that when callback delivery fails, the platform executes a retry schedule at 0s, 30s, and 120s delay intervals.
+- **Fault Isolation & Logging**: Verifies that if the retry limits are exceeded, the event is logged as `CALLBACK_EXHAUSTED` in platform telemetry, but the synchronous detection run is not failed or invalidated.
 
 ---
 

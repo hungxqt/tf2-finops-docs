@@ -72,7 +72,7 @@
 
 ## ADR-004 - CUR S3 plus Cost Explorer API data access
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-019
 - **Date**: 2026-06-24
 - **Context**: The platform requires both detailed resource-level cost metrics (which are highly structured) and daily cost data queries to catch anomaly patterns.
 - **Decision**: Combine AWS Data Exports (CUR 2.0) delivered to S3 with direct queries to the AWS Cost Explorer API. CUR is used for historical deep dives, partition analysis, and dashboard trends, while Cost Explorer API serves as the primary daily querying mechanism for scheduled runs. To prevent exceeding the strict **5 requests/second** Cost Explorer rate limit, CDO caches query results in DynamoDB; the AI Engine consumes this cached cost data for its 7-day and 30-day baseline requirements instead of querying the Cost Explorer API directly.
@@ -269,7 +269,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-06-25
-- **Context**: The AI Engine Lambda runtime v1.1.0 contract has shifted from an asynchronous detection model (returning `202 Accepted` and requiring polling on `/v1/status/{correlation_id}`) to a synchronous detection model (returning `200 OK` with the final `anomalies_list` directly in the response). This API contract change makes the old SQS execution queue and polling logic obsolete for the primary detection loop.
+- **Context**: The AI Engine Lambda runtime v1.3.0 contract has shifted from an asynchronous detection model (returning `202 Accepted` and requiring polling on `/v1/status/{correlation_id}`) to a synchronous detection model (returning `200 OK` with the final `anomalies_list` directly in the response). This API contract change makes the old SQS execution queue and polling logic obsolete for the primary detection loop.
 - **Decision**: Adopt the synchronous `/v1/detect` endpoint directly in the CDO Step Functions orchestration workflow, invoking the AI Engine Lambda runtime synchronously. Remove SQS/DLQ from the primary detection loop (retaining SQS only for alerting retries/backoff). This supersedes the detection flow portions of ADR-012.
 - **Consequence**:
   - Pro: Eliminates Step Functions polling loops for detection status, reducing execution complexity and states.
@@ -277,7 +277,7 @@
   - Pro: Immediate feedback on success, correlation, and list of anomalies directly from the single invoke payload.
   - Trade-off: The Step Functions synchronous invoke duration increases, which is safely within AWS Lambda's 15-minute execution limit (as CUR parsing and Bedrock Nova model execution completes in 30-45 seconds).
 - **Alternatives considered**:
-  - Keep the async SQS polling: Rejected because the v1.1.0 API contract frozen between CDO and AIOps mandates synchronous response delivery for the `/v1/detect` route to simplify client-side integration and reduce AWS infrastructure sprawl.
+  - Keep the async SQS polling: Rejected because the v1.3.0 API contract frozen between CDO and AIOps mandates synchronous response delivery for the `/v1/detect` route to simplify client-side integration and reduce AWS infrastructure sprawl.
 
 ---
 
@@ -329,6 +329,44 @@
 - **Alternatives considered**:
   - Keep separate Request and Worker Lambda container configurations: Rejected because maintaining two Lambda deployments for the same model image introduces redundant Terraform resource definitions, dual Cold Starts, and complex async polling code.
   - Deploy a Private REST API Gateway facade: Rejected for the scheduled batch execution flow to minimize resource overhead, since Step Functions can invoke the Lambda container function directly and securely.
+
+---
+
+## ADR-019 - CUR-primary detection with conditional Cost Explorer fallback
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The AI API contract v1.3.0 changed `aws_cost_explorer_daily` from an always-required input to a conditional fallback used only when CUR is delayed. The CDO platform also needs globally unique telemetry bucket names so multiple CDO teams can deploy in parallel without S3 name collisions.
+- **Decision**: Use CUR data in S3 as the default scheduled detection source. Set `telemetry_delay_event = true` and include Cost Explorer daily data only when CUR is not finalized within the accepted 36-hour data timestamp window. Enforce telemetry object URIs under `s3://tf2-cdo{NN}-telemetry-{region}/...json.gz`.
+- **Consequence**:
+  - Pro: Reduces Cost Explorer API calls in the normal path and avoids duplicate aggregate data when finalized CUR is available.
+  - Pro: Aligns the CDO lakehouse with the authoritative billing export source while preserving an operational fallback during CUR delay.
+  - Pro: Prevents S3 `BucketAlreadyExists` collisions across CDO teams.
+  - Note: Cost Explorer fallback records have lower certainty and must be surfaced as `data_confidence = LOW`.
+  - Note: Cross-team shared skeleton deployments require either constrained wildcard bucket access or STS AssumeRole with an `ExternalId`.
+- **Alternatives considered**:
+  - Keep Cost Explorer as the primary daily input: Rejected because v1.3.0 makes Cost Explorer conditional and CUR is the authoritative source when finalized.
+  - Remove Cost Explorer entirely: Rejected because CUR delivery can lag and the demo needs a controlled fallback path.
+  - Use a single shared bucket name: Rejected because S3 bucket names are globally unique and parallel CDO deployments would collide.
+
+---
+
+## ADR-020 - CDO-owned rollback cache and environment-tiered error budget lock
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The AI API contract v1.3.0 moved rollback execution responsibility to CDO so rollback remains possible even when AI Engine is unavailable. The contract also changed error budget lock behavior from one flat threshold to environment-specific thresholds.
+- **Decision**: Cache `rollback_payload.boto3_equivalent` immediately after `/v1/decide`, execute rollback from the CDO-owned cache, and call `POST /v1/audit/{audit_id}/rollback` only to notify AI Engine of the result. Apply `LOCKED_MODE` at 1 percent rollback rate for prod/prod-core/prod-payments, 10 percent for staging, and no auto-lock for dev/sandbox/ml-research/data-analytics.
+- **Consequence**:
+  - Pro: Rollback no longer depends on live AI Engine connectivity during an incident.
+  - Pro: Keeps containment safety stricter in production while avoiding unnecessary lockouts in dev and sandbox.
+  - Pro: Preserves AI feedback and audit updates after CDO completes rollback.
+  - Note: CDO must secure the rollback cache because it contains executable boto3 intent.
+  - Note: Staging auto-reset behavior must be monitored to avoid hiding recurring quality issues.
+- **Alternatives considered**:
+  - Let AI Engine execute rollback directly: Rejected because CDO owns member-account credentials and containment permissions.
+  - Call AI Engine to regenerate rollback instructions during rollback: Rejected because rollback must still work when AI Engine is unavailable.
+  - Keep a flat 1 percent lock threshold for every environment: Rejected because v1.3.0 explicitly disables auto-lock in dev/sandbox and raises staging tolerance to 10 percent.
 
 
 

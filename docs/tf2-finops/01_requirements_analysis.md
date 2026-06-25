@@ -16,18 +16,18 @@ The AIOps team owns any synthetic historical dataset used to train, enhance, cal
 
 For Finance stakeholders, success means the dashboard can answer four questions without SQL: what changed, which account or squad owns it, how confident the platform is, and what action is allowed. For CDO reviewers, success means every scheduled run has a traceable input window, idempotency key, AI Engine contract version, alert decision, containment mode, and audit record.
 
-### 1.1 Programmatic Contract Mapping (v1.1)
+### 1.1 Programmatic Contract Mapping (v1.3.0)
 
 To integrate with the shared anomaly detection contracts, this CDO platform maps the logical interfaces to serverless Lambda execution components as follows:
 
 | Endpoint / Interface | Source Contract | CDO Target Design & Implementation |
 |---|---|---|
-| `POST /v1/detect` | `ai-api-contract.md` | Initiates synchronous batch anomaly detection. CDO invokes the AI detect Lambda with cost data, returning `success`, `correlation_id`, `anomalies_detected`, and `anomalies_list`. |
+| `POST /v1/detect` | `ai-api-contract.md` | Initiates synchronous batch anomaly detection. CDO invokes the AI detect Lambda with CUR cost data by default (or Cost Explorer daily data when `telemetry_delay_event = true` is activated as fallback), returning `success`, `correlation_id`, `anomalies_detected`, `anomalies_list`, and `data_confidence` (HIGH/LOW). Supports an optional `callback_url` for additive callback notification (does not replace the synchronous response). |
 | `GET /v1/status/{id}` | `ai-api-contract.md` | Retrieves remediation/self-healing status for a given anomaly_id or audit_id. (No longer used for polling detection status). |
 | `POST /v1/decide` | `ai-api-contract.md` | Requests RCA, recommended actions, and CLI dry-run payloads. CDO maps separate Finance (read-only) and Engineering (remediation/action plan) payloads. |
 | `POST /v1/verify` | `ai-api-contract.md` | Evaluates remediation outcome using post-action metrics. Triggers locked containment if error budget burnt > 1%. |
 | `POST /v1/audit/{audit_id}/rollback` | `ai-api-contract.md` | Manual or programmatic rollback handler. Restores resource state and updates the tenant's error budget. |
-| `resource_utilization_metrics` | `telemetry-contract.md` | Hybrid cost and performance inputs including CPU, memory, net, disk, database connections, and GPU metrics. Fallback to CUR-only mode (confidence score halved, dry-run/alert only) when CloudWatch metrics are missing. |
+| `resource_utilization_metrics` | `telemetry-contract.md` | Hybrid cost and performance inputs including CPU (sent as raw 24-hourly `cpu_utilization_hourly` array; AI Engine computes idle continuous hours), memory, net, disk, database connections, and GPU metrics. Fallback to CUR-only mode (data_confidence: LOW, dry-run/alert only) when CloudWatch metrics are missing. |
 | Secure Ingress & Identity | `telemetry-contract.md` | Signatures verified via AWS IAM SigV4 (`Authorization`), payload integrity hash (`X-Payload-SHA256`), tenant isolation (`X-Tenant-Id`), replay protection window skew < 300s (`X-Request-Timestamp`), and idempotency locks (`X-Idempotency-Key`). |
 | Per-CDO Deployment | `deployment-contract.md` | The AI engine is provided as an ECR container image. This CDO deploys its own endpoint hosted on AWS Lambda Container, isolated by tenant contexts, and governed by Bedrock/budget limit alarms. |
 
@@ -44,7 +44,7 @@ The CDO platform must meet the following non-functional requirements (NFRs) to e
 | Cost per run | Minimize; tracked with `Evidence needed: CDO pipeline run costs` | Ensures the platform itself is cost-effective. |
 | Security baseline | IAM least-privilege, multi-account read-only access | Core boundary: NEVER terminate prod, delete data, or modify IAM. |
 | AI Engine hosting uptime | ≥99.5% availability for the hosted model functions | CDO-hosted AI Engine Lambda container function must be reliable for direct execution. |
-| Cost data contract coverage | CUR + Cost Explorer + CloudWatch resource_utilization_metrics (cpu_percent, memory_mib, network_in_bytes, network_out_bytes, disk_io_ops, database_connections, gpu_utilization, idle_hours_continuous) | Ensures CDO sends cost details along with CloudWatch metrics for anomaly detection (supporting idle_resource and runaway_usage patterns), with a fallback to CUR-only mode (confidence *= 0.5) when metrics are missing. |
+| Cost data contract coverage | CUR + Cost Explorer + CloudWatch resource_utilization_metrics (cpu_percent, memory_mib, network_in_bytes, network_out_bytes, disk_io_ops, database_connections, gpu_utilization, cpu_utilization_hourly) | Ensures CDO sends cost details along with CloudWatch metrics for anomaly detection (supporting idle_resource and runaway_usage patterns), with a fallback to CUR-only mode (data_confidence: LOW) when metrics are missing. |
 | Idempotency | One accepted run per account and cost window | Prevents duplicate alerts, duplicate AI Engine calls, and double-counted dashboard materializations. |
 | Alert explainability | Every anomaly alert includes confidence, severity, evidence window, owner route, and explanation | Finance and Engineering must be able to decide whether the alert is valid and what to do next. |
 | Containment safety | Prod limited to tag, suggest, or dry-run; non-prod actions require policy approval | Keeps automation useful without crossing the client hard boundary. |
@@ -88,7 +88,7 @@ The responsibility boundary between the CDO and AIOps teams is defined as follow
 | AI model backtest performance and metrics | | Owns |
 | Versioned container artifacts (images, weights, configs) | | Provides |
 
-*Note: The CDO team consumes the AI Engine through a versioned programmatic contract via direct Lambda execution (representing logical `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` semantics). The responsibility split is defined such that CDO owns the hosting infrastructure (VPC, subnets, Lambda functions, execution roles, reserved concurrency, SQS/DLQ queues for alerts, and S3-based audit and idempotency stores), while AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics. Telemetry includes CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics` (CPU, memory, network, disk, database connections, and GPU metrics), with a fallback to CUR-only mode (confidence score halved) if CloudWatch is unavailable.*
+*Note: The CDO team consumes the AI Engine through a versioned programmatic contract via direct Lambda execution (representing logical `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` semantics). The responsibility split is defined such that CDO owns the hosting infrastructure (VPC, subnets, Lambda functions, execution roles, reserved concurrency, SQS/DLQ queues for alerts, and S3-based audit and idempotency stores), while AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics. Telemetry includes CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics` (CPU, memory, network, disk, database connections, and GPU metrics), with a fallback to CUR-only mode (data_confidence: LOW) if CloudWatch is unavailable.*
 
 *Note on Contract Wording*: The signed contracts (`deployment-contract.md`) assume generic Task Force deployment configurations (which may mention ECS Fargate, App Runner, or Lambda). This CDO platform maps the ECR container image provided by AIOps to AWS Lambda Container hosting. Outdated/generic compute targets in the contracts are treated as references rather than implementation bindings.
 

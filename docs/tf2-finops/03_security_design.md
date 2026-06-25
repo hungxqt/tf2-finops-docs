@@ -130,13 +130,27 @@ Access control for the static S3 + CloudFront Finance Dashboard is enforced thro
 
 ### 2.5 Error Budget Security Lock (LOCKED_MODE)
 
-To prevent automated containment runaways and protect resource availability, the platform enforces an automatic Error Budget Security Lock:
-1. **Trigger Condition**: If the rollback rate (manually triggered rollbacks due to false positives) exceeds **1% within a 30-day rolling window**, the AI Engine automatically transitions the tenant to `LOCKED_MODE`.
+To prevent automated containment runaways and protect resource availability, the platform enforces an automatic Error Budget Security Lock with tiered thresholds:
+1. **Trigger Condition**: Transitions the tenant to `LOCKED_MODE` based on the environment tier:
+   - `prod`, `prod-core`, and `prod-payments` lock if the rollback rate (manually triggered rollbacks due to false positives) exceeds **1% within a 30-day rolling window**.
+   - `staging` locks if the rollback rate exceeds **10% within a 30-day rolling window**.
+   - `dev`, `sandbox`, `ml-research`, and `data-analytics` do not trigger locks (error budget checks are disabled).
 2. **Behavior**:
    - Every request to `/v1/decide` automatically returns `dry_run_mode: true`, and the AI Engine refuses to provide active remediation payloads.
-   - All response headers include the `X-Containment-Status: LOCKED` and `X-Lock-Reason: error_budget_exceeded_1pct` fields.
+   - All response headers include the `X-Containment-Status: LOCKED` and `X-Lock-Reason: error_budget_exceeded_threshold` fields.
    - The CDO platform forces all downstream containment executions to dry-run (alert-only) mode, ignoring any manual override attempts.
 3. **Recovery**: Transitioning out of `LOCKED_MODE` requires manual review and approval by the AI Team Lead, who must explicitly reset the error budget parameters.
+
+### 2.6 S3 Telemetry Bucket Naming & IAM Access Modes
+
+To store operational telemetry, intermediate anomaly evidence, and run audit logs, S3 buckets follow the standardized naming convention:
+- `tf2-cdo{NN}-telemetry-{region}` (where `{NN}` represents the team/tenant number, and `{region}` represents the deployment AWS region, e.g., `ap-southeast-1`).
+
+Access to these telemetry buckets across accounts supports two distinct IAM configuration modes:
+1. **Per-CDO Mode (Default)**: A strict, single-tenant isolation model where each CDO platform instance has dedicated read-write permissions scoped exclusively to its own team bucket (`tf2-cdo{NN}-telemetry-{region}`).
+2. **Shared Skeleton Mode**: A multi-tenant orchestration model allowing cross-account telemetry sharing. Access is governed via either:
+   - A wildcard S3 resource policy restricted by AWS conditions to specific organization OUs.
+   - Cross-account `STS AssumeRole` with an `ExternalId` dynamically generated based on the tenant's `X-Tenant-Id` header, ensuring strict tenant boundaries during multi-account ingestion.
 
 ## 3. Secrets Management
 
@@ -154,7 +168,11 @@ The following secrets are stored in AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the AI Engine Lambda function does not pull static API keys from Secrets Manager. Instead, the AI Engine Lambda validates request integrity and clock skew drift (max 300s) directly from cross-cutting headers.
+Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the AI Engine Lambda function does not pull static API keys from Secrets Manager. Instead, the AI Engine Lambda validates request integrity and clock skew drift directly from cross-cutting headers.
+
+The platform enforces a clock-skew split policy:
+1. **API Requests Clock Skew**: The `X-Request-Timestamp` header skew limit is strictly set to **300 seconds** to prevent replay attacks. Requests outside this window are automatically rejected.
+2. **Ingestion Data Telemetry Delay**: A time delay of up to **36 hours** for cost data (CUR exports in S3) is normal and accepted as part of standard cloud billing latency, and does not trigger replay or clock-skew validation errors.
 
 For example, the Lambda container function validates the incoming request using the following python logic:
 
@@ -260,6 +278,14 @@ Every action taken by the CDO platform is documented. For containment actions, t
     "action": "remove_tags",
     "keys": ["FinOpsWatch", "AnomalyDetected"]
   },
+  "rollback_status": "success",
+  "rollback_executed_at": "2026-06-23T07:25:00Z",
+  "boto3_result": {
+    "HTTPStatusCode": 200,
+    "ResponseMetadata": {
+      "RequestId": "7f89b910-c123..."
+    }
+  },
   "approval_status": "pending_squad_response",
   "retention_location": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/",
   "retention_period_days": 90,
@@ -271,7 +297,7 @@ Every action taken by the CDO platform is documented. For containment actions, t
 }
 ```
 
-The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in the authoritative S3 bucket (with optional dashboard cache duplication in DynamoDB), with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. When a rollback operation is executed, the audit log is updated with rollback-specific fields including `rollback_status`, `rollback_executed_at`, and the optional `boto3_result` containing the raw API response from AWS. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in the authoritative S3 bucket (with optional dashboard cache duplication in DynamoDB), with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, setting `data_confidence = LOW` and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
 
 ### 5.2 Storage + Retention
 

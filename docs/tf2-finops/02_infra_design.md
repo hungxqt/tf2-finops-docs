@@ -12,7 +12,7 @@
 
 The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with a shared AIOps-provided AI Engine hosted on AWS Lambda container images. The serverless compute tier utilizes Lambda functions running within private subnets. The central Step Functions orchestrator coordinates the execution flow by invoking the AI Engine Lambda directly and synchronously. Note that `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` represent logical contract semantics for model integration, not deployed REST/HTTP routes in this baseline batch workflow, as no Private API Gateway is deployed.
 
-The architecture is sized around recurring CDO platform responsibilities, not around the AIOps model-training dataset. CDO must reliably pull cost and performance data from approved AWS sources, normalize it into a contract-ready shape, invoke the AIOps-owned AI Engine, and preserve the returned decision evidence. Any synthetic historical dataset used to train, enhance, or backtest the model remains AIOps-owned. Detection telemetry includes CUR data, Cost Explorer API queries, and CloudWatch performance metrics (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment.
+The architecture is sized around recurring CDO platform responsibilities, not around the AIOps model-training dataset. CDO must reliably pull cost and performance data from approved AWS sources, normalize it into a contract-ready shape, invoke the AIOps-owned AI Engine, and preserve the returned decision evidence. Any synthetic historical dataset used to train, enhance, or backtest the model remains AIOps-owned. Detection telemetry includes CUR data, Cost Explorer API queries, and CloudWatch performance metrics (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, setting `data_confidence = LOW` and forcing dry-run/alert-only containment.
 
 ```mermaid
 graph TB
@@ -24,7 +24,8 @@ graph TB
 
     subgraph "CDO Management Account VPC (ap-southeast-1)"
         subgraph "Ingestion & Orchestration"
-            EB[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+            S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger (Default, No Polling)| SF[Step Functions Workflow]
+            EB[EventBridge Scheduler] -->|Trigger Daily Fallback / Delayed > 36h| SF
             SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
             SF -->|Evaluate Run| LambdaState[State Lambda]
             SF -->|Trigger Containment| LambdaCont[Containment Lambda]
@@ -80,15 +81,18 @@ graph TB
     %% AI Engine Integration
     SF -->|1. POST /v1/detect - Direct Synchronous Invoke| AILambda
     AILambda -->|2. Read cost & CloudWatch metrics| S3Cur
-    AILambda -->|3. Return anomalies_list - Synchronous| SF
+    AILambda -->|3. Return anomalies_list & data_confidence - Synchronous| SF
     SF -->|4. Write audit record| S3Audit
     SF -->|5. POST /v1/decide - Retrieve plan| AILambda
-    AILambda -->|6. Return DecideResponse| SF
+    AILambda -->|6. Return DecideResponse (with rollback_payload.boto3_equivalent)| SF
+    SF -->|6.1. Cache rollback payload in DynamoDB| DDB
     SF -->|7. POST /v1/verify| AILambda
     AILambda -->|8. Return VerifyResponse| SF
+    SF -->|9. Execute rollback from Cache (Boto3)| MemberAccounts
+    SF -->|10. POST /v1/audit/{audit_id}/rollback - Report results| AILambda
 ```
 
-*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR, Cost Explorer, and CloudWatch performance data to S3, and catalogs it. The workflow invokes the AIOps-owned AI Engine Lambda synchronously (`POST /v1/detect`), which returns anomalies directly in the response. Step Functions then requests decisions (`POST /v1/decide`) for any detected anomalies, coordinates alerting, triggers approved containment actions, writes authoritative audit records to S3 (with Object Lock), updates the DynamoDB read cache, and verifies outcomes (`POST /v1/verify`) synchronously.*
+*Caption: The CDO pipeline is triggered by default by S3 CUR object-arrival EventBridge notifications (no polling), or by EventBridge Scheduler daily as a fallback if CUR data is delayed by more than 36 hours. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR, Cost Explorer, and CloudWatch performance data to S3, and catalogs it. The workflow invokes the AIOps-owned AI Engine Lambda synchronously (`POST /v1/detect`, with target P99 latency < 300 ms as it operates without LLM calls), which returns anomalies and `data_confidence` directly in the response. Step Functions then requests decisions (`POST /v1/decide`) for any detected anomalies (subject to a Bedrock 45s hard limit for RCA generation), immediately caching `rollback_payload.boto3_equivalent` in DynamoDB. It coordinates alerting, triggers approved containment actions, writes authoritative audit records to S3, and verifies outcomes (`POST /v1/verify`) synchronously. Rollbacks are CDO-executed from the DynamoDB cache using Boto3, then reported via `POST /v1/audit/{audit_id}/rollback`.*
 
 ---
 
@@ -121,7 +125,7 @@ graph TD
     Actions -->|12. Publish| Dashboard[Finance Dashboard / Channels]
 ```
 
-*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting cost and CloudWatch telemetry to the Lakehouse, calling the AI Engine Lambda synchronously (`POST /v1/detect`), calling `POST /v1/decide` to retrieve containment plans, executing approved actions via policy workers, verifying outcomes via `POST /v1/verify`, and committing tamper-proof compliance logs directly to S3.*
+*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting cost and CloudWatch telemetry (utilizing EventBridge S3 object-arrival triggers by default, or Cost Explorer API fallback if CUR is delayed > 36 hours), calling the AI Engine Lambda synchronously (`POST /v1/detect` with P99 latency < 300 ms), calling `POST /v1/decide` to retrieve containment plans and caching `rollback_payload.boto3_equivalent` in DynamoDB, executing approved actions, verifying outcomes via `POST /v1/verify`, performing Boto3 rollbacks from cache and reporting them via `POST /v1/audit/{audit_id}/rollback`, and committing tamper-proof compliance logs directly to S3.*
 
 Operationally, Step Functions is the control boundary between deterministic CDO logic and probabilistic AI output. Every transition records a `run_id`, cost window, account scope, and contract version so that Finance can trace a dashboard anomaly back to the exact ingestion batch and AI decision. This design also prevents the AI Engine from directly touching member accounts; all alerting and containment actions are mediated by CDO policy workers.
 
@@ -138,7 +142,8 @@ graph TB
     end
 
     subgraph "CDO Ingestion & Lakehouse"
-        Scheduler[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+        S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger Ingestion (Default, No Polling)| SF[Step Functions Workflow]
+        Scheduler[EventBridge Scheduler] -->|Trigger Fallback if Delayed > 36h| SF
         SF -->|1. Run Puller| Puller[Ingestion Lambda]
         Puller -->|Fetch API Cost| CE
         Puller -->|Copy CUR Files| CUR
@@ -156,9 +161,9 @@ graph TB
     class CUR,CE,CW external;
 ```
 
-*Caption: Step Functions invokes the Ingestion Lambda daily via EventBridge Scheduler. Raw cost data and CloudWatch utilization metrics are stored in the S3 Raw Zone, transitioned and cataloged into Parquet format in the S3 Curated Zone, and made queryable via Athena. The query results are passed back to the Step Functions orchestrator to feed the AI Engine.*
+*Caption: The default ingestion flow is triggered dynamically by EventBridge upon S3 CUR object-arrival (no polling). If the CUR delivery is delayed by more than 36 hours, a daily EventBridge Scheduler triggers the fallback path, pulling daily data via the Cost Explorer API (with `telemetry_delay_event = true`). Raw cost data and CloudWatch utilization metrics (including the `cpu_utilization_hourly` array) are stored in the S3 Raw Zone, normalized and cataloged in the S3 Curated Zone, and queryable via Athena to feed the AI Engine.*
 
-The ingestion workflow normalizes the two operational billing shapes and CloudWatch performance metrics before invoking the AI Engine. CUR provides resource-level fields such as account ID, product code, resource ID, unblended cost, and resource tags. Cost Explorer provides aggregate fields such as linked account, service name, service code, region, unblended cost, and estimated/final status. CloudWatch provides resource utilization metrics (CPU, memory, net, disk, DB connections, and GPU metrics). The curated layer keeps normalized display name and service code fields so CDO can build dashboard views without taking ownership of model training data.
+The ingestion workflow normalizes the two operational billing shapes (CUR as default daily detection source; Cost Explorer daily data as fallback when `telemetry_delay_event = true` if CUR is delayed > 36 hours) and CloudWatch performance metrics before invoking the AI Engine. CUR provides resource-level fields such as account ID, product code, resource ID, unblended cost, and resource tags. Cost Explorer provides aggregate fields such as linked account, service name, service code, region, unblended cost, and estimated/final status. CloudWatch provides resource utilization metrics (including CPU via `cpu_utilization_hourly` array replacing the old `idle_hours_continuous`, memory, net, disk, DB connections, and GPU metrics). The curated layer keeps normalized display name and service code fields so CDO can build dashboard views without taking ownership of model training data.
 
 ### 1.3 AI Engine Lambda Container Hosting Platform
 
@@ -210,7 +215,7 @@ graph TB
 
 *Caption: The AI Engine detection request from the Step Functions orchestrator is sent via direct Lambda invocation to the AI Engine Lambda function (`POST /v1/detect`). The AI Engine Lambda processes cost and CloudWatch utilization metrics synchronously from S3 and returns the detection results immediately. The orchestrator then requests decisions (`POST /v1/decide`), executes containment actions, writes the audit records to S3, and verifies the remediation actions (`POST /v1/verify`) synchronously.*
 
-The Lambda-based platform hosts the containerized AI Engine to perform cost anomaly detection synchronously. By invoking the AI Engine Lambda function directly, the Step Functions orchestrator receives the `anomalies_list` within the same request lifecycle (typically 30-45 seconds), eliminating the overhead of status polling loops and queues. The orchestrator records authoritative idempotency keys and compliance audit records directly in Amazon S3, using Object Lock for WORM immutability. DynamoDB is used purely as a cache to support low-latency finance dashboard queries. This contract-first approach provides predictable, synchronous execution while enforcing strict security boundaries via IAM execution roles and Private VPC Endpoints.
+The Lambda-based platform hosts the containerized AI Engine to perform cost anomaly detection synchronously. By invoking the AI Engine Lambda function directly, the Step Functions orchestrator receives the `anomalies_list` and `data_confidence` within the same request lifecycle (target P99 latency for `/v1/detect` is < 300 ms as it performs direct analysis without LLM processing; the Bedrock 45s hard limit is isolated to `/v1/decide` for generating root cause analysis and action plans), eliminating the overhead of status polling loops and queues. The orchestrator records authoritative idempotency keys and compliance audit records directly in Amazon S3, using Object Lock for WORM immutability. DynamoDB is used as a cache to support low-latency finance dashboard queries and to store the rollback payloads (`rollback_payload.boto3_equivalent`) for direct Boto3 execution by CDO workers. This contract-first approach provides predictable, synchronous execution while enforcing strict security boundaries via IAM execution roles and Private VPC Endpoints.
 
 ### 1.4 Alerting & Containment Engine
 
@@ -253,9 +258,9 @@ graph TB
     end
 ```
 
-*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write authoritative audit logs to S3 (protected by Object Lock), apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. An S3 + CloudFront static web dashboard reads precomputed JSON audit and spend summaries from the DynamoDB read-cache layer to present containment status directly to Finance stakeholders. Dashboard action controls (such as manual rollbacks or remediation verification) are routed securely from the S3 Static Dashboard to the singular AI Engine Lambda container function via its secure AWS Lambda Function URL mapped under CloudFront. All other CDO Lambdas are strictly internal resources orchestrated by Step Functions; they do not have public endpoints or separate Function URLs. CDO calls `POST /v1/verify` to verify containment, and supports manual rollbacks via `POST /v1/audit/{audit_id}/rollback`.*
+*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write authoritative audit logs to S3 (protected by Object Lock), apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. An S3 + CloudFront static web dashboard reads precomputed JSON audit and spend summaries from the DynamoDB read-cache layer to present containment status directly to Finance stakeholders. Dashboard action controls (such as manual rollbacks or remediation verification) are routed securely from the S3 Static Dashboard to the singular AI Engine Lambda container function via its secure AWS Lambda Function URL mapped under CloudFront. All other CDO Lambdas are strictly internal resources orchestrated by Step Functions; they do not have public endpoints or separate Function URLs. CDO calls `POST /v1/verify` to verify containment, executes Boto3 rollbacks from cached `rollback_payload.boto3_equivalent` records in DynamoDB, and reports rollback status via `POST /v1/audit/{audit_id}/rollback`.*
 
-The containment engine treats `execution_mode` as a mandatory policy input, not a runtime convenience. Production resources can only receive tag, suggest, or dry-run outcomes, while dev/sandbox resources may receive apply-mode actions only when policy and approval requirements are satisfied. Each proposed or executed action writes an authoritative audit record to S3 before attempting any member-account operation. Once completed, CDO invokes `POST /v1/verify` to report the telemetry outcome, or triggers manual rollbacks via `POST /v1/audit/{audit_id}/rollback` which initiates resource tagging restoration. Operationally, `GET /v1/status/{id}` is retained exclusively to check the remediation/self-healing status of a specific containment action using the `audit_id` or `anomaly_id`, and is not used for polling active detection progress.
+The containment engine treats `execution_mode` as a mandatory policy input, not a runtime convenience. Production resources can only receive tag, suggest, or dry-run outcomes, while dev/sandbox resources may receive apply-mode actions only when policy and approval requirements are satisfied. Each proposed or executed action writes an authoritative audit record to S3 before attempting any member-account operation. Once completed, CDO invokes `POST /v1/verify` to report the telemetry outcome. Manual or policy-driven rollbacks are CDO-executed directly from the DynamoDB cache (using `rollback_payload.boto3_equivalent`), then reported to the AI Engine via `POST /v1/audit/{audit_id}/rollback` to update the audit ledger. Operationally, `GET /v1/status/{id}` is retained exclusively to check the remediation/self-healing status of a specific containment action using the `audit_id` or `anomaly_id`, and is not used for polling active detection progress.
 
 ### 1.5 Programmatic API Sequence Workflow
 
@@ -268,28 +273,32 @@ sequenceDiagram
     participant Lake as S3 Lakehouse / Ingestion
     participant AI as AI Engine Lambda
     participant S3 as S3 Audit & Idempotency
+    participant DDB as DynamoDB Cache
     participant Cont as Alert & Containment Engine
 
     Note over SF, Lake: 1. CDO Ingests Cost & CloudWatch Telemetry
-    SF->>Lake: Execute Ingestion (CUR, CE, CloudWatch metrics)
+    SF->>Lake: Execute Ingestion (CUR default, CE fallback if CUR delayed > 36h)
     Lake-->>SF: Raw & Curated data stored
     
     Note over SF, S3: 2. CDO Checks Idempotency
     SF->>S3: Read / Write Idempotency key (S3 object with 24h TTL check)
     S3-->>SF: Key acquired (success)
     
-    Note over SF, AI: 3. CDO Calls Synchronous Detection
+    Note over SF, AI: 3. CDO Calls Synchronous Detection (P99 < 300ms)
     SF->>AI: POST /v1/detect (Ingested Telemetry + Headers)
     AI->>Lake: Read Features & CloudWatch Utilization Metrics
-    AI-->>SF: 200 OK (success: true, anomalies_list, correlation_id)
+    AI-->>SF: 200 OK (success: true, anomalies_list, data_confidence, correlation_id)
     
     opt anomalies_detected = true
         Note over SF, S3: 4. Log Detection Evidence
         SF->>S3: Write initial audit record (Object Lock)
         
-        Note over SF, AI: 5. CDO Requests Intervention Plan
+        Note over SF, AI: 5. CDO Requests Intervention Plan (Bedrock 45s hard limit)
         SF->>AI: POST /v1/decide (anomaly_context)
-        AI-->>SF: 200 OK DecideResponse (action_plan, applied_payload, rollback_payload)
+        AI-->>SF: 200 OK DecideResponse (action_plan, applied_payload, rollback_payload.boto3_equivalent)
+        
+        Note over SF, DDB: 5.1 CDO Caches Rollback Payload
+        SF->>DDB: Cache rollback_payload.boto3_equivalent
         
         Note over SF, Cont: 6. CDO Executes Proposed Plan & Verifies
         SF->>Cont: Execute proposed containment actions (tag/suggest/shutdown)
@@ -302,9 +311,18 @@ sequenceDiagram
         Note over SF, S3: 7. Commit Final Outcome
         SF->>S3: Write final verification audit record
     end
+
+    opt Rollback Triggered (Manual / Policy-driven)
+        Note over SF, DDB: 8. CDO Performs Rollback
+        SF->>DDB: Read cached rollback_payload.boto3_equivalent
+        SF->>Cont: Execute Boto3 commands from cache
+        Cont-->>SF: Rollback outcome
+        SF->>AI: POST /v1/audit/{audit_id}/rollback (results)
+        AI-->>SF: 200 OK RollbackResponse
+    end
 ```
 
-*Caption: The programmatic API sequence diagram outlines the synchronous anomaly detection and remediation validation loop, showing synchronous detection, plan generation, verification, and S3-based audit ledger commits.*
+*Caption: The programmatic API sequence diagram outlines the synchronous anomaly detection and remediation validation loop, showing synchronous detection, plan generation, caching of rollback payloads, execution of rollback from cache, verification, and S3-based audit ledger commits.*
 
 ---
 
@@ -390,7 +408,7 @@ The account model must preserve environment context because the same anomaly typ
 
 ### 4.2 Isolation pattern
 
-- **Data Isolation**: Cost data collected from member accounts is stored in a single S3 bucket partitioned by Account ID: `s3://cdo-curated-bucket/account_id=123456789012/year=2026/month=06/`.
+- **Data Isolation**: Cost data collected from member accounts is stored in a single S3 bucket partitioned by Account ID: `s3://tf2-cdo{NN}-telemetry-{region}/curated/account_id=123456789012/year=2026/month=06/`.
 - **Query Isolation**: Athena table definitions use Glue partition projection. Athena queries executed for dashboard materialized views are restricted by the `account_id` partition key.
 - **Ownership Resolution**: Resources are mapped to specific engineering squads using the standardized metadata tags `owner` and `squad`. When the ingestion pipeline encounters resources lacking these tags, it automatically assigns them to a default squad (`unassigned-resources`) and routes alerts to the CDO infrastructure channel for manual remediation.
 
@@ -417,7 +435,7 @@ When onboarding a new AWS account or squad to the FinOps Watch platform, the fol
 
 To prevent duplicate runs for the same cost period (which would skew dashboard data and incur duplicate Cost Explorer API fees), the CDO platform implements an idempotency mechanism using Amazon S3:
 - Every daily execution generates a composite idempotency key: `{tenant_id}:{billing_period_date}:{batch_type}` (e.g., `tenant_id:2026-06-25:daily_batch`).
-- The Step Functions workflow begins by checking for the existence of this key as an empty object in the authoritative idempotency store: `s3://company-cdo-telemetry/idempotency/{key}`.
+- The Step Functions workflow begins by checking for the existence of this key as an empty object in the authoritative idempotency store: `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/{key}`.
 - If the object exists, the execution is aborted gracefully to prevent double-processing.
 - If the object does not exist, the workflow writes it to lock the run. The object is configured with an S3 Lifecycle rule that automatically deletes it after 24 hours.
 
@@ -425,15 +443,16 @@ To prevent duplicate runs for the same cost period (which would skew dashboard d
 
 To protect the AWS Cost Explorer API from exceeding its strict rate limit of **5 requests per second**, the CDO platform implements a DynamoDB-based caching strategy as described in the telemetry contract:
 - **CDO Cache Storage**: The Ingestion Lambda queries daily Cost Explorer metrics and caches the result payload inside a dedicated DynamoDB table (`cdo-cost-cache-table`) keyed by `AccountID:DateRange`.
+- **Fallback Data Source**: Cost Explorer daily data serves as the fallback cache when CUR data exports are delayed (>36 hours), triggered when the orchestrator sets `telemetry_delay_event = true` to query the Cost Explorer API and cache the results in the DynamoDB table.
 - **AI Engine Offline Consumption**: When the AIOps-provided AI Engine executes and requires historical baseline cost data (such as 7-day or 30-day trailing spends for feature engineering and anomaly analysis), it reads the cached cost records directly from the CDO DynamoDB store (or S3 curated parquet files via Athena) using direct SDK calls under its execution role.
 - **Benefits**: This prevents the AI Engine and multiple platform Lambdas from calling the Cost Explorer API concurrently, ensuring the platform remains well below the 5 requests/sec threshold and eliminating any chance of AWS throttling.
 
 ### 4.6 Telemetry Ingestion Compliance & Validation
 
 The CDO platform enforces all data-plane validation and security controls defined in `telemetry-contract.md` and `ai-api-contract.md`:
-- **Schema & Ingestion Types**: Telemetry complies with schema version 3 (`telemetry://finops-watch/v3`). Ingestion supports `RAW_JSON` (<10MB Cost Explorer API data) and `S3_POINTER` (<500MB compressed CUR exports stored in S3) data ingestion types. No CloudWatch performance telemetry (utilization signals like CPUUtilization, DatabaseConnections, memory_mib) is sent to the AI Engine for detection; these are reserved strictly for platform operational observability (alerts, logging, metrics, dashboard).
-- **Request & Integrity Fields**: Every direct Lambda invocation payload to the AI Engine includes standard cross-cutting metadata fields representing the contract headers: `X-Tenant-Id` (`tenant_id`), `X-Idempotency-Key` (format: `{tenant_id}:{billing_period_date}:{batch_type}` stored in `s3://company-cdo-telemetry/idempotency/` with a 24-hour Object Lifecycle Expiry), `X-Correlation-Id`, `X-Payload-SHA256` (`payload_sha256`), and `X-Request-Timestamp` (`request_timestamp`).
-- **Response Fields**: The synchronous `/v1/detect` response returns standard fields: `success` (boolean), `correlation_id` (UUID v4), `anomalies_detected` (boolean), `anomalies_list` (containing `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, and `alert_routing`), and `error_message` (optional).
+- **Schema & Ingestion Types**: Telemetry complies with schema version 3 (`telemetry://finops-watch/v3`). Ingestion supports `RAW_JSON` (<10MB Cost Explorer API data) and `S3_POINTER` (<500MB compressed CUR exports stored in S3) data ingestion types. CloudWatch performance telemetry is sent to the AI Engine for detection (including `cpu_utilization_hourly` as a raw 24-hourly CPU array replacing the old `idle_hours_continuous`, `memory_mib`, `network_in_bytes`, `network_out_bytes`, `disk_io_ops`, `database_connections`, and `gpu_utilization`). If CloudWatch performance metrics are missing, the platform automatically falls back to CUR-only mode, setting `data_confidence = LOW`.
+- **Request & Integrity Fields**: Every direct Lambda invocation payload to the AI Engine includes standard cross-cutting metadata fields representing the contract headers: `X-Tenant-Id` (`tenant_id`), `X-Idempotency-Key` (format: `{tenant_id}:{billing_period_date}:{batch_type}` stored in `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/` with a 24-hour Object Lifecycle Expiry), `X-Correlation-Id`, `X-Payload-SHA256` (`payload_sha256`), and `X-Request-Timestamp` (`request_timestamp`).
+- **Response Fields**: The synchronous `/v1/detect` response returns standard fields: `success` (boolean), `correlation_id` (UUID v4), `anomalies_detected` (boolean), `anomalies_list` (containing `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, and `alert_routing`), `data_confidence` (HIGH/LOW), optional `callback_url`, and `error_message` (optional).
 - **Control Flags**: 
   - `is_ad_hoc`: Bypasses 24h idempotency limits for emergency scans (capped at 5 requests/day).
   - `is_estimated`: Indicates AWS estimated data; lowers AI confidence score (<0.50), sets actions to review-only, and bypasses automatic containment.

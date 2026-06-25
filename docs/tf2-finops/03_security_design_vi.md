@@ -130,13 +130,27 @@ Kiểm soát truy cập cho Bảng điều khiển Tài chính tĩnh S3 + CloudF
 
 ### 2.5 Khóa bảo mật ngân sách lỗi (Error Budget Security Lock - LOCKED_MODE)
 
-Để ngăn chặn các hành động tự động containment bị lỗi dây chuyền và bảo vệ tính sẵn sàng của tài nguyên, hệ thống áp dụng cơ chế Khóa bảo mật ngân sách lỗi tự động:
-1. **Điều kiện kích hoạt**: Nếu tỷ lệ rollback (hoàn tác thủ công do phát hiện False Positive) vượt quá **1% trong cửa sổ 30 ngày liên tục**, AI Engine sẽ tự động chuyển Tenant sang trạng thái `LOCKED_MODE`.
+Để ngăn chặn các hành động tự động containment bị lỗi dây chuyền và bảo vệ tính sẵn sàng của tài nguyên, hệ thống áp dụng cơ chế Khóa bảo mật ngân sách lỗi tự động với các ngưỡng phân tầng:
+1. **Điều kiện kích hoạt**: Chuyển Tenant sang trạng thái `LOCKED_MODE` dựa trên phân tầng môi trường:
+   - Môi trường `prod`, `prod-core`, và `prod-payments` sẽ khóa nếu tỷ lệ rollback (hoàn tác thủ công do phát hiện False Positive) vượt quá **1% trong cửa sổ 30 ngày liên tục**.
+   - Môi trường `staging` sẽ khóa nếu tỷ lệ rollback vượt quá **10% trong cửa sổ 30 ngày liên tục**.
+   - Môi trường `dev`, `sandbox`, `ml-research`, và `data-analytics` không kích hoạt khóa (tính năng kiểm tra ngân sách lỗi bị vô hiệu hóa).
 2. **Hành vi**:
    - Mọi yêu cầu gửi tới `/v1/decide` sẽ tự động trả về `dry_run_mode: true` và AI Engine từ chối cung cấp payload can thiệp thật.
-   - Tất cả các tiêu đề phản hồi (response headers) sẽ bao gồm các trường `X-Containment-Status: LOCKED` và `X-Lock-Reason: error_budget_exceeded_1pct`.
+   - Tất cả các tiêu đề phản hồi (response headers) sẽ bao gồm các trường `X-Containment-Status: LOCKED` và `X-Lock-Reason: error_budget_exceeded_threshold`.
    - Nền tảng CDO bắt buộc chuyển mọi hoạt động containment downstream sang chế độ dry-run (chỉ cảnh báo), bỏ qua mọi nỗ lực ghi đè thủ công.
 3. **Khôi phục**: Việc mở khóa trạng thái `LOCKED_MODE` yêu cầu xem xét và phê duyệt thủ công từ Trưởng nhóm AI (AI Team Lead), người phải đặt lại các tham số ngân sách lỗi một cách rõ ràng.
+
+### 2.6 Tiêu chuẩn đặt tên Bucket S3 & Các chế độ truy cập IAM (S3 Telemetry Bucket Naming & IAM Access Modes)
+
+Để lưu trữ dữ liệu đo lường vận hành (telemetry), bằng chứng bất thường trung gian, và nhật ký kiểm toán, các S3 bucket tuân theo quy tắc đặt tên chuẩn hóa sau:
+- `tf2-cdo{NN}-telemetry-{region}` (trong đó `{NN}` đại diện cho số hiệu nhóm/tenant, và `{region}` đại diện cho vùng triển khai AWS, ví dụ: `ap-southeast-1`).
+
+Việc truy cập các telemetry bucket này giữa các tài khoản hỗ trợ hai chế độ cấu hình IAM riêng biệt:
+1. **Chế độ per-CDO (Mặc định - per-CDO Mode)**: Mô hình cách ly nghiêm ngặt, đơn bên (single-tenant), trong đó mỗi thực thể CDO platform có quyền đọc/ghi chuyên dụng được giới hạn riêng cho bucket thuộc nhóm của mình (`tf2-cdo{NN}-telemetry-{region}`).
+2. **Chế độ khung chia sẻ (Shared Skeleton Mode)**: Mô hình điều phối đa bên (multi-tenant) cho phép chia sẻ dữ liệu telemetry chéo tài khoản. Quyền truy cập được quản lý thông qua:
+   - Một chính sách tài nguyên S3 chứa ký tự đại diện (wildcard) được giới hạn bởi các điều kiện AWS (AWS conditions) cho các OU cụ thể của tổ chức.
+   - Hoặc gọi chéo tài khoản `STS AssumeRole` đi kèm với một mã định danh ngoại (ExternalId) được tạo động dựa trên tiêu đề `X-Tenant-Id` của tenant, đảm bảo ranh giới thuê bao nghiêm ngặt trong quá trình thu thập dữ liệu đa tài khoản.
 
 ## 3. Secrets Management
 
@@ -154,7 +168,11 @@ Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, hàm AI Engine Lambda không lấy static API keys từ Secrets Manager. Thay vào đó, hàm AI Engine Lambda sẽ xác thực độ toàn vẹn yêu cầu và độ lệch thời gian (clock skew drift tối đa 300s) trực tiếp từ các cross-cutting headers.
+Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, hàm AI Engine Lambda không lấy static API keys từ Secrets Manager. Thay vào đó, hàm AI Engine Lambda sẽ xác thực độ toàn vẹn yêu cầu và độ lệch thời gian trực tiếp từ các cross-cutting headers.
+
+Hệ thống áp dụng chính sách tách biệt về độ lệch thời gian (clock-skew split policy):
+1. **Độ lệch thời gian của yêu cầu API**: Độ lệch của tiêu đề `X-Request-Timestamp` được giới hạn nghiêm ngặt ở mức **300 giây** để chống lại các cuộc tấn công phát lại (replay attacks). Các yêu cầu nằm ngoài cửa sổ này sẽ tự động bị từ chối.
+2. **Độ trễ truyền dữ liệu CUR đầu vào**: Độ trễ thời gian lên tới **36 giờ** đối với dữ liệu chi phí (tệp xuất CUR trong S3) là bình thường và được chấp nhận do độ trễ cập nhật hóa đơn tiêu chuẩn của đám mây, và không kích hoạt lỗi xác thực độ lệch thời gian hay phát lại.
 
 Ví dụ, hàm container Lambda xác thực yêu cầu đi vào bằng đoạn mã logic Python sau:
 
@@ -260,6 +278,14 @@ Mọi hành động kiểm soát do CDO platform thực hiện đều được g
     "action": "remove_tags",
     "keys": ["FinOpsWatch", "AnomalyDetected"]
   },
+  "rollback_status": "success",
+  "rollback_executed_at": "2026-06-23T07:25:00Z",
+  "boto3_result": {
+    "HTTPStatusCode": 200,
+    "ResponseMetadata": {
+      "RequestId": "7f89b910-c123..."
+    }
+  },
   "approval_status": "pending_squad_response",
   "retention_location": "s3://cdo-audit-trail-bucket/audit/year=2026/month=06/",
   "retention_period_days": 90,
@@ -271,7 +297,7 @@ Mọi hành động kiểm soát do CDO platform thực hiện đều được g
 }
 ```
 
-Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại kho lưu trữ S3 đáng tin cậy (với tùy chọn đồng bộ cache lên DynamoDB), với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Dữ liệu đo lường hiệu năng gửi tới AI Engine để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, giảm nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only. Các tệp log và metrics của CloudWatch cũng được sử dụng cho việc giám sát sức khỏe vận hành của CDO platform và cảnh báo SRE. Mọi hoạt động xác thực bảng điều khiển (đăng nhập thành công, đăng xuất, làm mới phiên hết hạn), lỗi xác thực (đăng nhập thất bại, chữ ký token không hợp lệ, vi phạm cửa sổ replay) và các nỗ lực truy cập nhóm không được ủy quyền (như người dùng Finance readonly cố gắng gọi một hành động của operator) đều được ghi nhật ký ngay lập tức vào CloudWatch Logs và truyền về S3 để lưu giữ lịch sử kiểm toán.
+Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Khi hoạt động rollback được thực thi, nhật ký kiểm toán sẽ được cập nhật thêm các trường dành riêng cho rollback bao gồm `rollback_status`, `rollback_executed_at` và trường tùy chọn `boto3_result` chứa phản hồi API thô từ AWS. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại kho lưu trữ S3 đáng tin cậy (với tùy chọn đồng bộ cache lên DynamoDB), với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Dữ liệu đo lường hiệu năng gửi tới AI Engine để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, thiết lập `data_confidence = LOW` và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only. Các tệp log và metrics của CloudWatch cũng được sử dụng cho việc giám sát sức khỏe vận hành của CDO platform và cảnh báo SRE. Mọi hoạt động xác thực bảng điều khiển (đăng nhập thành công, đăng xuất, làm mới phiên hết hạn), lỗi xác thực (đăng nhập thất bại, chữ ký token không hợp lệ, vi phạm cửa sổ replay) và các nỗ lực truy cập nhóm không được ủy quyền (như người dùng Finance readonly cố gắng gọi một hành động của operator) đều được ghi nhật ký ngay lập tức vào CloudWatch Logs và truyền về S3 để lưu giữ lịch sử kiểm toán.
 
 ### 5.2 Storage + Retention
 

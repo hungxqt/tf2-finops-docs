@@ -62,6 +62,9 @@ Chế độ xem Xu hướng chi tiêu hiển thị chi phí AWS hàng ngày trê
 ### 2.2 Chi tiết bất thường (Anomaly detail)
 Khi người dùng nhấp vào một điểm đánh dấu bất thường hoặc chọn một sự kiện từ danh sách bất thường, chế độ xem Chi tiết bất thường sẽ được điền các bằng chứng quyết định:
 - **Độ tin cậy trực quan**: Một thanh trượt phần trăm thể hiện độ tin cậy của mô hình, được dịch thành các xếp hạng ngôn ngữ tự nhiên (ví dụ: Cao, Trung bình, Thấp).
+- **Độ tin cậy dữ liệu (Data Confidence)**: Thể hiện tính đầy đủ và chất lượng của dữ liệu đo lường hiệu năng đầu vào, được dịch thành các nhãn thân thiện với bộ phận Tài chính (Finance):
+  - `HIGH`: "Thu thập đầy đủ (dữ liệu chi phí & hiệu năng đã xác thực)" - Bất thường được phát hiện bằng cách sử dụng các bản ghi thanh toán đã được chốt và dữ liệu hiệu suất tài nguyên.
+  - `LOW`: "Dữ liệu đo lường bị chậm (dự phòng nguồn dữ liệu bị suy giảm)" - Dữ liệu telemetry bị trễ hoặc thiếu chỉ số hiệu suất, tự động chuyển sang chế độ dự phòng Cost Explorer hàng ngày hoặc CUR-only.
 - **Mức độ nghiêm trọng (Severity)**: Được phân loại thành Nguy cấp (Critical - kích hoạt thông báo dry-run hoặc hành động containment ngay lập tức), Cảnh báo (Warning), hoặc Thấp (Low).
 - **Cửa sổ bằng chứng (Evidence Window)**: Dấu thời gian bắt đầu và kết thúc của mô hình chi tiêu bất thường.
 - **Văn bản giải thích (Explanation Text)**: Mô tả bằng ngôn ngữ tự nhiên được tạo bởi AI Engine (ví dụ: "Phát hiện tăng đột ngột 4× chi phí EC2 trên thực thể g5.4xlarge, điển hình cho các cụm huấn luyện máy học không được quản lý").
@@ -78,17 +81,21 @@ Một bảng kiểm toán tương tác liệt kê tất cả các hành động 
 - **Hành động containment đang hoạt động**: Bảng hiển thị ID tài nguyên, tài khoản, squad sở hữu, loại hành động (ví dụ: Tagging, Sandbox Shutdown, Quota Cap) và thời gian thực thi.
 - **Chế độ thực thi (Execution Mode)**: Gắn nhãn rõ ràng cho các hành động là `dry-run` (giả lập containment hoặc chỉ đề xuất) hoặc `apply` (áp dụng tự động chính sách trên môi trường non-production).
 - **Đường liên kết bản ghi kiểm toán**: Một đường liên kết trực tiếp, có thể nhấp để xem bản ghi kiểm toán không thể sửa đổi được lưu trữ dưới dạng đối tượng S3 JSON. Mỗi liên kết tham chiếu đến Correlation ID và Idempotency Key duy nhất của lượt chạy.
-- **Các trường trạng thái & thông tin chi tiết sự cố dựa trên hợp đồng (Contract-Backed Status & Incident Detail Fields)**: Giao diện người dùng hiển thị các tham số chính được truy vấn trực tiếp từ kho lưu trữ có thẩm quyền S3 (với việc cache trên DynamoDB để hiển thị nhanh chóng trên dashboard), đại diện cho ngữ nghĩa hợp đồng API v1.1:
+- **Các trường trạng thái & thông tin chi tiết sự cố dựa trên hợp đồng (Contract-Backed Status & Incident Detail Fields)**: Giao diện người dùng hiển thị các tham số chính được truy vấn trực tiếp từ kho lưu trữ có thẩm quyền S3 (với việc cache trên DynamoDB để hiển thị nhanh chóng trên dashboard), đại diện cho ngữ nghĩa hợp đồng API v1.3:
   - `audit_id`: Mã định danh duy nhất cho phiên kiểm toán sự cố (ví dụ: `ANM-YYYY-MMDD[A-Z]`).
   - `status`: Trạng thái sự cố (ví dụ: `PENDING_APPROVAL`, `IN_PROGRESS`, `SUCCESS`, `ROLLED_BACK`, `ESCALATED`).
-  - `containment_locked`: Cờ Boolean cho biết liệu việc tự động can thiệp có bị khóa hay không (chỉ cho phép `dry_run_mode: true`) do vi phạm ngân sách lỗi.
+  - `containment_locked`: Cờ Boolean cho biết liệu việc tự động can thiệp có bị khóa hay không (chỉ cho phép `dry_run_mode: true` only) do vi phạm ngân sách lỗi.
   - `error_budget_remaining_pct`: Tỷ lệ ngân sách lỗi còn lại của tenant (0% đến 100%).
   - **Nhật ký hành động (Actions Log)**: Lịch sử từng bước bao gồm dấu thời gian, loại hành động, trạng thái và tác nhân thực hiện (ví dụ: `tag-for-review`, `auto-shutdown`, `quota-cap`).
-- **Chỉ báo Khóa ngân sách lỗi (Error Budget Lock - LOCKED_MODE)**: Một biểu ngữ nổi bật trên bảng điều khiển hiển thị `X-Containment-Status: LOCKED` nếu tỷ lệ hoàn tác (rollback) vượt quá 1% trong 30 ngày. Biểu ngữ hiển thị lý do khóa (`error_budget_exceeded_1pct`), dấu thời gian khóa và vô hiệu hóa mọi nút chuyển đổi "Apply", bắt buộc mọi quyết định chạy ở chế độ dry-run.
+- **Chỉ báo Khóa ngân sách lỗi (Error Budget Lock - LOCKED_MODE)**: Một biểu ngữ nổi bật trên bảng điều khiển hiển thị `X-Containment-Status: LOCKED` nếu tỷ lệ hoàn tác (rollback) vượt quá ngưỡng ngân sách lỗi. Biểu ngữ hiển thị lý do khóa (`error_budget_exceeded_threshold`), dấu thời gian khóa và vô hiệu hóa mọi nút chuyển đổi "Apply", bắt buộc mọi quyết định chạy ở chế độ dry-run. Việc khóa được phân tầng theo môi trường:
+  - **Môi trường Sản xuất (Prod)**: Bị khóa nếu tỷ lệ rollback > 1%.
+  - **Môi trường Staging**: Bị khóa nếu tỷ lệ rollback > 10%.
+  - **Môi trường Phát triển/Sandbox (Dev)**: Tính năng khóa bị vô hiệu hóa (không bao giờ bị khóa, ngưỡng ngân sách lỗi không áp dụng).
 - **Quy trình xác thực (Verification Flow)**: Người vận hành được phân quyền có thể kích hoạt xác thực việc khắc phục bằng cách gửi báo cáo thực thi và dữ liệu telemetry sau can thiệp (qua lệnh gọi API `/v1/verify`). Giao diện người dùng hiển thị giá trị `next_action` được trả về (như `DONE`, `RETRY`, `ROLLBACK`, hoặc `ESCALATE`).
 - **Hành vi Khôi phục/Hoàn tác (Rollback/Restore Behavior)**: Cho phép các kỹ sư kích hoạt khôi phục thủ công (đại diện cho ngữ nghĩa `/v1/audit/{audit_id}/rollback`), được hiển thị dưới dạng nút **Rollback**.
-  - *Tham số request*: `reason` (lý do rollback) và `rolled_back_by` (email người thực hiện).
-  - *Phản hồi/Trạng thái giao diện mong muốn*: Xác nhận khởi tạo rollback, cập nhật tỷ lệ hao hụt ngân sách lỗi (`new_error_budget_burned_pct`) và chuyển trạng thái sự cố sang `ROLLED_BACK`.
+  - *Tham số request*: `reason` (lý do rollback), `rolled_back_by` (email người thực hiện), `rollback_executed_at` (dấu thời gian thực thi hoàn tác), `rollback_status` (trạng thái khôi phục), và tùy chọn `boto3_result` (thông tin chi tiết về thực thi khôi phục).
+  - *Phản hồi/Trạng thái giao diện mong muốn*: Xác nhận khởi tạo rollback, trả về `audit_recorded = true` (thay vì `rollback_initiated`), cập nhật tỷ lệ hao hụt ngân sách lỗi (`new_error_budget_burned_pct`) và chuyển trạng thái sự cố sang `ROLLED_BACK`.
+  - *Logic thực thi Rollback (Rollback Execution Logic)*: Hành động rollback được xử lý trực tiếp bởi CDO backend. Khi được kích hoạt, CDO backend đọc cấu hình `rollback_payload.boto3_equivalent` đã được lưu trữ cache trong kho lưu trữ có thẩm quyền S3, thực thi các hành động rollback trực tiếp thông qua các API tiêu chuẩn của AWS SDK (Boto3/CLI) (đảm bảo việc khôi phục hoạt động bình thường ngay cả khi AI Engine ngoại tuyến), sau đó thông báo cho endpoint kiểm toán của AI Engine về trạng thái và thông tin chi tiết của quá trình thực thi.
 - **Giới hạn kiểm soát truy cập (Access Control Restriction)**: Các lệnh khôi phục thô và kế hoạch thực thi bị giới hạn nghiêm ngặt, chỉ hiển thị và có khả năng thực thi bởi các kỹ sư CDO/Kỹ thuật được phân quyền dưới các IAM policy riêng biệt và nhóm người dùng Cognito. Người dùng Tài chính (Finance) chỉ tương tác với các trạng thái trực quan cấp cao và không bao giờ nhìn thấy hoặc thực thi các CLI command.
 
 ---
@@ -99,19 +106,19 @@ Hàm Lambda định tuyến cảnh báo (Alert Routing Lambda) xử lý đầu r
 
 ### 3.1 Cảnh báo Finance (Finance alerts)
 Các bất thường mức độ nghiêm trọng cao hoặc các sự kiện vượt quá ngưỡng ngân sách cụ thể (ví dụ: chi phí chênh lệch >100 USD/ngày) được định tuyến đến kênh thông báo của Finance.
-- **Kênh phân phối**: Amazon SES (Email) hoặc Amazon SNS (SMS/Pager).
-- **Trọng tâm nội dung**: Tác động tài chính (USD delta), trạng thái hành động containment hiện tại, đường liên kết kiểm toán S3/CloudFront và siêu dữ liệu cho biết khả năng khôi phục/gia hạn có tồn tại cho bất thường đó hay không.
+- **Kênh phân phối**: Amazon SES (Email) or Amazon SNS (SMS/Pager).
+- **Trọng tâm nội dung**: Tác động tài chính (USD delta), độ tin cậy dữ liệu (`HIGH`/`LOW` với các nhãn ngôn ngữ tự nhiên), trạng thái hành động containment hiện tại, đường liên kết kiểm toán S3/CloudFront và siêu dữ liệu cho biết khả năng khôi phục/gia hạn có tồn tại cho bất thường đó hay không.
 - **Ràng buộc bảo mật (Security Constraint)**: Không bao gồm bất kỳ nút hành động trực tiếp hoặc câu lệnh CLI nào trong các thông báo cảnh báo công khai của Finance.
 - **Tần suất**: Các thông báo batch hàng ngày, với khả năng leo thang ngay lập tức đối với các đột biến chi phí nguy cấp.
 
 ### 3.2 Cảnh báo Kỹ thuật (Engineering alerts)
 Tất cả các bất thường được phát hiện được định tuyến trực tiếp đến các squad chịu trách nhiệm về tài nguyên mục tiêu.
 - **Kênh phân phối**: Slack Webhook (Các kênh squad chuyên dụng) hoặc Jira API (tự động tạo ticket). Các URL webhook của Squad được truy xuất động bằng cách sử dụng đối tượng cấu hình `slack_routing` được trả về trong phản hồi `/v1/decide` (định nghĩa `channel_name` và `webhook_url_pointer`).
-- **Trọng tâm nội dung**: ID tài nguyên kỹ thuật (ARN), loại dịch vụ, môi trường (Dev/Sandbox/Prod), trạng thái tuân thủ tag và đường dẫn rollback đề xuất.
+- **Trọng tâm nội dung**: ID tài nguyên kỹ thuật (ARN), loại dịch vụ, môi trường (Dev/Sandbox/Prod), trạng thái tuân thủ tag, trạng thái độ tin cậy dữ liệu (`HIGH`/`LOW`), và đường dẫn rollback đề xuất.
 - **Kiểm soát hành động (Action Control)**: Include các liên kết hành động Xác thực và Hoàn tác ngắn hạn, được xác thực (thực thi đối với lớp API đại diện cho ngữ nghĩa `/v1/verify` và `/v1/audit/{audit_id}/rollback`) khi chính sách và cấu hình môi trường cho phép.
 - **Tần suất & Gom nhóm (Frequency & Aggregation)**: Để ngăn ngừa tình trạng quá tải thông báo (alert fatigue) và tin nhắn rác trên Slack, Lambda Cảnh báo sẽ tổng hợp (gom nhóm) các cảnh báo theo `Squad_ID` và gửi chúng dưới dạng một tin nhắn Digest (Tóm tắt) hàng ngày duy nhất (thay vì gửi tin nhắn rác gần như thời gian thực cho từng bất thường riêng lẻ, chẳng hạn như 50 pod bị lỗi đồng thời). Bản tóm tắt liệt kê các bất thường nghiêm trọng nhất cần chú ý.
 
-*Ghi chú về dữ liệu telemetry*: Dữ liệu đo lường được xử lý để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, giảm nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only.
+*Ghi chú về dữ liệu telemetry*: Dữ liệu đo lường được xử lý để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, thiết lập `data_confidence = LOW` và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only.
 
 ### 3.3 Xử lý lỗi API hợp đồng (API contract error handling)
 Khi người vận hành kích hoạt các nút điều khiển hành động, hệ thống bảng điều khiển và cảnh báo sẽ xử lý các lỗi hợp đồng sau:
@@ -125,7 +132,12 @@ Khi người vận hành kích hoạt các nút điều khiển hành động, h
 - **`ERR_RATE_LIMITED`**: Lượt gọi vượt quá 100 requests/phút. Client thực hiện exponential backoff.
 - **`ERR_LLM_TIMEOUT` / `ERR_SERVICE_DOWN`**: AI Engine không khả dụng hoặc bị timeout. Nền tảng CDO kích hoạt hệ thống luật fallback tĩnh nội bộ.
 
-### 3.4 Payload cảnh báo mẫu (Example alert payload)
+### 3.4 Khả năng quan sát callback (Callback observability)
+Đối với các tích hợp sử dụng callback để thông báo cho CDO về trạng thái bất thường:
+- **Ghi nhật ký đo lường (Telemetry Logging)**: Việc truyền tải callback được ghi nhật ký dưới dạng dữ liệu đo lường vận hành của nền tảng.
+- **Cô lập đồng bộ (Synchronous Isolation)**: Thất bại trong việc gửi callback (ngay cả sau khi đã thử lại hết số lần cấu hình) không làm lỗi hoặc mất hiệu lực kết quả phát hiện đồng bộ chính.
+
+### 3.5 Payload cảnh báo mẫu (Example alert payload)
 Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schema dưới đây đại diện cho một payload cảnh báo điển hình được gửi đến các kênh thông báo:
 
 ```json
@@ -135,6 +147,7 @@ Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schem
   "anomaly_type": "runaway_usage",
   "severity": "HIGH",
   "confidence_score": 0.94,
+  "data_confidence": "HIGH",
   "resource_id": "arn:aws:ec2:ap-southeast-1:123456789012:instance/i-0abcd1234efgh5678",
   "environment": "sandbox",
   "responsible_team": "squad-prediction-models",

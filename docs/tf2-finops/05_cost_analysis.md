@@ -31,6 +31,7 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Secrets Manager** | $0.40/secret/month + request charges | AI Engine credentials, webhooks, contract signing key, external IDs | Shared fixed plus request volume. |
 | **KMS** | $1.00/CMK/month + request charges | Data, audit, secrets, encryption keys | Shared fixed; consolidation requires Security approval. |
 | **Observability - CloudWatch, Prometheus, OTel & X-Ray** | Logs, metrics, trace analyzer, ADOT/OTel collector, and dashboard charges | Lambda logs, Step Functions traces, queue metrics, performance metrics (CPU, Memory, database utilization), and platform dashboards | Shared and variable; ADOT and telemetry collection can become a top cost driver. |
+| **Query - Cost Explorer API** | $0.01 per request | Fallback cost query ONLY when S3 CUR is delayed (`telemetry_delay_event = true`) | Conditional fallback cost; otherwise $0 under normal CUR operations. |
 | **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for the AI Engine Lambda container function | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
 | **Dashboard - S3 + CloudFront** | S3 & CloudFront pricing | Finance stakeholder dashboard access | S3 storage and CloudFront HTTPS request/data transfer fees. |
 | **Amazon Cognito (Auth)** | Free tier up to 50,000 MAUs; then $0.0055/MAU | User directory and Hosted UI auth gateway for dashboard access | Shared platform cost; free for capstone scale. |
@@ -42,6 +43,7 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 - The above forecast is the estimated **CDO platform infrastructure** including the CDO-owned Lambda container hosting platform, but excluding AIOps-owned model development and model-quality work.
 - VPC endpoints, KMS, and observability are the largest fixed costs.
 - Actual costs must be measured from tagged AWS spend. Use `Evidence needed: CDO Lambda hosting actual`, `Evidence needed: CDO pipeline per-run actual`, and `Evidence needed: AI workload hosted-on-CDO actual` until measured.
+- Enabling the `callback_url` parameter triggers additional egress data transfer, logging, and retry costs when asynchronous notifications are enabled.
 
 ---
 
@@ -79,7 +81,7 @@ As tenant count grows, fixed costs such as VPC endpoints, KMS CMKs, and S3 + Clo
 | **Athena partition pruning** |  Implemented | 60-80% query cost | Partition by cost_period_start, account_id, service |
 | **VPC Gateway Endpoints (S3, DynamoDB)** |  Implemented | $0.09/GB NAT cost | S3/DDB traffic bypasses NAT Gateway |
 | **CloudWatch Logs retention** |  Implemented | 50% logs cost | Application logs: 14 days; Audit logs: 90 days then export to S3 |
-| **Lambda reserved concurrency** |  Not applicable | N/A | Low-frequency batch workload, no need to reserve |
+| **Lambda reserved concurrency** |  Implemented | N/A | Baseline Reserved Concurrency (5-10 concurrent executions) acts as a cost/blast guardrail, while Provisioned Concurrency is optional. |
 | **Savings Plans / Reserved Instances** |  W12 T4 evaluation | 20-40% compute | Need 2-week baseline to determine commitment; not applied in 2-week capstone |
 | **SQS batching for alerts** | Implemented | 20-40% Lambda cost | Batch SQS messages (e.g., 5 or 10 messages) to invoke fewer alert routing Lambda executions. |
 | **Lambda right-sizing & architecture choice** | Implemented | 15-30% compute cost | Select x86_64 or Graviton2 based on performance/cost ratio, right-sizing memory limits. |
@@ -235,6 +237,7 @@ After completing the 2-week capstone with actual baseline, the following recomme
 | **Lambda cold-start provisioned concurrency** | +$50-150/month | Medium | Apply Provisioned Concurrency only where latency SLAs are breached; use autoscaling. |
 | **SQS retry loops** | +$50-300/day | Medium | Set maximum SQS receive counts, configure DLQs, check execution status. |
 | **CloudWatch high-cardinality metrics** | +$20-100/month | Medium | Limit custom metrics labels, use default VPC endpoint metrics. |
+| **Retry and cache-storage costs** | Variable | Medium | Dynamically bounded by log retention (14 days app / 90 days audit) and cache lifecycle rules (24h S3 / 30 days DynamoDB). |
 | **Mơ hồ sở hữu chi phí AIOps/CDO** | Budget disputes | Medium | Tag AI runtime separately from AIOps model development/training. |
 
 ---

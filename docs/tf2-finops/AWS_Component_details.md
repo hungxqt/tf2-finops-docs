@@ -275,25 +275,29 @@ It sequences deterministic CDO steps: idempotency check, ingestion, validation, 
 
 ### Role
 
-The ingestion Lambda pulls Cost Explorer data and copies or registers CUR files.
+The ingestion Lambda pulls CUR cost files by default, or conditionally pulls Cost Explorer data as fallback.
 
 ### Purpose
 
-It turns external billing sources into raw platform inputs stored under the CDO lakehouse.
+It turns external billing sources and CloudWatch performance metrics into raw platform inputs stored under the CDO lakehouse.
 
 ### Input
 
 - Account list and role-assumption details.
-- CUR bucket names and prefixes.
+- CUR bucket names and prefixes (bucket naming standard: `s3://tf2-cdo{NN}-telemetry-{region}/`).
+- `telemetry_delay_event` (boolean flag to toggle fallback Cost Explorer daily data pull instead of CUR).
 - Cost Explorer query window.
-- Raw S3 bucket and prefix.
+- CloudWatch performance telemetry metrics (including raw 24-hourly `cpu_utilization_hourly` array).
+- Raw S3 bucket and prefix (conforming to standard bucket naming).
 - KMS key ARN for write access.
 - Retry and backoff settings.
 
 ### Output
 
 - Raw CUR file references.
-- Raw Cost Explorer JSON files.
+- Raw Cost Explorer JSON files (pulled as fallback if `telemetry_delay_event = true`).
+- CPU utilization raw array (`cpu_utilization_hourly`).
+- Downstream ingestion status tags including `data_confidence` (HIGH for CUR, LOW for Cost Explorer fallback).
 - Source object URI evidence.
 - Pull status per account and cost window.
 - Error records for CUR delay or Cost Explorer throttling.
@@ -362,10 +366,11 @@ It serves as the entry point for the AI detection flow. It validates incoming re
 
 ### Input
 
-- Normalized cost window payload.
-- Run ID and idempotency key.
+- Normalized cost window payload (with `telemetry_delay_event` flag).
+- Run ID and idempotency key (bucket naming standard: `s3://tf2-cdo{NN}-telemetry-{region}/`).
 - Account scope.
 - Contract version.
+- CloudWatch performance telemetry metrics (including raw 24-hourly `cpu_utilization_hourly` array).
 - Secrets reference for payload integrity signing.
 
 ### Output
@@ -375,7 +380,13 @@ It serves as the entry point for the AI detection flow. It validates incoming re
   - `correlation_id` (UUID v4)
   - `anomalies_detected` (boolean)
   - `anomalies_list` (array of detected anomalies)
+  - `data_confidence` (HIGH/LOW, indicating CUR data source quality vs Cost Explorer fallback)
+  - `callback_url` (optional, for additive async callback notification)
   - `error_message` (optional)
+- Decide Response outputs (representing `/v1/decide` logical endpoint):
+  - `action_plan` (containment strategy)
+  - `applied_payload` (commands to apply)
+  - `rollback_payload.boto3_equivalent` (cached in DynamoDB immediately, CDO-executed from cache via Boto3, then reported via `POST /v1/audit/{audit_id}/rollback`)
 - Error codes or validation failures (contract-level equivalents of HTTP `400 Bad Request` or `409 Conflict`) if idempotency check or payload validation fails.
 
 ## 12. Alert Routing Lambda
@@ -490,6 +501,7 @@ It preserves immutable source evidence before transformation, supporting reproce
 - Billing period.
 - Ingestion timestamp.
 - KMS encryption configuration.
+- Bucket naming convention: standard bucket naming `s3://tf2-cdo{NN}-telemetry-{region}/raw/`.
 
 ### Output
 
@@ -515,6 +527,7 @@ It provides the stable lakehouse layer for Athena queries, AI contract payload c
 - Owner and squad tags.
 - Account, year, and month partition values.
 - Parquet conversion output.
+- Bucket naming convention: standard bucket naming `s3://tf2-cdo{NN}-telemetry-{region}/curated/`.
 
 ### Output
 
@@ -540,6 +553,7 @@ It acts as the durable evidence store for traceability, especially when DynamoDB
 - AI decision evidence references.
 - Retention period, at least 90 days.
 - Object Lock settings when enabled.
+- Bucket naming convention: standard bucket naming `s3://tf2-cdo{NN}-telemetry-{region}/audit/` and `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/`.
 
 ### Output
 
@@ -786,7 +800,7 @@ Executes model inference and anomaly analysis inside a Lambda function initializ
 
 ### Input
 
-- Ingested cost and CloudWatch utilization features from S3.
+- Ingested cost and CloudWatch utilization features from S3 (including `cpu_utilization_hourly` array and `telemetry_delay_event` flag; bucket naming standard: `s3://tf2-cdo{NN}-telemetry-{region}/`).
 - Pinned ECR image digest.
 - S3 bucket ARNs for evidence.
 - Lambda execution role ARN.
@@ -794,7 +808,8 @@ Executes model inference and anomaly analysis inside a Lambda function initializ
 
 ### Output
 
-- Anomaly detection results and explanations returned synchronously to the Step Functions orchestrator.
+- Anomaly detection results (including `data_confidence` and optional `callback_url`) and explanations returned synchronously to the Step Functions orchestrator.
+- Decisions and recommended actions including `rollback_payload.boto3_equivalent` cached by CDO in DynamoDB (rollback is CDO-executed from cache, then reported via `POST /v1/audit/{audit_id}/rollback`).
 - Detailed execution reasoning evidence written to the S3 bucket.
 - Execution traces sent to X-Ray and logs sent to CloudWatch.
 

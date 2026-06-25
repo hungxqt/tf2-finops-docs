@@ -12,7 +12,7 @@
 
 Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) ở mặt phẳng dữ liệu để thu thập và phân tích chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với một AI Engine dùng chung do AIOps cung cấp được lưu trữ trên các hình ảnh container AWS Lambda. Lớp tính toán serverless sử dụng các hàm Lambda chạy trong các subnet riêng tư. Bộ điều phối Step Functions trung tâm gọi trực tiếp và đồng bộ AI Engine Lambda. Lưu ý rằng `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback` đại diện cho các ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai trong luồng công việc chạy theo lô cơ bản này, vì không có Private API Gateway nào được triển khai.
 
-Kiến trúc này được định cỡ xoay quanh các trách nhiệm lặp lại của nền tảng CDO, chứ không xoay quanh bộ dữ liệu huấn luyện mô hình của AIOps. CDO phải kéo dữ liệu thanh toán và hiệu suất một cách đáng tin cậy từ các nguồn AWS được phê duyệt, chuẩn hóa nó thành dạng sẵn sàng cho hợp đồng, gọi AI Engine do AIOps sở hữu và lưu giữ bằng chứng quyết định được trả về. Mọi bộ dữ liệu lịch sử tổng hợp được sử dụng để huấn luyện, nâng cao hoặc backtest mô hình đều thuộc sở hữu của AIOps. Telemetry phát hiện bao gồm dữ liệu CUR, các truy vấn API Cost Explorer, và các chỉ số hiệu suất CloudWatch (`resource_utilization_metrics` như CPU, bộ nhớ, mạng, đĩa, kết nối cơ sở dữ liệu, và chỉ số GPU). Nếu không có sẵn các chỉ số CloudWatch, nền tảng sẽ tự động kích hoạt chế độ dự phòng CUR-only, làm giảm một nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và giới hạn các biện pháp can thiệp ở chế độ dry-run/cảnh báo thuần túy.
+Kiến trúc này được định cỡ xoay quanh các trách nhiệm lặp lại của nền tảng CDO, chứ không xoay quanh bộ dữ liệu huấn luyện mô hình của AIOps. CDO phải kéo dữ liệu thanh toán và hiệu suất một cách đáng tin cậy từ các nguồn AWS được phê duyệt, chuẩn hóa nó thành dạng sẵn sàng cho hợp đồng, gọi AI Engine do AIOps sở hữu và lưu giữ bằng chứng quyết định được trả về. Mọi bộ dữ liệu lịch sử tổng hợp được sử dụng để huấn luyện, nâng cao hoặc backtest mô hình đều thuộc sở hữu của AIOps. Telemetry phát hiện bao gồm dữ liệu CUR, các truy vấn API Cost Explorer, và các chỉ số hiệu suất CloudWatch (`resource_utilization_metrics` như CPU, bộ nhớ, mạng, đĩa, kết nối cơ sở dữ liệu, và chỉ số GPU). Nếu không có sẵn các chỉ số CloudWatch, nền tảng sẽ tự động kích hoạt chế độ dự phòng CUR-only, thiết lập `data_confidence = LOW` và giới hạn các biện pháp can thiệp ở chế độ dry-run/cảnh báo thuần túy.
 
 ```mermaid
 graph TB
@@ -24,7 +24,8 @@ graph TB
 
     subgraph "CDO Management Account VPC (ap-southeast-1)"
         subgraph "Ingestion & Orchestration"
-            EB[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+            S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger (Default, No Polling)| SF[Step Functions Workflow]
+            EB[EventBridge Scheduler] -->|Trigger Daily Fallback / Delayed > 36h| SF
             SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
             SF -->|Evaluate Run| LambdaState[State Lambda]
             SF -->|Trigger Containment| LambdaCont[Containment Lambda]
@@ -80,15 +81,18 @@ graph TB
     %% AI Engine Integration
     SF -->|1. POST /v1/detect - Direct Synchronous Invoke| AILambda
     AILambda -->|2. Read cost & CloudWatch metrics| S3Cur
-    AILambda -->|3. Return anomalies_list - Synchronous| SF
+    AILambda -->|3. Return anomalies_list & data_confidence - Synchronous| SF
     SF -->|4. Write audit record| S3Audit
     SF -->|5. POST /v1/decide - Retrieve plan| AILambda
-    AILambda -->|6. Return DecideResponse| SF
+    AILambda -->|6. Return DecideResponse (with rollback_payload.boto3_equivalent)| SF
+    SF -->|6.1. Cache rollback payload in DynamoDB| DDB
     SF -->|7. POST /v1/verify| AILambda
     AILambda -->|8. Return VerifyResponse| SF
+    SF -->|9. Execute rollback from Cache (Boto3)| MemberAccounts
+    SF -->|10. POST /v1/audit/{audit_id}/rollback - Report results| AILambda
 ```
 
-*Chú thích: Quy trình CDO được kích hoạt hàng ngày bởi EventBridge Scheduler. Luồng Step Functions điều phối việc thu thập dữ liệu từ các tài khoản thành viên, ghi dữ liệu CUR, Cost Explorer, và dữ liệu hiệu năng CloudWatch thô vào S3, rồi tạo danh mục Glue Catalog. Luồng này gọi trực tiếp và đồng bộ AI Engine Lambda do AIOps sở hữu (POST /v1/detect), hàm này trả về các bất thường trực tiếp trong phản hồi. Step Functions sau đó gửi yêu cầu quyết định (POST /v1/decide) cho bất kỳ bất thường nào được phát hiện, điều phối cảnh báo, kích hoạt các hành động containment được phê duyệt, ghi nhận nhật ký kiểm toán có thẩm quyền vào S3 (với tính năng Object Lock), cập nhật DynamoDB cache, và xác minh kết quả (POST /v1/verify) một cách đồng bộ.*
+*Chú thích: Quy trình CDO được kích hoạt mặc định bởi các thông báo EventBridge khi có đối tượng S3 CUR mới (không polling), hoặc bởi EventBridge Scheduler hàng ngày dưới dạng fallback nếu dữ liệu CUR bị trễ quá 36 giờ. Luồng Step Functions điều phối việc thu thập dữ liệu từ các tài khoản thành viên, ghi dữ liệu CUR, Cost Explorer, và dữ liệu hiệu năng CloudWatch thô vào S3, rồi tạo danh mục Glue Catalog. Luồng này gọi trực tiếp và đồng bộ AI Engine Lambda do AIOps sở hữu (`POST /v1/detect`, với độ trễ mục tiêu P99 < 300 ms vì nó hoạt động không cần gọi LLM), hàm này trả về các bất thường và `data_confidence` trực tiếp trong phản hồi. Step Functions sau đó gửi yêu cầu quyết định (`POST /v1/decide`) cho bất kỳ bất thường nào được phát hiện (tuân theo giới hạn cứng 45 giây của Bedrock để tạo RCA), ngay lập tức lưu cache `rollback_payload.boto3_equivalent` vào DynamoDB. Hệ thống điều phối cảnh báo, kích hoạt các hành động containment được phê duyệt, ghi nhận nhật ký kiểm toán có thẩm quyền vào S3, và xác minh kết quả (`POST /v1/verify`) một cách đồng bộ. Các hành động rollback được thực thi bởi CDO trực tiếp từ DynamoDB cache bằng cách sử dụng Boto3, sau đó được báo cáo qua `POST /v1/audit/{audit_id}/rollback`.*
 
 ---
 
@@ -121,7 +125,7 @@ graph TD
     Actions -->|12. Publish| Dashboard[Finance Dashboard / Channels]
 ```
 
-*Chú thích: Bộ điều phối trung tâm Step Functions Orchestrator vận hành toàn bộ vòng lặp FinOps: trích xuất dữ liệu chi phí và telemetry CloudWatch vào Lakehouse, gọi hàm AI Engine Lambda một cách đồng bộ (`POST /v1/detect`), gọi `POST /v1/decide` để lấy kế hoạch can thiệp, thực thi các hành động đã được duyệt qua các worker chính sách, xác minh kết quả qua `POST /v1/verify`, và ghi nhận nhật ký kiểm toán tuân thủ chống giả mạo trực tiếp vào S3.*
+*Chú thích: Bộ điều phối trung tâm Step Functions Orchestrator vận hành toàn bộ vòng lặp FinOps: trích xuất dữ liệu chi phí và telemetry CloudWatch (mặc định sử dụng các trigger EventBridge khi có file S3 CUR arrival, hoặc fallback qua API Cost Explorer nếu CUR bị chậm > 36 giờ), gọi hàm AI Engine Lambda một cách đồng bộ (`POST /v1/detect` với độ trễ P99 < 300 ms), gọi `POST /v1/decide` để lấy kế hoạch can thiệp và lưu cache `rollback_payload.boto3_equivalent` vào DynamoDB, thực thi các hành động đã được duyệt, xác minh kết quả qua `POST /v1/verify`, thực hiện các hành động rollback bằng Boto3 trực tiếp từ cache và báo cáo kết quả qua `POST /v1/audit/{audit_id}/rollback`, và ghi nhận nhật ký kiểm toán tuân thủ chống giả mạo trực tiếp vào S3.*
 
 Về mặt vận hành, Step Functions là ranh giới kiểm soát giữa logic CDO mang tính xác định và đầu ra AI mang tính xác suất. Mỗi quá trình chuyển đổi trạng thái đều ghi lại `run_id`, cửa sổ chi phí, phạm vi tài khoản và phiên bản hợp đồng để Finance có thể truy vết một bất thường trên dashboard về đúng lô thu thập dữ liệu và quyết định của AI. Thiết kế này cũng ngăn AI Engine tác động trực tiếp đến các tài khoản thành viên; tất cả các hành động cảnh báo và containment đều được điều phối thông qua các worker chính sách của CDO.
 
@@ -138,7 +142,8 @@ graph TB
     end
 
     subgraph "CDO Ingestion & Lakehouse"
-        Scheduler[EventBridge Scheduler] -->|Trigger Daily| SF[Step Functions Workflow]
+        S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger Ingestion (Mặc định, Không Polling)| SF[Step Functions Workflow]
+        Scheduler[EventBridge Scheduler] -->|Trigger Fallback nếu CUR bị chậm > 36h| SF
         SF -->|1. Run Puller| Puller[Ingestion Lambda]
         Puller -->|Fetch API Cost| CE
         Puller -->|Copy CUR Files| CUR
@@ -156,9 +161,9 @@ graph TB
     class CUR,CE,CW external;
 ```
 
-*Chú thích: Step Functions kích hoạt hàm Ingestion Lambda hàng ngày thông qua EventBridge Scheduler. Dữ liệu chi phí thô và chỉ số hiệu năng CloudWatch từ các tài khoản thành viên (Member Accounts) được lưu trữ trong S3 Raw Zone, được chuyển tiếp và catalog hóa thành định dạng Parquet trong S3 Curated Zone, rồi được truy vấn thông qua Athena. Kết quả truy vấn được truyền ngược lại bộ điều phối Step Functions để cung cấp cho AI Engine.*
+*Chú thích: Luồng thu thập dữ liệu mặc định được kích hoạt tự động bởi EventBridge khi có tệp S3 CUR mới (không polling). Nếu việc phân phối CUR bị trễ quá 36 giờ, EventBridge Scheduler hàng ngày sẽ kích hoạt đường dẫn fallback, kéo dữ liệu daily qua API Cost Explorer (với `telemetry_delay_event = true`). Dữ liệu chi phí thô và các chỉ số hiệu năng CloudWatch (bao gồm cả mảng `cpu_utilization_hourly`) được lưu trữ trong S3 Raw Zone, được chuẩn hóa và catalog hóa trong S3 Curated Zone, rồi được Athena truy vấn để cung cấp cho AI Engine.*
 
-Workflow thu thập chuẩn hóa hai dạng dữ liệu thanh toán vận hành trước khi gọi AI Engine. CUR cung cấp các trường ở cấp độ tài nguyên như account ID, product code, resource ID, unblended cost và các thẻ tài nguyên. Cost Explorer cung cấp các trường tổng hợp như linked account, service name, service code, region, unblended cost và trạng thái estimated/final. Lớp curated lưu trữ cả trường mã dịch vụ đã chuẩn hóa và tên hiển thị để CDO có thể chuyển các payload nhất quán tới AIOps và xây dựng các chế độ xem dashboard mà không cần sở hữu dữ liệu huấn luyện mô hình.
+Workflow thu thập chuẩn hóa hai dạng dữ liệu thanh toán vận hành (CUR là nguồn phát hiện daily mặc định; dữ liệu daily từ Cost Explorer là phương án fallback khi kích hoạt `telemetry_delay_event = true` nếu CUR bị chậm > 36 giờ) và các chỉ số hiệu năng CloudWatch trước khi gọi AI Engine. CUR cung cấp các trường ở cấp độ tài nguyên như account ID, product code, resource ID, unblended cost và các thẻ tài nguyên. Cost Explorer cung cấp các trường tổng hợp như linked account, service name, service code, region, unblended cost và trạng thái estimated/final. CloudWatch cung cấp các chỉ số sử dụng tài nguyên (bao gồm CPU qua mảng `cpu_utilization_hourly` thay thế cho `idle_hours_continuous` cũ, memory, net, disk, DB connections và GPU metrics). Lớp curated lưu trữ cả trường mã dịch vụ đã chuẩn hóa và tên hiển thị để CDO có thể chuyển các payload nhất quán tới AIOps và xây dựng các chế độ xem dashboard mà không cần sở hữu dữ liệu huấn luyện mô hình.
 
 ### 1.3 Nền tảng Lưu trữ AI Engine trên Lambda Container (AI Engine Lambda Container Hosting Platform)
 
@@ -210,7 +215,7 @@ graph TB
 
 *Chú thích: Yêu cầu phát hiện dị thường từ bộ điều phối Step Functions được gửi qua cuộc gọi Lambda trực tiếp đến hàm AI Engine Lambda (`POST /v1/detect`). AI Engine Lambda xử lý đồng bộ dữ liệu chi phí và các chỉ số hiệu năng CloudWatch từ S3 và trả về kết quả phát hiện ngay lập tức. Bộ điều phối sau đó gửi yêu cầu quyết định (`POST /v1/decide`), thực thi các hành động can thiệp, ghi nhận hồ sơ kiểm toán vào S3, và xác minh hành động khắc phục (`POST /v1/verify`) một cách đồng bộ.*
 
-Nền tảng dựa trên Lambda lưu trữ AI Engine container hóa để phát hiện bất thường chi phí đồng bộ. Bằng cách gọi trực tiếp hàm Lambda AI Engine, bộ điều phối Step Functions nhận được `anomalies_list` trong cùng chu kỳ yêu cầu (thường là 30-45 giây), loại bỏ hoàn toàn các vòng lặp và hàng đợi truy vấn trạng thái. Bộ điều phối ghi nhận các khóa idempotency có thẩm quyền và nhật ký kiểm toán tuân thủ trực tiếp vào Amazon S3, sử dụng tính năng Object Lock để đảm bảo tính bất biến WORM. DynamoDB được sử dụng thuần túy như một bộ đệm đọc (cache) phục vụ các truy vấn độ trễ thấp của bảng điều khiển tài chính. Hướng tiếp cận ưu tiên hợp đồng này cung cấp khả năng thực thi đồng bộ có thể dự đoán trong khi thực thi các ranh giới bảo mật nghiêm ngặt qua các vai trò thực thi IAM và VPC Endpoint riêng tư.
+Nền tảng dựa trên Lambda lưu trữ AI Engine container hóa để phát hiện bất thường chi phí đồng bộ. Bằng cách gọi trực tiếp hàm Lambda AI Engine, bộ điều phối Step Functions nhận được `anomalies_list` và `data_confidence` trong cùng chu kỳ yêu cầu (độ trễ mục tiêu P99 cho `/v1/detect` là < 300 ms vì nó thực hiện phân tích trực tiếp không qua xử lý LLM; giới hạn cứng 45 giây của Bedrock chỉ áp dụng riêng cho `/v1/decide` khi tạo RCA và kế hoạch hành động), loại bỏ hoàn toàn các vòng lặp và hàng đợi truy vấn trạng thái. Bộ điều phối ghi nhận các khóa idempotency có thẩm quyền và nhật ký kiểm toán tuân thủ trực tiếp vào Amazon S3, sử dụng tính năng Object Lock để đảm bảo tính bất biến WORM. DynamoDB được sử dụng như một bộ đệm đọc (cache) phục vụ các truy vấn độ trễ thấp của bảng điều khiển tài chính và lưu trữ các rollback payload (`rollback_payload.boto3_equivalent`) phục vụ việc tự động rollback bằng Boto3 của các worker CDO. Hướng tiếp cận ưu tiên hợp đồng này cung cấp khả năng thực thi đồng bộ có thể dự đoán trong khi thực thi các ranh giới bảo mật nghiêm ngặt qua các vai trò thực thi IAM và VPC Endpoint riêng tư.
 
 ### 1.4 Động cơ Cảnh báo & Containment (Alerting & Containment Engine)
 
@@ -253,9 +258,9 @@ graph TB
     end
 ```
 
-*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán có thẩm quyền vào S3 (được bảo vệ bằng Object Lock), áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu từ lớp cache đọc DynamoDB để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. Các nút tương tác trên bảng điều khiển (như rollback thủ công hoặc xác minh can thiệp) được định tuyến bảo mật từ S3 Static Dashboard đến hàm Lambda container AI Engine duy nhất qua endpoint AWS Lambda Function URL bảo mật được ánh xạ dưới CloudFront. Tất cả các hàm Lambda khác của CDO đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions; các hàm này không có endpoint công khai hoặc Function URL riêng biệt. CDO gọi `POST /v1/verify` để xác minh containment và hỗ trợ rollback thủ công qua `POST /v1/audit/{audit_id}/rollback`.*
+*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán có thẩm quyền vào S3 (được bảo vệ bằng Object Lock), áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu từ lớp cache đọc DynamoDB để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. Các nút tương tác trên bảng điều khiển (như rollback thủ công hoặc xác minh can thiệp) được định tuyến bảo mật từ S3 Static Dashboard đến hàm Lambda container AI Engine duy nhất qua endpoint AWS Lambda Function URL bảo mật được ánh xạ dưới CloudFront. Tất cả các hàm Lambda khác của CDO đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions; các hàm này không có endpoint công khai hoặc Function URL riêng biệt. CDO gọi `POST /v1/verify` để xác minh containment, thực thi các hành động rollback bằng Boto3 trực tiếp từ cache `rollback_payload.boto3_equivalent` trong DynamoDB, và báo cáo kết quả qua `POST /v1/audit/{audit_id}/rollback`.*
 
-Động cơ containment coi `execution_mode` là một đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán có thẩm quyền vào S3 trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên. Sau khi hoàn thành, CDO gọi `POST /v1/verify` để báo cáo kết quả đo lường từ xa, hoặc kích hoạt rollback thủ công qua `POST /v1/audit/{audit_id}/rollback` để bắt đầu khôi phục lại thẻ (tag) của tài nguyên. Về mặt vận hành, `GET /v1/status/{id}` được giữ lại duy nhất để kiểm tra trạng thái khắc phục/tự phục hồi của một hành động containment cụ thể bằng `audit_id` hoặc `anomaly_id`, và không được dùng để poll tiến trình detect hoạt động.
+Động cơ containment coi `execution_mode` as a đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán có thẩm quyền vào S3 trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên. Sau khi hoàn thành, CDO gọi `POST /v1/verify` để báo cáo kết quả đo lường từ xa. Các hành động rollback thủ công hoặc theo chính sách được CDO thực thi trực tiếp từ DynamoDB cache (bằng cách sử dụng `rollback_payload.boto3_equivalent`), sau đó được báo cáo đến AI Engine qua `POST /v1/audit/{audit_id}/rollback` để cập nhật sổ nhật ký kiểm toán. Về mặt vận hành, `GET /v1/status/{id}` được giữ lại duy nhất để kiểm tra trạng thái khắc phục/tự phục hồi của một hành động containment cụ thể bằng `audit_id` hoặc `anomaly_id`, và không được dùng để poll tiến trình detect hoạt động.
 
 ### 1.5 Quy trình tuần tự API có lập trình (Programmatic API Sequence Workflow)
 
@@ -268,28 +273,32 @@ sequenceDiagram
     participant Lake as S3 Lakehouse / Ingestion
     participant AI as AI Engine Lambda
     participant S3 as S3 Audit & Idempotency
+    participant DDB as DynamoDB Cache
     participant Cont as Alert & Containment Engine
 
     Note over SF, Lake: 1. CDO Ingests Cost & CloudWatch Telemetry
-    SF->>Lake: Execute Ingestion (CUR, CE, chỉ số CloudWatch)
+    SF->>Lake: Execute Ingestion (CUR mặc định, CE fallback nếu CUR chậm > 36h)
     Lake-->>SF: Dữ liệu thô & tinh lọc đã lưu trữ
     
     Note over SF, S3: 2. CDO Checks Idempotency
     SF->>S3: Read / Write Idempotency key (S3 object với 24h TTL check)
     S3-->>SF: Khóa đã được lấy (success)
     
-    Note over SF, AI: 3. CDO Calls Synchronous Detection
+    Note over SF, AI: 3. CDO Calls Synchronous Detection (P99 < 300ms)
     SF->>AI: POST /v1/detect (Ingested Telemetry + Headers)
     AI->>Lake: Đọc đặc trưng & chỉ số sử dụng CloudWatch
-    AI-->>SF: 200 OK (success: true, anomalies_list, correlation_id)
+    AI-->>SF: 200 OK (success: true, anomalies_list, data_confidence, correlation_id)
     
     opt anomalies_detected = true
         Note over SF, S3: 4. Log Detection Evidence
         SF->>S3: Ghi hồ sơ kiểm toán ban đầu (Object Lock)
         
-        Note over SF, AI: 5. CDO Requests Intervention Plan
+        Note over SF, AI: 5. CDO Requests Intervention Plan (Giới hạn 45s của Bedrock)
         SF->>AI: POST /v1/decide (anomaly_context)
-        AI-->>SF: 200 OK DecideResponse (action_plan, applied_payload, rollback_payload)
+        AI-->>SF: 200 OK DecideResponse (action_plan, applied_payload, rollback_payload.boto3_equivalent)
+        
+        Note over SF, DDB: 5.1 CDO Caches Rollback Payload
+        SF->>DDB: Cache rollback_payload.boto3_equivalent
         
         Note over SF, Cont: 6. CDO Executes Proposed Plan & Verifies
         SF->>Cont: Thực thi các hành động containment được đề xuất (tag/suggest/shutdown)
@@ -302,9 +311,18 @@ sequenceDiagram
         Note over SF, S3: 7. Commit Final Outcome
         SF->>S3: Ghi hồ sơ kiểm toán xác minh cuối cùng
     end
+
+    opt Rollback Triggered (Manual / Policy-driven)
+        Note over SF, DDB: 8. CDO Performs Rollback
+        SF->>DDB: Đọc cached rollback_payload.boto3_equivalent
+        SF->>Cont: Thực thi các lệnh Boto3 từ cache
+        Cont-->>SF: Kết quả rollback
+        SF->>AI: POST /v1/audit/{audit_id}/rollback (results)
+        AI-->>SF: 200 OK RollbackResponse
+    end
 ```
 
-*Chú thích: Sơ đồ tuần tự API có lập trình phác thảo luồng phát hiện bất thường và xác thực khắc phục đồng bộ, cho thấy việc phát hiện đồng bộ, tạo kế hoạch, xác minh và ghi nhận nhật ký kiểm toán có thẩm quyền trên S3.*
+*Chú thích: Sơ đồ tuần tự API có lập trình phác thảo luồng phát hiện bất thường và xác thực khắc phục đồng bộ, cho thấy việc phát hiện đồng bộ, tạo kế hoạch, lưu cache rollback payload, thực thi rollback từ cache, xác minh và ghi nhận nhật ký kiểm toán có thẩm quyền trên S3.*
 
 
 ---
@@ -391,7 +409,7 @@ Mô hình tài khoản phải bảo toàn ngữ cảnh môi trường vì cùng 
 
 ### 4.2 Mô hình cô lập (Isolation pattern)
 
-- **Cô lập dữ liệu**: Dữ liệu chi phí thu thập từ các tài khoản thành viên được lưu trữ trong một bucket S3 duy nhất, được phân vùng theo mã tài khoản (Account ID): `s3://cdo-curated-bucket/account_id=123456789012/year=2026/month=06/`.
+- **Cô lập dữ liệu**: Dữ liệu chi phí thu thập từ các tài khoản thành viên được lưu trữ trong một bucket S3 duy nhất, được phân vùng theo mã tài khoản (Account ID): `s3://tf2-cdo{NN}-telemetry-{region}/curated/account_id=123456789012/year=2026/month=06/`.
 - **Cô lập truy vấn**: Các định nghĩa bảng trong Athena sử dụng tính năng chiếu phân vùng (partition projection) của Glue. Các truy vấn Athena được thực thi để phục vụ các materialized view của bảng điều khiển được giới hạn chặt chẽ theo khóa phân vùng `account_id`.
 - **Xác định sở hữu (Ownership)**: Tài nguyên được ánh xạ tới các nhóm kỹ thuật (squad) cụ thể bằng cách sử dụng các thẻ siêu dữ liệu tiêu chuẩn là `owner` và `squad`. Khi pipeline thu thập dữ liệu phát hiện các tài nguyên thiếu các thẻ này, hệ thống sẽ tự động gán chúng vào một nhóm mặc định (`unassigned-resources`) và định tuyến cảnh báo đến kênh hạ tầng của CDO để xử lý thủ công.
 
@@ -418,22 +436,23 @@ Khi thực hiện onboard một tài khoản AWS hoặc squad mới vào nền t
 
 Nhằm ngăn chặn việc chạy trùng lặp cho cùng một kỳ chi phí (điều này sẽ làm sai lệch dữ liệu trên bảng điều khiển và phát sinh thêm chi phí gọi Cost Explorer API trùng lặp), nền tảng CDO triển khai cơ chế idempotency sử dụng Amazon S3:
 - Mỗi lượt thực thi hàng ngày tạo ra một khóa idempotency tổng hợp: `{tenant_id}:{billing_period_date}:{batch_type}` (ví dụ: `tenant_id:2026-06-25:daily_batch`).
-- Luồng Step Functions bắt đầu bằng cách kiểm tra sự tồn tại của khóa này dưới dạng một đối tượng trống trong kho lưu trữ idempotency có thẩm quyền: `s3://company-cdo-telemetry/idempotency/{key}`.
+- Luồng Step Functions bắt đầu bằng cách kiểm tra sự tồn tại của khóa này dưới dạng một đối tượng trống trong kho lưu trữ idempotency có thẩm quyền: `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/{key}`.
 - Nếu đối tượng đã tồn tại, lượt chạy sẽ dừng lại một cách an toàn để tránh xử lý trùng lặp.
 - Nếu đối tượng chưa tồn tại, luồng công việc sẽ ghi đối tượng đó để khóa lượt chạy. Đối tượng được cấu hình với quy tắc S3 Lifecycle để tự động xóa sau 24 giờ.
 ### 4.5 Cache dữ liệu chi phí & Kiểm soát giới hạn tần suất Cost Explorer (Cost Explorer Rate Limit Control)
 
 Để bảo vệ AWS Cost Explorer API khỏi việc vượt quá giới hạn tần suất nghiêm ngặt **5 requests/second**, nền tảng CDO triển khai chiến lược cache dựa trên DynamoDB như mô tả trong hợp đồng telemetry:
 - **Lưu trữ Cache CDO**: Lambda Ingestion thực hiện truy vấn các chỉ số Cost Explorer hàng ngày và cache payload kết quả vào một bảng DynamoDB chuyên dụng (`cdo-cost-cache-table`) với khóa chính là `AccountID:DateRange`.
+- **Nguồn dữ liệu dự phòng (Fallback)**: Dữ liệu daily của Cost Explorer đóng vai trò là cache dự phòng khi việc xuất dữ liệu CUR bị trễ (>36 giờ), được kích hoạt khi bộ điều phối đặt cờ `telemetry_delay_event = true` để truy vấn API Cost Explorer và lưu cache kết quả vào bảng DynamoDB.
 - **AI Engine đọc dữ liệu offline**: Khi AI Engine do đội AIOps cung cấp thực thi và yêu cầu dữ liệu chi phí baseline lịch sử (chẳng hạn như dữ liệu chi phí 7 ngày hoặc 30 ngày qua để trích xuất đặc trưng và phân tích bất thường), nó sẽ đọc trực tiếp các bản ghi chi phí đã cache từ DynamoDB của CDO (hoặc các tệp parquet đã lọc trên S3 thông qua Athena) bằng cách sử dụng các cuộc gọi SDK trực tiếp dưới vai trò execution role của nó.
 - **Lợi ích**: Thiết kế này ngăn việc AI Engine và nhiều Lambda của nền tảng thực hiện gọi trực tiếp Cost Explorer API đồng thời, đảm bảo hệ thống luôn hoạt động dưới ngưỡng 5 requests/second và loại bỏ hoàn toàn khả năng bị AWS throttling.
 
 ### 4.6 Tuân thủ & Xác thực Thu thập Telemetry (Telemetry Ingestion Compliance & Validation)
 
 Nền tảng CDO thực thi tất cả các kiểm soát bảo mật và xác thực trên mặt phẳng dữ liệu (data-plane) được quy định trong `telemetry-contract.md` và `ai-api-contract.md`:
-- **Schema & Kiểu Ingestion**: Telemetry tuân thủ schema phiên bản 3 (`telemetry://finops-watch/v3`). Ingestion hỗ trợ kiểu `RAW_JSON` (<10MB Cost Explorer API data) và `S3_POINTER` (<500MB compressed CUR exports stored in S3) data ingestion types. Không có telemetry hiệu năng CloudWatch (các tính hiệu sử dụng như CPUUtilization, DatabaseConnections, memory_mib) nào được gửi đến AI Engine để phát hiện; những dữ liệu này được dành riêng cho việc quan sát hoạt động của nền tảng (cảnh báo, nhật ký, chỉ số, bảng điều khiển).
-- **Trường Request & Toàn vẹn (Request & Integrity Fields)**: Mọi payload gọi trực tiếp đến AI Engine phải đính kèm các trường siêu dữ liệu chuẩn đại diện cho các header hợp đồng: `X-Tenant-Id` (`tenant_id`), `X-Idempotency-Key` (định dạng: `{tenant_id}:{billing_period_date}:{batch_type}` được lưu trong `s3://company-cdo-telemetry/idempotency/` với chu kỳ tự động xóa 24 giờ của S3 Object Lifecycle), `X-Correlation-Id`, `X-Payload-SHA256` (`payload_sha256`), và `X-Request-Timestamp` (`request_timestamp`).
-- **Trường dữ liệu phản hồi (Response Fields)**: Phản hồi đồng bộ `/v1/detect` trả về các trường chuẩn: `success` (boolean), `correlation_id` (UUID v4), `anomalies_detected` (boolean), `anomalies_list` (chứa `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, và `alert_routing`), và `error_message` (tùy chọn).
+- **Schema & Kiểu Ingestion**: Telemetry tuân thủ schema phiên bản 3 (`telemetry://finops-watch/v3`). Ingestion hỗ trợ kiểu `RAW_JSON` (<10MB Cost Explorer API data) và `S3_POINTER` (<500MB compressed CUR exports stored in S3) data ingestion types. Telemetry hiệu năng CloudWatch được gửi đến AI Engine để phát hiện (bao gồm `cpu_utilization_hourly` dưới dạng mảng CPU thô mỗi 24 giờ thay thế cho `idle_hours_continuous` cũ, `memory_mib`, `network_in_bytes`, `network_out_bytes`, `disk_io_ops`, `database_connections`, và `gpu_utilization`). Nếu thiếu các chỉ số hiệu năng CloudWatch, nền tảng sẽ tự động chuyển sang chế độ CUR-only, thiết lập `data_confidence = LOW`.
+- **Trường Request & Toàn vẹn (Request & Integrity Fields)**: Mọi payload gọi trực tiếp đến AI Engine phải đính kèm các trường siêu dữ liệu chuẩn đại diện cho các header hợp đồng: `X-Tenant-Id` (`tenant_id`), `X-Idempotency-Key` (định dạng: `{tenant_id}:{billing_period_date}:{batch_type}` được lưu trong `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/` với chu kỳ tự động xóa 24 giờ của S3 Object Lifecycle), `X-Correlation-Id`, `X-Payload-SHA256` (`payload_sha256`), và `X-Request-Timestamp` (`request_timestamp`).
+- **Trường dữ liệu phản hồi (Response Fields)**: Phản hồi đồng bộ `/v1/detect` trả về các trường chuẩn: `success` (boolean), `correlation_id` (UUID v4), `anomalies_detected` (boolean), `anomalies_list` (chứa `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, và `alert_routing`), `data_confidence` (HIGH/LOW), `callback_url` tùy chọn, và `error_message` (tùy chọn).
 - **Các cờ điều khiển**:
   - `is_ad_hoc`: Bỏ qua khóa idempotency 24h khi quét khẩn cấp (tối đa 5 lần/ngày).
   - `is_estimated`: Đánh dấu dữ liệu tạm tính; AI Engine sẽ tự động giảm confidence score (<0.50), gán nhãn chỉ xem xét (review-only) và bỏ qua tự động containment.
