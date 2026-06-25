@@ -244,3 +244,22 @@
   - Trade-off: Less native BI functionality, ad-hoc data exploration, or user-driven custom chart generation compared to QuickSight. Advanced business unit requirements may later justify integrating QuickSight Enterprise.
 - **Alternatives considered**:
   - Amazon QuickSight (Enterprise edition): Rejected as the MVP default due to per-user seat fees, higher baseline configuration costs, and the complexity of embedding custom interactive rollback action triggers within standard dashboards.
+
+---
+
+## ADR-014 - Athena DDL validation to Terraform Glue schema with Partition Projection
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The lakehouse-centric data plane requires cataloging S3-based Cost and Usage Report (CUR) datasets. The architecture needs to define a reliable schema management workflow and a partition update strategy that handles dynamically generated billing-period directories (e.g., year and month) without introducing latency, manual overhead, or unnecessary runtime costs.
+- **Decision**: Use Athena SQL DDL during initial schema design and validation because it gives fast feedback against real/synthetic CUR files. After validation, promote the schema into Terraform-managed AWS Glue Data Catalog definitions (using `aws_glue_catalog_table` resources) as the durable source of truth. Use Athena Partition Projection for CUR/Data Exports billing-period partitions so scheduled ingestion does not depend on Glue Crawler, MSCK REPAIR TABLE, or manual ALTER TABLE partition registration.
+- **Consequence**:
+  - Pro: Eliminates all runtime ingestion costs ($0.44/DPU-hour) and execution lag (1-3 minutes) associated with running Glue Crawlers.
+  - Pro: Ensures deterministic schema structures in the Glue Data Catalog, eliminating the risk of Crawler heuristic type mismatch or schema drift.
+  - Pro: Removes database-write credentials or Glue metadata write permissions from runtime ingestion Lambdas, aligning with the principle of least privilege.
+  - Trade-off: Schema updates require a deployment pipeline execution rather than automated runtime discovery, which matches our stable production engineering gates.
+- **Alternatives considered**:
+  - Glue Crawler for routine operations: Rejected due DPU cost, run latency, and heuristic schema risk.
+  - Athena SQL DDL as permanent management: Rejected because manual schema creation introduces drift and is harder to version-control or code-review than IaC.
+  - Manual partition repair (MSCK REPAIR TABLE or Lambda-triggered ALTER TABLE): Rejected because it adds operational latency, API call costs, and scheduled-run fragility compared to client-side partition projection.
+

@@ -96,7 +96,7 @@ graph TB
     AILambdaWorker -->|5. Read cost & CloudWatch metrics| S3Cur
     AILambdaWorker -->|6. Write results| DDB
     AILambdaWorker -->|7. Write evidence payload| S3Cur
-    SF -->|8. GET /v1/status/{correlation_id} (Poll DynamoDB)| DDB
+    SF -->|"8. GET /v1/status/{correlation_id} (Poll DynamoDB)"| DDB
     SF -->|9. POST /v1/decide| AILambdaWorker
     SF -->|10. POST /v1/verify / Rollback| AILambdaWorker
 ```
@@ -124,7 +124,7 @@ graph TD
         AILambdaReq -->|4. Queue Task| SQS[SQS Buffer]
         SQS -->|5. Execute Inference| AILambdaWorker[AI Engine Worker Lambda]
         AILambdaWorker -->|6. Store Results| DDB[(DynamoDB Run State / S3)]
-        SF -->|7. Poll GET /v1/status/{id}| DDB
+        SF -->|"7. Poll GET /v1/status/{id}"| DDB
         SF -->|8. POST /v1/decide| AILambdaWorker
         SF -->|9. Execute Containment Plan| Actions[Alerting & Containment Engine]
         SF -->|10. POST /v1/verify| AILambdaWorker
@@ -219,7 +219,7 @@ graph TB
     Worker -->|4. Read Cost & Performance Features| CuratedS3
     Worker -->|5. Write inference results & state| DDB
     Worker -->|6. Write evidence payload| CuratedS3
-    SF -->|7. Poll status / GET /v1/status/{id}| DDB
+    SF -->|"7. Poll status / GET /v1/status/{id}"| DDB
     SF -->|8. POST /v1/decide| Worker
     SF -->|9. POST /v1/verify| Worker
     
@@ -265,7 +265,7 @@ graph TB
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
         CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
-        S3Dashboard2 -->|5. Trigger actions (POST)| APIGateway[AWS API Gateway / Lambda Function URL]
+        S3Dashboard2 -->|"5. Trigger actions (POST)"| APIGateway[AWS API Gateway / Lambda Function URL]
         APIGateway -->|6. Execute action| ContLambda
         CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
         LambdaEdge["Lambda@Edge Auth Validator"] -->|Validate cookie JWT| CloudFront
@@ -341,7 +341,7 @@ The following infrastructure components are deployed in `ap-southeast-1` to oper
 | Compute (Adapters) | Lambda | Runs lightweight, serverless adapter code to pull Cost Explorer API data, copy CUR 2.0 exports, and handle alerts/containment. | Pay-per-use, ~$0.00001667 per GB-second. |
 | Data Lake (Raw) | Amazon S3 | Stores immutable daily CUR 2.0 files and Cost Explorer JSON dumps. | $0.023 per GB/month + request fees. |
 | Data Lake (Curated) | Amazon S3 | Stores partitioned, schema-validated cost files in Parquet format, optimized for querying. | $0.0125 per GB/month (Infrequent Access) + transition fees. |
-| Metadata Catalog | Glue Data Catalog | Automatically registers table partitions and maintains the schema definitions for Athena. | First 1M cataloged objects are free; crawler runs cost $0.44 per DPU-hour. |
+| Metadata Catalog | Glue Data Catalog | Stores deterministic schema definitions defined in IaC (Terraform), utilizing Athena Partition Projection (ADR-014). | First 1M cataloged objects are free; zero runtime crawler costs (ADR-014). |
 | Query Engine | Amazon Athena | Allows serverless SQL queries on S3 files to build materialized views and drive dashboards. | $5.00 per TB of data scanned. |
 | State & Audit Database | Amazon DynamoDB | Stores run state, idempotency keys, containment audit logs, and dashboard materialized views. | On-demand capacity: $1.25 per million write units, $0.25 per million read units. |
 | AI Engine Hosting | AWS Lambda (Container Image) | Hosts the shared AIOps-provided AI Engine (Request and Worker functions) using container images packaged in ECR with up to 10 GB storage size support. | Pay-per-use execution costs: ~$0.00001667 per GB-second. |
@@ -431,7 +431,7 @@ When onboarding a new AWS account or squad to the FinOps Watch platform, the fol
    - Provisions 'FinOpsCrossAccountAccessRole' in the target member account.
    - Configures trust policy allowing the central CDO Lambda and the AI Engine Lambda execution roles to assume it.
    - Updates target account CUR export configuration to deliver data to S3.
-3. Glue crawler is triggered to update partitions in the Glue Data Catalog.
+3. Partition Projection dynamically maps new partitions inside Athena using date/period configurations defined in IaC (ADR-014).
 4. E2E Validation run:
    - Ingestion Lambda makes a test API call to target account Cost Explorer.
    - Verifies IAM cross-account permission assumption and direct Lambda invocation.

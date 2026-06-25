@@ -222,7 +222,7 @@ graph TB
     Worker -->|4. Read Cost & Performance Features| CuratedS3
     Worker -->|5. Write inference results & state| DDB
     Worker -->|6. Write evidence payload| CuratedS3
-    SF -->|7. Poll status / GET /v1/status/{id}| DDB
+    SF -->|"7. Poll status / GET /v1/status/{id}"| DDB
     SF -->|8. POST /v1/decide| Worker
     SF -->|9. POST /v1/verify| Worker
     
@@ -268,7 +268,7 @@ graph TB
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
         CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
-        S3Dashboard2 -->|5. Trigger actions (POST)| APIGateway[AWS API Gateway / Lambda Function URL]
+        S3Dashboard2 -->|"5. Trigger actions (POST)"| APIGateway[AWS API Gateway / Lambda Function URL]
         APIGateway -->|6. Execute action| ContLambda
         CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
         LambdaEdge["Lambda@Edge Auth Validator"] -->|Validate cookie JWT| CloudFront
@@ -345,7 +345,7 @@ Các thành phần hạ tầng sau đây được triển khai tại vùng `ap-s
 | Tính toán (Adapters) | Lambda | Chạy mã adapter serverless gọn nhẹ để lấy dữ liệu từ Cost Explorer API, sao chép các bản xuất CUR 2.0 và xử lý cảnh báo/containment. | Thanh toán theo mức sử dụng, ~0,00001667 USD mỗi GB-giây. |
 | Hồ dữ liệu (Raw Zone) | Amazon S3 | Lưu trữ các tệp CUR 2.0 hàng ngày và các tệp kết xuất JSON từ Cost Explorer không thể sửa đổi. | 0,023 USD mỗi GB/tháng + phí yêu cầu. |
 | Hồ dữ liệu (Curated Zone) | Amazon S3 | Lưu trữ các tệp chi phí đã được phân vùng và xác thực schema dưới định dạng Parquet, được tối ưu hóa cho truy vấn. | 0,0125 USD mỗi GB/tháng (Infrequent Access) + phí chuyển đổi lớp lưu trữ. |
-| Danh mục siêu dữ liệu (Metadata Catalog) | Glue Data Catalog | Tự động đăng ký các phân vùng bảng và duy trì định nghĩa schema cho Athena. | 1 triệu đối tượng được phân mục đầu tiên là miễn phí; các lượt chạy crawler có chi phí 0,44 USD mỗi DPU-giờ. |
+| Danh mục siêu dữ liệu (Metadata Catalog) | Glue Data Catalog | Lưu trữ định nghĩa schema xác định được cấu hình trong IaC (Terraform), sử dụng tính năng Athena Partition Projection (ADR-014). | 1 triệu đối tượng được phân mục đầu tiên là miễn phí; không phát sinh chi phí chạy crawler ở runtime (ADR-014). |
 | Công cụ truy vấn (Query Engine) | Amazon Athena | Cho phép chạy truy vấn SQL serverless trên các tệp S3 để xây dựng các materialized view và cung cấp dữ liệu cho bảng điều khiển. | 5,00 USD trên mỗi TB dữ liệu được quét. |
 | Cơ sở dữ liệu trạng thái & kiểm toán (State & Audit Database) | Amazon DynamoDB | Lưu trữ trạng thái chạy, các khóa idempotency, nhật ký kiểm toán containment và các materialized view của bảng điều khiển. | Dung lượng on-demand: 1,25 USD trên mỗi triệu đơn vị ghi (write unit), 0,25 USD trên mỗi triệu đơn vị đọc (read unit). |
 | AI Engine Hosting | AWS Lambda (Container Image) | Lưu trữ AI Engine dùng chung do nhóm AIOps cung cấp (các hàm Request và Worker) bằng cách sử dụng các hình ảnh container được đóng gói trong ECR hỗ trợ kích thước lưu trữ lên đến 10 GB. | Chi phí chạy theo mức sử dụng thực tế: ~0,00001667 USD mỗi GB-giây. |
@@ -435,7 +435,7 @@ Khi thực hiện onboard một tài khoản AWS hoặc squad mới vào nền t
    - Provisions 'FinOpsCrossAccountAccessRole' in the target member account.
    - Configures trust policy allowing the central CDO Lambda and the AI Engine Lambda execution roles to assume it.
    - Updates target account CUR export configuration to deliver data to S3.
-3. Glue crawler is triggered to update partitions in the Glue Data Catalog.
+3. Partition Projection tự động ánh xạ các phân vùng mới bên trong Athena thông qua các cấu hình ngày/chu kỳ được định nghĩa trong IaC (ADR-014).
 4. E2E Validation run:
    - Ingestion Lambda makes a test API call to target account Cost Explorer.
    - Xác thực việc giả lập quyền IAM cross-account và gọi Lambda trực tiếp.

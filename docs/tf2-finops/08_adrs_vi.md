@@ -243,3 +243,22 @@
   - Trade-off: Ít tính năng BI gốc hơn, hạn chế khả năng tự khám phá dữ liệu ad-hoc hoặc tự tạo biểu đồ của người dùng so với QuickSight. Các yêu cầu nâng cao của đơn vị kinh doanh sau này có thể cần tích hợp thêm QuickSight Enterprise.
 - **Các phương án thay thế đã xem xét (Alternatives considered)**:
   - Amazon QuickSight (Phiên bản Enterprise): Bị từ chối làm mặc định cho MVP do phí seat trên mỗi người dùng, chi phí cấu hình cơ sở cao hơn và sự phức tạp khi nhúng các trình kích hoạt hành động rollback tương tác tùy chỉnh trong các bảng điều khiển tiêu chuẩn.
+
+---
+
+## ADR-014 - Xác thực schema bằng Athena DDL rồi quản lý Glue schema bằng Terraform với Partition Projection (Athena DDL validation to Terraform Glue schema with Partition Projection)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Mặt phẳng dữ liệu lakehouse-centric yêu cầu lập danh mục (catalog) cho các tập dữ liệu Cost and Usage Report (CUR) lưu trữ trên S3. Kiến trúc cần xác định một quy trình quản lý schema đáng tin cậy và chiến lược cập nhật phân vùng để xử lý các thư mục chu kỳ thanh toán được tạo động (ví dụ: year và month) mà không làm tăng độ trễ, gánh nặng thủ công hoặc chi phí chạy thực tế không đáng có.
+- **Quyết định (Decision)**: Sử dụng Athena SQL DDL trong quá trình thiết kế và xác thực schema ban đầu vì nó cung cấp phản hồi nhanh chóng đối với các tệp CUR thực tế/giả lập. Sau khi xác thực, chuyển schema này vào các định nghĩa AWS Glue Data Catalog do Terraform quản lý (sử dụng tài nguyên `aws_glue_catalog_table`) như một nguồn sự thật (source of truth) lâu dài. Sử dụng Athena Partition Projection cho các phân vùng chu kỳ thanh toán của CUR/Data Exports để quá trình thu thập theo lịch trình không phụ thuộc vào Glue Crawler, câu lệnh MSCK REPAIR TABLE hoặc đăng ký phân vùng ALTER TABLE thủ công.
+- **Hệ quả (Consequence)**:
+  - Pro: Loại bỏ hoàn toàn chi phí chạy thực tế ($0,44/DPU-giờ) và độ trễ thực thi (1-3 phút) liên quan đến việc chạy Glue Crawler.
+  - Pro: Đảm bảo cấu trúc schema xác định trong Glue Data Catalog, loại bỏ rủi ro sai lệch kiểu dữ liệu hoặc trôi lệch schema (schema drift) do các phỏng đoán (heuristic) của Crawler.
+  - Pro: Loại bỏ thông tin xác thực ghi cơ sở dữ liệu hoặc quyền ghi siêu dữ liệu Glue khỏi các hàm Lambda thu thập dữ liệu ở runtime, tuân thủ nguyên tắc đặc quyền tối thiểu.
+  - Trade-off: Các bản cập nhật schema yêu cầu thực thi pipeline triển khai thay vì tự động phát hiện ở runtime, điều này phù hợp với các cổng kỹ thuật (engineering gates) ổn định trên môi trường production.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Glue Crawler cho các hoạt động thông thường: Bị từ chối do chi phí DPU, độ trễ chạy và rủi ro schema dựa trên phỏng đoán (heuristic).
+  - Athena SQL DDL làm giải pháp quản lý vĩnh viễn: Bị từ chối vì việc tạo schema thủ công gây ra trôi lệch dữ liệu và khó kiểm soát phiên bản hoặc review code hơn so với IaC.
+  - Sửa chữa phân vùng thủ công (MSCK REPAIR TABLE hoặc ALTER TABLE được kích hoạt bởi Lambda): Bị từ chối vì nó làm tăng độ trễ vận hành, chi phí gọi API và tính mong manh của lượt chạy theo lịch trình so với tính năng partition projection phía client.
+

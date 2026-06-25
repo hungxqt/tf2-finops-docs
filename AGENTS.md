@@ -53,14 +53,14 @@ Use these defaults unless the user provides different decisions:
 - AWS Region: `ap-southeast-1` for examples.
 - Cadence decision: 24h default, defended as the middle trade-off between data freshness, Cost Explorer/CUR lag, operational cost, and false-positive control.
 - Data sources: AWS Data Exports/CUR 2.0 or CUR in S3 plus Cost Explorer API.
-- Data lake: S3 raw and curated zones, Glue Data Catalog, Athena views, and governed prefixes for cost, ownership, anomaly, alert, containment, and audit datasets.
+- Data lake: S3 raw and curated zones, Glue Data Catalog, Athena views, and governed prefixes for cost, ownership, anomaly, alert, containment, and audit datasets. AWS Glue schemas are managed in Terraform and utilize client-side Athena Partition Projection to avoid Glue Crawler runtime costs (ADR-014).
 - Orchestration: EventBridge Scheduler triggers Step Functions Standard workflows.
 - AI integration: CDO hosts the AIOps-provided AI Engine on Lambda container images; CDO owns the hosting platform, ECR image deployment by digest, Lambda execution roles, reserved concurrency, SQS/DLQ async flow, DynamoDB result/idempotency stores, CloudWatch/X-Ray monitoring, and platform SLOs; AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics.
 - AI Engine runtime: Lambda container image in `ap-southeast-1`, private VPC integration, ECR for container images, Lambda execution roles, Secrets Manager integration. Direct Lambda and SQS invocation is used for the default scheduled batch workflow (Step Functions -> AI Engine Request Lambda -> SQS -> AI Engine Worker Lambda -> DynamoDB/S3 results -> Step Functions result check).
 - Lambda concurrency guardrails: Lambda reserved concurrency (e.g., 5-10 concurrent executions baseline) to control blast radius and throttle limits, with Provisioned Concurrency only as a production optimization if cold-start latency demands it.
 - Async execution queue: SQS queues (and DLQ) for asynchronous processing, allowing `/v1/detect` to return `202 Accepted` quickly while a background Lambda function processes the CUR data and writes results to DynamoDB/S3.
 - Database: DynamoDB for tracking execution state, idempotency locks, run results, and audit trails.
-- Analytics storage/query: S3, Glue Data Catalog, Athena, and materialized dashboard tables/views where needed.
+- Analytics storage/query: S3, Glue Data Catalog, Athena, and materialized dashboard tables/views where needed. Schemas are validated with Athena SQL DDL before promotion into Terraform definitions with Athena Partition Projection (ADR-014).
 - Operational metadata: DynamoDB tables for run state, anomaly records, routing state, idempotency keys, containment audit records, and dashboard materialized views.
 - Dashboard: QuickSight or a lightweight internal web dashboard backed by Athena/DynamoDB views.
 - Alerting: separate Finance and Engineering channels, such as email/Slack/SNS targets, with routing based on anomaly type and ownership tags.
@@ -321,6 +321,7 @@ Required ADR entries (minimum, each as `## ADR-NNN - <Short title>`):
 - `## ADR-006 - DynamoDB/S3 audit trail with >=90 days retention` — Audit storage decision.
 - `## ADR-007 - ECS Fargate for AI Engine hosting over serverless functions` — Why CDO hosts AI Engine on ECS Fargate instead of Lambda (superseded by ADR-010).
 - `## ADR-008 - Always-on plus Spot Fargate task separation` — Cost-performance trade-off for stable vs interruptible workloads (superseded by ADR-010).
+- `## ADR-014 - Athena DDL validation to Terraform Glue schema with Partition Projection` — Use Athena DDL for validation and Terraform + Partition Projection for production schemas.
 
 Each ADR must include these fields (matching template format exactly):
 

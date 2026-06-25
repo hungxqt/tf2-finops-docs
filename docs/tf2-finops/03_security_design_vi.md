@@ -147,7 +147,7 @@ Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 | Secret | Nơi lưu trữ | Chu kỳ xoay vòng | Được truy cập bởi |
 |---|---|---|---|
 | `finops/ai-engine/api-key` (Hết hiệu lực) | Hết hiệu lực | N/A | Được thay thế bởi thông tin xác thực AWS IAM SigV4 |
-| `finops/dashboard/db-creds` | AWS Secrets Manager | Tự động mỗi 60 ngày | Athena crawler / QuickSight dataset engine trong tương lai |
+| `finops/dashboard/db-creds` | AWS Secrets Manager | Tự động mỗi 60 ngày | Athena Query Engine / QuickSight dataset engine trong tương lai |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | Thủ công mỗi 90 ngày | `LambdaAlertRouting` |
 | `finops/ai-engine/contract-signing-key` (Hết hiệu lực) | Hết hiệu lực | N/A | Được thay thế bởi cơ chế kiểm tra toàn vẹn yêu cầu (`X-Payload-SHA256`) |
 | `finops/containment/external-id-seed` | AWS Secrets Manager | Xoay vòng thủ công khi xảy ra sự cố | Quy trình cung cấp vai trò containment |

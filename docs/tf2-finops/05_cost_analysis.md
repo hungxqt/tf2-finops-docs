@@ -23,7 +23,7 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Storage - S3 audit archive** | $0.0125/GB-month IA estimate | Containment and decision evidence retained at least 90 days | Variable by alert/containment volume; retention is mandatory. |
 | **Database - DynamoDB on-demand** | $1.25/million write + $0.25/million read | Run state, idempotency, audit index, dashboard materialization | Variable with runs and dashboard reads. |
 | **Query - Athena** | $5.00/TB scanned | Dashboard refresh, evidence lookup, operational review | Variable; controlled by partition pruning and query limits. |
-| **Data Catalog - Glue** | Catalog/crawler charges by object and DPU-hour | Cost tables, partitions, schema evolution | Variable but small at capstone scale. |
+| **Data Catalog - Glue** | Catalog storage/metadata requests | Cost tables, partitions, Partition Projection (ADR-014) | Variable but negligible at capstone scale (free tier; ADR-014). |
 | **Compute - AI Engine Request/Worker Lambdas** | $0.20/1M requests + $0.0000166667/GB-second | AI Engine Request Lambda container function and SQS-triggered worker executions; 24h cadence | Variable AI workload hosting cost; tag separately from CDO adapters. |
 | **Hàng đợi SQS & DLQ** | $0.40/million requests | Buffering requests for async worker Lambda execution | Variable queue operations cost. |
 | **ECR repositories** | $0.10/GB-month storage | Versioned AIOps container images and Lambda container image versions | Shared fixed/variable by retained image count. |
@@ -123,7 +123,7 @@ This section must be filled only after running the platform with tagged AWS reso
 | Step Functions | `Evidence needed: state transition count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Include retries and manual redrives. |
 | S3 raw/curated/audit | `Evidence needed: GB-month and request forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Separate cost data and audit evidence prefixes. |
 | DynamoDB | `Evidence needed: read/write forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Run state, idempotency, audit index, dashboard materialization. |
-| Athena/Glue | `Evidence needed: scanned TB and crawler usage` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Validate partition pruning. |
+| Athena/Glue | `Evidence needed: scanned TB and catalog queries` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Validate partition pruning and Partition Projection (ADR-014). |
 
 | AI Engine Lambda compute | `Evidence needed: invocation count and GB-seconds` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Request Lambda container and SQS-triggered worker execution duration. |
 | SQS queues & DLQ | `Evidence needed: message count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Buffering operations for asynchronous execution. |

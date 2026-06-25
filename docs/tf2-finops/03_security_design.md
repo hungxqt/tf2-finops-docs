@@ -147,7 +147,7 @@ The following secrets are stored in AWS Secrets Manager:
 | Secret | Storage | Rotation | Accessed by |
 |---|---|---|---|
 | `finops/ai-engine/api-key` (Deprecated) | Deprecated | N/A | Superseded by AWS IAM SigV4 credentials |
-| `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | Athena crawler / Future QuickSight dataset engine |
+| `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | Athena Query Engine / Future QuickSight dataset engine |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | 90 days manual | `LambdaAlertRouting` |
 | `finops/ai-engine/contract-signing-key` (Deprecated) | Deprecated | N/A | Superseded by request payload integrity checks (`X-Payload-SHA256`) |
 | `finops/containment/external-id-seed` | AWS Secrets Manager | Manual rotation on incident | Containment role provisioning workflow |
