@@ -24,7 +24,7 @@ graph TB
 
     subgraph "CDO Management Account VPC (ap-southeast-1)"
         subgraph "Ingestion & Orchestration"
-            S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger (Default, No Polling)| SF[Step Functions Workflow]
+            S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|"Trigger (Default, No Polling)"| SF[Step Functions Workflow]
             EB[EventBridge Scheduler] -->|Trigger Daily Fallback / Delayed > 36h| SF
             SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
             SF -->|Evaluate Run| LambdaState[State Lambda]
@@ -33,8 +33,8 @@ graph TB
         end
 
         subgraph "Data Lakehouse Tier"
-            S3Raw[(S3 Raw Zone)]
-            S3Cur[(S3 Curated Zone)]
+            S3Raw[("S3 Raw Zone")]
+            S3Cur[("S3 Curated Zone")]
             GlueCat[Glue Data Catalog]
             Athena[Athena Query Engine]
         end
@@ -46,10 +46,10 @@ graph TB
         end
 
         subgraph "Storage & Database Tier"
-            DDB[(DynamoDB Dashboard Cache)]
-            DDBIdempotency[(DynamoDB finops-idempotency-{env})]
-            DDBRollback[(DynamoDB finops-rollback-cache)]
-            S3Audit[(S3 company-cdo-{account_id}-telemetry)]
+            DDB[("DynamoDB Dashboard Cache")]
+            DDBIdempotency[("DynamoDB finops-idempotency-{env}")]
+            DDBRollback[("DynamoDB finops-rollback-cache")]
+            S3Audit[("S3 company-cdo-{account_id}-telemetry")]
         end
     end
 
@@ -96,7 +96,7 @@ graph TB
     ALB --> AILambda
     AILambda -->|9. Return VerifyResponse| SF
     SF -->|10. Offline rollback from Cache - Boto3| MemberAccounts
-    SF -->|11. POST /v1/audit/{audit_id}/rollback| ALB
+    SF -->|"11. POST /v1/audit/{audit_id}/rollback"| ALB
 ```
 
 *Caption: The CDO pipeline is triggered by default by S3 CUR object-arrival EventBridge notifications (no polling), or by EventBridge Scheduler daily as a fallback if CUR data is delayed by more than 36 hours. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR, Cost Explorer, and CloudWatch performance data to S3, and catalogs it. The workflow invokes the AIOps-owned AI Engine Lambda synchronously through the private internal ALB endpoint (`POST /v1/detect`, with target P99 latency < 300 ms as it operates without LLM calls), which returns anomalies and `data_confidence` directly in the response. Step Functions then requests decisions (`POST /v1/decide`) for any detected anomalies (subject to a Bedrock 45s hard limit for RCA generation), immediately caching `rollback_payload.boto3_equivalent` in DynamoDB table `finops-rollback-cache`. It coordinates alerting, triggers approved containment actions, writes authoritative audit records to S3 (`company-cdo-{account_id}-telemetry` with Object Lock), and verifies outcomes (`POST /v1/verify`) synchronously. Rollbacks are CDO-executed from the DynamoDB cache using Boto3, then reported via `POST /v1/audit/{audit_id}/rollback` and SQS queue `finops-watch-rollback`.*
@@ -116,7 +116,7 @@ graph TD
     end
 
     subgraph "CDO Management Account"
-        SF[Step Functions Orchestrator] -->|1. Ingest Data| Lakehouse[(S3 Lakehouse & Athena)]
+        SF[Step Functions Orchestrator] -->|1. Ingest Data| Lakehouse[("S3 Lakehouse & Athena")]
         Lakehouse -->|2. Cost & Performance Data| SF
         SF -->|3. POST /v1/detect - Synchronous| AILambda[AI Engine Lambda]
         AILambda -->|4. Return anomalies_list| SF
@@ -124,8 +124,8 @@ graph TD
         AILambda -->|6. Return Action Plan| SF
         SF -->|7. Execute Containment Plan| Actions[Alerting & Containment Engine]
         SF -->|8. POST /v1/verify| AILambda
-        SF -->|9. Write Authoritative Audit| S3Audit[(S3 Audit Store)]
-        SF -->|10. Cache Run State| DDB[(DynamoDB Cache)]
+        SF -->|9. Write Authoritative Audit| S3Audit[("S3 Audit Store")]
+        SF -->|10. Cache Run State| DDB[("DynamoDB Cache")]
     end
 
     Actions -->|11. Apply Policy| Members
@@ -149,15 +149,15 @@ graph TB
     end
 
     subgraph "CDO Ingestion & Lakehouse"
-        S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger Ingestion (Default, No Polling)| SF[Step Functions Workflow]
+        S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|"Trigger Ingestion (Default, No Polling)"| SF[Step Functions Workflow]
         Scheduler[EventBridge Scheduler] -->|Trigger Fallback if Delayed > 36h| SF
         SF -->|1. Run Puller| Puller[Ingestion Lambda]
         Puller -->|Fetch API Cost| CE
         Puller -->|Copy CUR Files| CUR
         Puller -->|Fetch Performance Metrics| CW
-        Puller -->|2. Write Raw| RawS3[(S3 Raw Zone)]
+        Puller -->|2. Write Raw| RawS3[("S3 Raw Zone")]
         
-        RawS3 -->|3. Partition & Convert| CuratedS3[(S3 Curated Zone)]
+        RawS3 -->|3. Partition & Convert| CuratedS3[("S3 Curated Zone")]
         Catalog[Glue Data Catalog] -->|4. Catalog Schemas| CuratedS3
         Athena[Athena Query Engine] -->|5. Run SQL Query| CuratedS3
         
@@ -183,15 +183,15 @@ graph TB
     end
 
     subgraph "Data Lakehouse"
-        CuratedS3[(S3 Curated Zone)]
+        CuratedS3[("S3 Curated Zone")]
     end
 
     subgraph "Database Store"
-        DDB[(DynamoDB Dashboard Cache)]
+        DDB[("DynamoDB Dashboard Cache")]
     end
 
     subgraph "Storage Store"
-        S3Audit[(S3 Authoritative Audit Store)]
+        S3Audit[("S3 Authoritative Audit Store")]
     end
 
     subgraph "Private Serverless Compute"
@@ -209,14 +209,14 @@ graph TB
     %% Flow
     SF -->|1. POST /v1/detect - private ALB HTTPS| ALB
     ALB --> AILambda
-    AILambda -->|2. Check/Write conditional idempotency| DDBIdempotency[(DynamoDB finops-idempotency-{env})]
+    AILambda -->|2. Check/Write conditional idempotency| DDBIdempotency[("DynamoDB finops-idempotency-{env}")]
     AILambda -->|3. Read Cost & Performance Features| CuratedS3
     AILambda -->|4. Return anomalies_list| SF
     SF -->|5. Write audit record - Object Lock| S3Audit
     SF -->|6. POST /v1/decide| ALB
     ALB --> AILambda
     AILambda -->|7. Return DecideResponse| SF
-    SF -->|7.1 Cache rollback boto3_equivalent| DDBRollback[(DynamoDB finops-rollback-cache)]
+    SF -->|7.1 Cache rollback boto3_equivalent| DDBRollback[("DynamoDB finops-rollback-cache")]
     SF -->|8. POST /v1/verify| ALB
     ALB --> AILambda
     AILambda -->|9. Return VerifyResponse| SF
@@ -249,14 +249,14 @@ graph TB
         SF -->|1. Route Alerts| AlertLambda[Alert Routing Lambda]
         SF -->|2. Execute Policy & verify| ContLambda[Containment Lambda]
         
-        StateLambda[State Lambda] -->|Query Run Lock| DDBIdempotency[(DynamoDB finops-idempotency-{env})]
+        StateLambda[State Lambda] -->|Query Run Lock| DDBIdempotency[("DynamoDB finops-idempotency-{env}")]
         SF -->|Query State| StateLambda
         
-        ContLambda -->|Write Audit Record| S3Audit[(S3 Audit Store with Object Lock)]
+        ContLambda -->|Write Audit Record| S3Audit[("S3 Audit Store with Object Lock")]
         ContLambda -->|3. Tag/Shutdown| DevSand
         ContLambda -->|4. Dry-Run / Tag Only| Prod
         
-        ContLambda -->|Update view cache| CacheDB[(DynamoDB Dashboard Cache)]
+        ContLambda -->|Update view cache| CacheDB[("DynamoDB Dashboard Cache")]
     end
 
     subgraph "Channels & Presentation"
@@ -286,8 +286,8 @@ sequenceDiagram
     participant Lake as S3 Lakehouse / Ingestion
     participant ALB as Private ALB
     participant AI as AI Engine Lambda
-    participant DDB_Idemp as DynamoDB finops-idempotency-{env}
-    participant DDB_Rollback as DynamoDB finops-rollback-cache
+    participant DDB_Idemp as "DynamoDB finops-idempotency-{env}"
+    participant DDB_Rollback as "DynamoDB finops-rollback-cache"
     participant S3 as S3 Audit Store
     participant Cont as Alert & Containment Engine
 

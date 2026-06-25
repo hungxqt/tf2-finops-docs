@@ -24,7 +24,7 @@ graph TB
 
     subgraph "CDO Management Account VPC (ap-southeast-1)"
         subgraph "Ingestion & Orchestration"
-            S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger (Default, No Polling)| SF[Step Functions Workflow]
+            S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|"Trigger (Mặc định, Không Polling)"| SF[Step Functions Workflow]
             EB[EventBridge Scheduler] -->|Trigger Daily Fallback / Delayed > 36h| SF
             SF -->|Invoke Puller| LambdaPull[Ingestion Lambda]
             SF -->|Evaluate Run| LambdaState[State Lambda]
@@ -33,20 +33,23 @@ graph TB
         end
 
         subgraph "Data Lakehouse Tier"
-            S3Raw[(S3 Raw Zone)]
-            S3Cur[(S3 Curated Zone)]
+            S3Raw[("S3 Raw Zone")]
+            S3Cur[("S3 Curated Zone")]
             GlueCat[Glue Data Catalog]
             Athena[Athena Query Engine]
         end
 
-        subgraph "Private Subnets (Serverless Compute)"
-            AILambda[AI Engine Lambda Function]
+        subgraph "Private Subnets (Secure AI Hosting)"
+            ALB[Internal ALB / Target Group]
+            AILambda[AI Engine Lambda Container Function]
             VPCEndpoints[Private VPC Endpoints: S3, ECR, KMS, Logs, STS, Secrets]
         end
 
         subgraph "Storage & Database Tier"
-            DDB[(DynamoDB Dashboard Cache)]
-            S3Audit[(S3 Authoritative Audit & Idempotency Store)]
+            DDB[("DynamoDB Dashboard Cache")]
+            DDBIdempotency[("DynamoDB finops-idempotency-{env}")]
+            DDBRollback[("DynamoDB finops-rollback-cache")]
+            S3Audit[("S3 company-cdo-{account_id}-telemetry")]
         end
     end
 
@@ -71,7 +74,7 @@ graph TB
     Athena -->|Query data| S3Cur
 
     %% Orchestration & Database/S3 interactions
-    LambdaState -->|Idempotency key check & write lock| S3Audit
+    LambdaState -->|Verify Run State| S3Audit
     LambdaCont -->|Write immutable audit record| S3Audit
     LambdaCont -->|Assume role & tag/suggest/shutdown| MemberAccounts[Member Accounts Resources]
     LambdaAlert -->|Route alert payload| Slack
@@ -79,17 +82,21 @@ graph TB
     SF -->|Sync view updates to cache| DDB
 
     %% AI Engine Integration
-    SF -->|1. POST /v1/detect - Direct Synchronous Invoke| AILambda
-    AILambda -->|2. Read cost & CloudWatch metrics| S3Cur
-    AILambda -->|3. Return anomalies_list & data_confidence - Synchronous| SF
-    SF -->|4. Write audit record| S3Audit
-    SF -->|5. POST /v1/decide - Retrieve plan| AILambda
-    AILambda -->|6. Return DecideResponse (with rollback_payload.boto3_equivalent)| SF
-    SF -->|6.1. Cache rollback payload in DynamoDB| DDB
-    SF -->|7. POST /v1/verify| AILambda
-    AILambda -->|8. Return VerifyResponse| SF
-    SF -->|9. Execute rollback from Cache (Boto3)| MemberAccounts
-    SF -->|10. POST /v1/audit/{audit_id}/rollback - Report results| AILambda
+    SF -->|1. POST /v1/detect - private ALB HTTPS với SigV4| ALB
+    ALB --> AILambda
+    AILambda -->|2. Check/Write conditional idempotency| DDBIdempotency
+    AILambda -->|3. Read cost & CloudWatch metrics| S3Cur
+    AILambda -->|4. Return anomalies_list| SF
+    SF -->|5. Write audit record| S3Audit
+    SF -->|6. POST /v1/decide| ALB
+    ALB --> AILambda
+    AILambda -->|7. Return DecideResponse| SF
+    SF -->|7.1. Cache rollback_payload.boto3_equivalent| DDBRollback
+    SF -->|8. POST /v1/verify| ALB
+    ALB --> AILambda
+    AILambda -->|9. Return VerifyResponse| SF
+    SF -->|10. Offline rollback from Cache - Boto3| MemberAccounts
+    SF -->|"11. POST /v1/audit/{audit_id}/rollback"| ALB
 ```
 
 *Chú thích: Quy trình CDO được kích hoạt mặc định bởi các thông báo EventBridge khi có đối tượng S3 CUR mới (không polling), hoặc bởi EventBridge Scheduler hàng ngày dưới dạng fallback nếu dữ liệu CUR bị trễ quá 36 giờ. Luồng Step Functions điều phối việc thu thập dữ liệu từ các tài khoản thành viên, ghi dữ liệu CUR, Cost Explorer, và dữ liệu hiệu năng CloudWatch thô vào S3, rồi tạo danh mục Glue Catalog. Luồng này gọi trực tiếp và đồng bộ AI Engine Lambda do AIOps sở hữu (`POST /v1/detect`, với độ trễ mục tiêu P99 < 300 ms vì nó hoạt động không cần gọi LLM), hàm này trả về các bất thường và `data_confidence` trực tiếp trong phản hồi. Step Functions sau đó gửi yêu cầu quyết định (`POST /v1/decide`) cho bất kỳ bất thường nào được phát hiện (tuân theo giới hạn cứng 45 giây của Bedrock để tạo RCA), ngay lập tức lưu cache `rollback_payload.boto3_equivalent` vào DynamoDB. Hệ thống điều phối cảnh báo, kích hoạt các hành động containment được phê duyệt, ghi nhận nhật ký kiểm toán có thẩm quyền vào S3, và xác minh kết quả (`POST /v1/verify`) một cách đồng bộ. Các hành động rollback được thực thi bởi CDO trực tiếp từ DynamoDB cache bằng cách sử dụng Boto3, sau đó được báo cáo qua `POST /v1/audit/{audit_id}/rollback`.*
@@ -109,7 +116,7 @@ graph TD
     end
 
     subgraph "CDO Management Account"
-        SF[Step Functions Orchestrator] -->|1. Ingest Data| Lakehouse[(S3 Lakehouse & Athena)]
+        SF[Step Functions Orchestrator] -->|1. Ingest Data| Lakehouse[("S3 Lakehouse & Athena")]
         Lakehouse -->|2. Cost & Performance Data| SF
         SF -->|3. POST /v1/detect - Synchronous| AILambda[AI Engine Lambda]
         AILambda -->|4. Return anomalies_list| SF
@@ -117,8 +124,8 @@ graph TD
         AILambda -->|6. Return Action Plan| SF
         SF -->|7. Execute Containment Plan| Actions[Alerting & Containment Engine]
         SF -->|8. POST /v1/verify| AILambda
-        SF -->|9. Write Authoritative Audit| S3Audit[(S3 Audit Store)]
-        SF -->|10. Cache Run State| DDB[(DynamoDB Cache)]
+        SF -->|9. Write Authoritative Audit| S3Audit[("S3 Audit Store")]
+        SF -->|10. Cache Run State| DDB[("DynamoDB Cache")]
     end
 
     Actions -->|11. Apply Policy| Members
@@ -142,15 +149,15 @@ graph TB
     end
 
     subgraph "CDO Ingestion & Lakehouse"
-        S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|Trigger Ingestion (Mặc định, Không Polling)| SF[Step Functions Workflow]
+        S3CURArrival[EventBridge: S3 CUR Object-Arrival] -->|"Trigger Ingestion (Mặc định, Không Polling)"| SF[Step Functions Workflow]
         Scheduler[EventBridge Scheduler] -->|Trigger Fallback nếu CUR bị chậm > 36h| SF
         SF -->|1. Run Puller| Puller[Ingestion Lambda]
         Puller -->|Fetch API Cost| CE
         Puller -->|Copy CUR Files| CUR
         Puller -->|Fetch Performance Metrics| CW
-        Puller -->|2. Write Raw| RawS3[(S3 Raw Zone)]
+        Puller -->|2. Write Raw| RawS3[("S3 Raw Zone")]
         
-        RawS3 -->|3. Partition & Convert| CuratedS3[(S3 Curated Zone)]
+        RawS3 -->|3. Partition & Convert| CuratedS3[("S3 Curated Zone")]
         Catalog[Glue Data Catalog] -->|4. Catalog Schemas| CuratedS3
         Athena[Athena Query Engine] -->|5. Run SQL Query| CuratedS3
         
@@ -176,19 +183,20 @@ graph TB
     end
 
     subgraph "Data Lakehouse"
-        CuratedS3[(S3 Curated Zone)]
+        CuratedS3[("S3 Curated Zone")]
     end
 
     subgraph "Database Store"
-        DDB[(DynamoDB Dashboard Cache)]
+        DDB[("DynamoDB Dashboard Cache")]
     end
 
     subgraph "Storage Store"
-        S3Audit[(S3 Authoritative Audit Store)]
+        S3Audit[("S3 Authoritative Audit Store")]
     end
 
     subgraph "Private Serverless Compute"
         subgraph "Synchronous Execution"
+            ALB[Private ALB / Target Group]
             AILambda[AI Engine Lambda Function]
         end
     end
@@ -199,15 +207,20 @@ graph TB
     end
 
     %% Flow
-    SF -->|1. POST /v1/detect - Direct Synchronous Invoke| AILambda
-    AILambda -->|2. Read Cost & Performance Features| CuratedS3
-    AILambda -->|3. Return anomalies_list| SF
-    SF -->|4. Write audit record - Object Lock| S3Audit
-    SF -->|5. POST /v1/decide| AILambda
-    AILambda -->|6. Return DecideResponse| SF
-    SF -->|7. POST /v1/verify| AILambda
-    AILambda -->|8. Return VerifyResponse| SF
-    SF -->|9. Sync view cache| DDB
+    SF -->|1. POST /v1/detect - private ALB HTTPS| ALB
+    ALB --> AILambda
+    AILambda -->|2. Check/Write conditional idempotency| DDBIdempotency[("DynamoDB finops-idempotency-{env}")]
+    AILambda -->|3. Read Cost & Performance Features| CuratedS3
+    AILambda -->|4. Return anomalies_list| SF
+    SF -->|5. Write audit record - Object Lock| S3Audit
+    SF -->|6. POST /v1/decide| ALB
+    ALB --> AILambda
+    AILambda -->|7. Return DecideResponse| SF
+    SF -->|7.1 Cache rollback boto3_equivalent| DDBRollback[("DynamoDB finops-rollback-cache")]
+    SF -->|8. POST /v1/verify| ALB
+    ALB --> AILambda
+    AILambda -->|9. Return VerifyResponse| SF
+    SF -->|10. Sync view cache| DDB
     
     AILambda -.->|Pull Image by Digest| ECR
     AILambda -.->|Access SDK| SM
@@ -236,14 +249,14 @@ graph TB
         SF -->|1. Route Alerts| AlertLambda[Alert Routing Lambda]
         SF -->|2. Execute Policy & verify| ContLambda[Containment Lambda]
         
-        StateLambda[State Lambda] -->|Query Run Lock| DDBIdempotency[(DynamoDB finops-idempotency-{env})]
+        StateLambda[State Lambda] -->|Query Run Lock| DDBIdempotency[("DynamoDB finops-idempotency-{env}")]
         SF -->|Query State| StateLambda
         
-        ContLambda -->|Write Audit Record| S3Audit[(S3 Audit Store with Object Lock)]
+        ContLambda -->|Write Audit Record| S3Audit[("S3 Audit Store with Object Lock")]
         ContLambda -->|3. Tag/Shutdown| DevSand
         ContLambda -->|4. Dry-Run / Tag Only| Prod
         
-        ContLambda -->|Update view cache| CacheDB[(DynamoDB Dashboard Cache)]
+        ContLambda -->|Update view cache| CacheDB[("DynamoDB Dashboard Cache")]
     end
 
     subgraph "Channels & Presentation"
@@ -271,53 +284,58 @@ sequenceDiagram
     autonumber
     participant SF as Step Functions Orchestrator
     participant Lake as S3 Lakehouse / Ingestion
+    participant ALB as Private ALB
     participant AI as AI Engine Lambda
-    participant S3 as S3 Audit & Idempotency
-    participant DDB as DynamoDB Cache
+    participant DDB_Idemp as "DynamoDB finops-idempotency-{env}"
+    participant DDB_Rollback as "DynamoDB finops-rollback-cache"
+    participant S3 as S3 Audit Store
     participant Cont as Alert & Containment Engine
 
     Note over SF, Lake: 1. CDO Ingests Cost & CloudWatch Telemetry
     SF->>Lake: Execute Ingestion (CUR mặc định, CE fallback nếu CUR chậm > 36h)
     Lake-->>SF: Dữ liệu thô & tinh lọc đã lưu trữ
     
-    Note over SF, S3: 2. CDO Checks Idempotency
-    SF->>S3: Read / Write Idempotency key (S3 object với 24h TTL check)
-    S3-->>SF: Khóa đã được lấy (success)
-    
-    Note over SF, AI: 3. CDO Calls Synchronous Detection (P99 < 300ms)
-    SF->>AI: POST /v1/detect (Ingested Telemetry + Headers)
+    Note over SF, ALB: 2. CDO Calls Synchronous Detection via Private ALB (P99 < 300ms)
+    SF->>ALB: POST /v1/detect (with X-Idempotency-Key & X-Correlation-Id)
+    ALB->>AI: Forward request
+    Note over AI, DDB_Idemp: AI validates and checks/writes idempotency lock
+    AI->>DDB_Idemp: PutItem / GetItem with Conditional Write
+    DDB_Idemp-->>AI: Success / Cache Hit
     AI->>Lake: Đọc đặc trưng & chỉ số sử dụng CloudWatch
     AI-->>SF: 200 OK (success: true, anomalies_list, data_confidence, correlation_id)
     
     opt anomalies_detected = true
-        Note over SF, S3: 4. Log Detection Evidence
-        SF->>S3: Ghi hồ sơ kiểm toán ban đầu (Object Lock)
+        Note over SF, S3: 3. Log Detection Evidence
+        SF->>S3: Ghi hồ sơ kiểm toán ban đầu (Object Lock, >=90 ngày)
         
-        Note over SF, AI: 5. CDO Requests Intervention Plan (Giới hạn 45s của Bedrock)
-        SF->>AI: POST /v1/decide (anomaly_context)
+        Note over SF, ALB: 4. CDO Requests Intervention Plan
+        SF->>ALB: POST /v1/decide (anomaly_context)
+        ALB->>AI: Forward request
         AI-->>SF: 200 OK DecideResponse (action_plan, applied_payload, rollback_payload.boto3_equivalent)
         
-        Note over SF, DDB: 5.1 CDO Caches Rollback Payload
-        SF->>DDB: Cache rollback_payload.boto3_equivalent
+        Note over SF, DDB_Rollback: 4.1 CDO Caches Rollback Payload
+        SF->>DDB_Rollback: Cache rollback_payload.boto3_equivalent (ngay lập tức)
         
-        Note over SF, Cont: 6. CDO Executes Proposed Plan & Verifies
+        Note over SF, Cont: 5. CDO Executes Proposed Plan & Verifies
         SF->>Cont: Thực thi các hành động containment được đề xuất (tag/suggest/shutdown)
-        Cont->>S3: Ghi hồ sơ kiểm toán thực thi
+        Cont->>S3: Ghi hồ sơ kiểm toán thực thi (Object Lock)
         Cont-->>SF: Kết quả thực thi
         
-        SF->>AI: POST /v1/verify (action_executed + post_telemetry)
+        SF->>ALB: POST /v1/verify (action_executed + post_telemetry)
+        ALB->>AI: Forward request
         AI-->>SF: 200 OK VerifyResponse (success, next_action)
         
-        Note over SF, S3: 7. Commit Final Outcome
-        SF->>S3: Ghi hồ sơ kiểm toán xác minh cuối cùng
+        Note over SF, S3: 6. Commit Final Outcome
+        SF->>S3: Ghi hồ sơ kiểm toán xác minh cuối cùng (Object Lock)
     end
 
-    opt Rollback Triggered (Manual / Policy-driven)
-        Note over SF, DDB: 8. CDO Performs Rollback
-        SF->>DDB: Đọc cached rollback_payload.boto3_equivalent
-        SF->>Cont: Thực thi các lệnh Boto3 từ cache
+    opt Rollback Triggered (Manual / Policy-driven / AI unavailable)
+        Note over SF, DDB_Rollback: 7. CDO Performs Rollback (Rollback Independence)
+        SF->>DDB_Rollback: Đọc cached rollback_payload.boto3_equivalent
+        SF->>Cont: Thực thi các lệnh Boto3 trực tiếp (không phụ thuộc AI)
         Cont-->>SF: Kết quả rollback
-        SF->>AI: POST /v1/audit/{audit_id}/rollback (results)
+        SF->>ALB: POST /v1/audit/{audit_id}/rollback (results)
+        ALB->>AI: Forward request
         AI-->>SF: 200 OK RollbackResponse
     end
 ```

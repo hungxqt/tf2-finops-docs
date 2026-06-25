@@ -30,12 +30,12 @@ graph TD
     end
 
     subgraph "External Storage & Services"
-        S3Raw[(S3 Raw Zone)]
-        S3Cur[(S3 Curated Zone)]
-        S3Audit[(S3 Authoritative Audit Store)]
-        DDB_Idemp[(DynamoDB finops-idempotency-{env})]
-        DDB_Rollback[(DynamoDB finops-rollback-cache)]
-        DDB_Dash[(DynamoDB Dashboard Cache)]
+        S3Raw[("S3 Raw Zone")]
+        S3Cur[("S3 Curated Zone")]
+        S3Audit[("S3 Authoritative Audit Store")]
+        DDB_Idemp[("DynamoDB finops-idempotency-{env}")]
+        DDB_Rollback[("DynamoDB finops-rollback-cache")]
+        DDB_Dash[("DynamoDB Dashboard Cache")]
         SM[Secrets Manager]
     end
 
