@@ -35,7 +35,7 @@ The platform's operational Performance is evaluated against Service Level Object
 
 ### 2.1 Contract Integration SLOs (Logical AI Engine Contract)
 
-Compliance with the contract-mandated limits from `ai-api-contract.md` §6 is measured programmatically for the direct Lambda/SQS execution path:
+Compliance with the contract-mandated limits from `ai-api-contract.md` §6 is measured programmatically for the private ALB routing execution path:
 
 | Contract SLO Metric | Target | Measurement Point | Verification Result |
 |---|---|---|---|

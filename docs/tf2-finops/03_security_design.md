@@ -171,7 +171,7 @@ The following secrets are stored in AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the private ALB/HTTPS adapter validates request credentials. The AI Engine container function validates request integrity, clock skew drift, and tenant boundaries directly from cross-cutting headers: `X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, and `X-Dry-Run-Mode`.
+Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, requests are signed using SigV4. The private ALB itself acts as the private entry point handling VPC routing and TLS termination, while the SigV4 signatures are validated at the compute runtime execution layer (inside the target AI Engine Lambda container via AWS IAM validation logic, or using a dedicated auth adapter / gateway target group). The AI Engine container function validates request integrity, clock skew drift, and tenant boundaries directly from cross-cutting headers: `X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, and `X-Dry-Run-Mode`.
 
 The platform enforces a clock-skew split policy:
 1. **API Requests Clock Skew**: The `X-Request-Timestamp` header skew limit is strictly set to **300 seconds** to prevent replay attacks. Requests outside this window are automatically rejected.
@@ -377,6 +377,28 @@ The compliance mapping is intentionally limited to capstone-relevant controls. T
 - [ ] **Operator Notification Channels**: When a containment action is denied, should the platform escalate alerts via PagerDuty or direct Slack webhook notifications?
 - [ ] **External Alert Redaction**: Which cost fields are allowed in Slack/email, and which must remain dashboard-only?
 - [ ] **Break-glass Approver**: Who approves temporary decrypt or production investigation access during an incident?
+
+## 9. Security Implementation Handoff
+
+To ensure smooth operational handover and contract compliance, the following implementation handoff details must be configured by the infrastructure engineers:
+
+### 9.1 IAM Permissions & Least-Privilege
+- **Containment Worker Execution Role**: Must possess only permissions for `ec2:CreateTags`, `ec2:DeleteTags`, and `ec2:StartInstances`/`ec2:StopInstances` (restricted to sandbox/development resource ARNs). It must not contain `iam:*` or data-destructive permissions.
+- **AI Engine Lambda Execution Role**: Scoped only to access its own ECR repository, write to `s3://company-cdo-{account_id}-telemetry/features/`, and perform read/write queries to `finops-idempotency-{env}` and `finops-rollback-cache`.
+
+### 9.2 VPC Private Access & Security Groups
+- **Private Subnet Restrictions**: The AI Engine container function runs entirely within private subnets with no internet routes. All external services (S3, ECR, DynamoDB, Secrets Manager) must be accessed via Gateway/Interface VPC Endpoints.
+- **Security Group Rules**: The ALB security group (`alb-sg`) accepts traffic only on Port 443 from within the CDO VPC CIDR block. The Lambda security group (`lambda-sg`) accepts Port 8080 traffic only from `alb-sg`.
+
+### 9.3 CloudWatch Alarms & Observability
+- **SigV4 Authentication Failures**: CloudWatch metric filters must monitor ALB logs for HTTP `403 Forbidden` or `401 Unauthorized` responses and trigger a `SigV4AuthFailureAlarm` if the count > 5 in 5 minutes.
+- **Lambda Concurrency Throttle**: Alarms must trigger on `Throttles` metrics for the AI Engine container function.
+
+### 9.4 Rate Limiting & Smoke-Test Probes
+- **Rate Limiting**: Placed at the Application Load Balancer layer or using Lambda Reserved Concurrency limits (capped at 10 concurrent executions) to prevent resource starvation.
+- **Smoke-Test Probes**: Post-deployment testing must run an automated runner inside the VPC to send signed HTTP requests using AWS SigV4 to the private ALB:
+  - Probe `/health` to verify container availability.
+  - Probe `/v1/detect` with a test payload to verify SigV4 validation, payload integrity checks (`X-Payload-SHA256`), and DynamoDB idempotency lock creation.
 
 ## Related documents
 

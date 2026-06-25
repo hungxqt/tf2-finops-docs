@@ -6,7 +6,7 @@
 > **Ranh giới Bảo mật**: Mọi thành phần hạ tầng và kiểm soát truy cập thuộc quyền sở hữu của CDO được mô tả ở đây phải tuân thủ nghiêm ngặt ranh giới cứng: **NEVER terminate prod, delete data, hoặc modify IAM**.
 
 
-Tài liệu này mở rộng các hợp phần AWS được mô tả trong [`02_infra_design.md`](02_infra_design.md) thành các chi tiết về vai trò (role), mục đích (purpose), đầu vào (input) và đầu ra (output).
+Tài liệu này mở rộng các hợp phần AWS được mô tả trong [`02_infra_design_vi.md`](02_infra_design_vi.md) thành các chi tiết về vai trò (role), mục đích (purpose), đầu vào (input) và đầu ra (output).
 
 Phạm vi là phân hệ kiểm soát FinOps (FinOps control plane) do CDO sở hữu:
 

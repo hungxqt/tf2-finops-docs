@@ -16,7 +16,7 @@ CDO platform sử dụng chiến lược triển khai hai lớp để phân tác
 1. **Lớp hạ tầng (AWS Resources)**: Sử dụng **Terraform (v1.5+)** để khởi tạo các tài nguyên bất biến (VPC, các hàm Lambda, ECR, DynamoDB, S3, IAM roles).
 2. **Lớp ứng dụng (Lambda Container Functions)**: Sử dụng **Terraform Lambda configuration** và **GitHub Actions (CI/CD) deployment pipelines** bằng cách ghim mã băm container image trên ECR.
 
-Terraform sở hữu nền tảng AWS: mạng, các bucket lakehouse, siêu dữ liệu Glue/Athena, Step Functions, các role execution Lambda, ECR repository, các bảng DynamoDB, và phân phối secrets. CDO sở hữu việc triển khai hạ tầng host serverless (VPC, subnets, thiết lập reserved concurrency, security groups, role execution Lambda, và các kho lưu trữ audit và idempotency dựa trên S3), trong khi AIOps sở hữu việc build container image, quản lý hợp đồng, và logic mô hình. Trạng thái mong muốn của các hàm Lambda trong thời gian chạy được quản lý thông qua Terraform và các pipeline triển khai GitHub Actions (CI/CD), do đó các phiên bản container image ứng dụng có thể di chuyển độc lập với các module hạ tầng trong khi vẫn phụ thuộc vào đầu ra của Terraform.
+Terraform sở hữu nền tảng AWS: mạng, các bucket lakehouse, siêu dữ liệu Glue/Athena, Step Functions, các role execution Lambda, ECR repository, các bảng DynamoDB, và phân phối secrets. CDO sở hữu việc triển khai hạ tầng host serverless (VPC, subnets, thiết lập reserved concurrency, security groups, role execution Lambda, kho lưu trữ idempotency dựa trên DynamoDB, và nhật ký kiểm toán dựa trên S3), trong khi AIOps sở hữu việc build container image, quản lý hợp đồng, và logic mô hình. Trạng thái mong muốn của các hàm Lambda trong thời gian chạy được quản lý thông qua Terraform và các pipeline triển khai GitHub Actions (CI/CD), do đó các phiên bản container image ứng dụng có thể di chuyển độc lập với các module hạ tầng trong khi vẫn phụ thuộc vào đầu ra của Terraform.
 
 ### 1.2 Module structure
 
@@ -122,7 +122,7 @@ Sau mỗi lần deploy, pipeline chạy smoke test bằng dữ liệu synthetic 
 3. Xác nhận dữ liệu thô (raw) và tinh chế (curated) được ghi vào các S3 bucket tuân theo tiêu chuẩn đặt tên 'company-cdo-{account_id}-telemetry'.
 4. Kiểm tra Glue/Athena có thể query dữ liệu curated.
 5. Gọi endpoint ALB nội bộ riêng tư của AI Engine sử dụng HTTPS và xác thực AWS SigV4:
-   - Xác thực rằng endpoint '/v1/detect' trả về giá trị 'data_confidence' (phân loại LOW/MEDIUM/HIGH).
+   - Xác thực rằng endpoint '/v1/detect' trả về giá trị 'data_confidence' (phân loại HIGH/LOW).
    - Xác thực rằng endpoint '/v1/decide' trả về 'rollback_payload.boto3_equivalent'.
    - Xác thực rằng các endpoint '/v1/status/{id}' và '/v1/verify' hoạt động bình thường.
 6. Xác thực rằng CDO platform ghi cache 'rollback_payload.boto3_equivalent' vào bảng DynamoDB 'finops-rollback-cache' ngay lập tức.
@@ -163,7 +163,7 @@ Trước khi cập nhật container image cho Lambda, pipeline sẽ khởi chạ
 1. Đối chiếu model version đăng ký từ AIOps với manifest image ECR mục tiêu.
 2. Kiểm tra JSON schema của các API contract HTTPS `/v1/*` của AI Engine đằng sau private ALB, cụ thể xác thực:
    - Request payload bao gồm cờ boolean `telemetry_delay_event`, đích nhận `callback_url`, `business_context`, `traffic_volume`, và trường `s3_bucket_uri` được kiểm tra khớp với biểu thức chính quy (regex) nghiêm ngặt `^s3://company-cdo-[0-9]{12}-telemetry/.*$`.
-   - Response payload chứa phân loại `data_confidence` (LOW/MEDIUM/HIGH), `cost_per_request`, và cấu trúc `rollback_payload.boto3_equivalent`.
+   - Response payload chứa phân loại `data_confidence` (HIGH/LOW) và cấu trúc `rollback_payload.boto3_equivalent`. Trường `cost_per_request` được AI Engine tự suy ra từ dữ liệu đo lường `business_context.traffic_volume` đầu vào thay vì là một trường kiểm tra xác thực phản hồi độc lập.
 3. Nếu schema không tương thích, quá trình build sẽ bị dừng ngay lập tức trước khi cập nhật cấu hình hàm Lambda, đảm bảo tính nhất quán của hệ thống.
 
 Việc kiểm tra khả năng tương thích không đánh giá chất lượng mô hình hoặc kiểm tra dữ liệu huấn luyện của AIOps. Nó chỉ xác thực hợp đồng vận hành mà CDO phụ thuộc vào: sức khỏe endpoint, request schema, response schema, các trường bắt buộc, trường phiên bản mô hình, hành vi timeout và các chế độ lỗi. Nếu AI Engine không khả dụng hoặc không tương thích, việc triển khai CDO chỉ có thể tiếp tục đối với các thay đổi hạ tầng mà không kích hoạt các đường dẫn áp dụng containment.

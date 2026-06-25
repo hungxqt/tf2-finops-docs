@@ -22,7 +22,7 @@ To integrate with the shared anomaly detection contracts, this CDO platform maps
 
 | Endpoint / Interface | Source Contract | CDO Target Design & Implementation |
 |---|---|---|
-| `POST /v1/detect` | `ai-api-contract.md` | Initiates synchronous batch anomaly detection. CDO invokes the AI detect Lambda with CUR cost data by default (or Cost Explorer daily data when `telemetry_delay_event = true` is activated as fallback), returning `success`, `correlation_id`, `anomalies_detected`, `anomalies_list`, and `data_confidence` (HIGH/LOW). Supports an optional `callback_url` for additive callback notification (does not replace the synchronous response). |
+| `POST /v1/detect` | `ai-api-contract.md` | Initiates synchronous batch anomaly detection. CDO invokes the private AI Engine endpoint `/v1/detect` via the private ALB with CUR cost data by default (or Cost Explorer daily data when `telemetry_delay_event = true` is activated as fallback), returning `success`, `correlation_id`, `anomalies_detected`, `anomalies_list`, and `data_confidence` (HIGH/LOW). Supports an optional `callback_url` for additive callback notification (does not replace the synchronous response). |
 | `GET /v1/status/{id}` | `ai-api-contract.md` | Retrieves remediation/self-healing status for a given anomaly_id or audit_id. (No longer used for polling detection status). |
 | `POST /v1/decide` | `ai-api-contract.md` | Requests RCA, recommended actions, and CLI dry-run payloads. CDO maps separate Finance (read-only) and Engineering (remediation/action plan) payloads. |
 | `POST /v1/verify` | `ai-api-contract.md` | Evaluates remediation outcome using post-action metrics. Triggers locked containment if error budget burnt > 1%. |

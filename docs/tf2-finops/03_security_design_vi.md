@@ -174,7 +174,7 @@ Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, private ALB/HTTPS adapter sẽ xác thực thông tin đăng nhập của yêu cầu. Hàm AI Engine container xác thực tính toàn vẹn của yêu cầu, độ lệch thời gian và ranh giới thuê bao trực tiếp từ các tiêu đề chéo: `X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, và `X-Dry-Run-Mode`.
+Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, các yêu cầu được ký bằng SigV4. Bản thân ALB riêng tư (private ALB) đóng vai trò là điểm truy cập riêng tư xử lý việc định tuyến VPC và chấm dứt kết nối TLS, trong khi chữ ký SigV4 được xác thực ở lớp thực thi runtime tính toán (bên trong Lambda container AI Engine mục tiêu thông qua logic xác thực AWS IAM, hoặc sử dụng một bộ điều phối xác thực / nhóm đích cổng kết nối chuyên dụng). Hàm AI Engine container xác thực tính toàn vẹn của yêu cầu, độ lệch thời gian và ranh giới thuê bao trực tiếp từ các tiêu đề chéo: `X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, và `X-Dry-Run-Mode`.
 
 Hệ thống áp dụng chính sách tách biệt về độ lệch thời gian (clock-skew split policy):
 1. **Độ lệch thời gian của yêu cầu API**: Độ lệch của tiêu đề `X-Request-Timestamp` được giới hạn nghiêm ngặt ở mức **300 giây** để chống lại các cuộc tấn công phát lại (replay attacks). Các yêu cầu nằm ngoài cửa sổ này sẽ tự động bị từ chối.
@@ -359,6 +359,7 @@ Kho lưu trữ kiểm toán containment được thiết kế dưới dạng app
 
 ## 6. CI Security Controls
 
+- **Quét hình ảnh & Phụ thuộc (Image & Dependency Scanning)**: Trivy được tích hợp vào pipeline CI/CD. Các hành động build sẽ tự động thất bại nếu các hình ảnh container chứa lỗ hổng bảo mật (CVE) mức độ `CRITICAL` hoặc `HIGH`.
 - **Chạy quyền Non-Root**: Cấu hình container bắt buộc chạy ứng dụng dưới quyền user non-root (ví dụ: chạy dưới user `1000` in Dockerfile).
 - **Cô Lập Hàm Lambda**: Các hàm Lambda container chạy trong các môi trường sandbox độc lập, chỉ đọc (ngoại trừ thư mục `/tmp`) và thực thi với các đặc quyền tối thiểu bằng các execution role riêng biệt.
 - **Giới Hạn Tài Nguyên**: Các giới hạn concurrency (Reserved Concurrency) được cấu hình trên các hàm Lambda để ngăn chặn các cuộc tấn công từ chối dịch vụ hoặc cạn kiệt tài nguyên của tài khoản.
@@ -379,6 +380,28 @@ Kho lưu trữ kiểm toán containment được thiết kế dưới dạng app
 - [ ] **Operator Notification Channels**: Khi một hành động containment bị từ chối, hệ thống nên gửi cảnh báo qua PagerDuty hay gửi trực tiếp về kênh Slack của đội bảo mật?
 - [ ] **External Alert Redaction**: Che giấu cảnh báo bên ngoài: Những trường chi phí nào được phép hiển thị trong Slack/email và những trường nào bắt buộc phải giữ riêng tư chỉ trên dashboard?
 - [ ] **Break-glass Approver**: Người phê duyệt khẩn cấp: Ai sẽ phê duyệt quyền giải mã tạm thời hoặc truy cập điều tra production trong quá trình xảy ra sự cố?
+
+## 9. Bàn giao Triển khai Bảo mật (Security Implementation Handoff)
+
+Để đảm bảo quá trình bàn giao vận hành diễn ra suôn sẻ và tuân thủ hợp đồng, các kỹ sư hạ tầng phải cấu hình các chi tiết bàn giao triển khai sau đây:
+
+### 9.1 Quyền IAM & Đặc quyền tối thiểu (IAM Permissions & Least-Privilege)
+- **Role thực thi của Containment Worker (Containment Worker Execution Role)**: Chỉ được sở hữu các quyền `ec2:CreateTags`, `ec2:DeleteTags`, và `ec2:StartInstances`/`ec2:StopInstances` (chỉ giới hạn cho các tài nguyên ARN trong môi trường sandbox/development). Vai trò này không được chứa các quyền `iam:*` hoặc các quyền hủy hoại dữ liệu.
+- **Role thực thi của AI Engine Lambda (AI Engine Lambda Execution Role)**: Chỉ được giới hạn trong việc truy cập kho lưu trữ ECR của chính nó, ghi dữ liệu vào `s3://company-cdo-{account_id}-telemetry/features/`, và thực hiện các truy vấn đọc/ghi tới bảng `finops-idempotency-{env}` và `finops-rollback-cache`.
+
+### 9.2 Truy cập VPC riêng tư & Nhóm bảo mật (VPC Private Access & Security Groups)
+- **Hạn chế trong Subnet riêng tư (Private Subnet Restrictions)**: Hàm container AI Engine chạy hoàn toàn trong các subnet riêng tư không có định tuyến ra internet. Tất cả các dịch vụ bên ngoài (S3, ECR, DynamoDB, Secrets Manager) phải được truy cập qua các Gateway/Interface VPC Endpoints.
+- **Quy tắc Security Group (Security Group Rules)**: Security group của ALB (`alb-sg`) chỉ chấp nhận traffic qua Cổng 443 từ bên trong dải mạng CIDR của CDO VPC. Security group của Lambda (`lambda-sg`) chỉ chấp nhận traffic qua Cổng 8080 từ `alb-sg`.
+
+### 9.3 Cảnh báo CloudWatch & Khả năng quan sát (CloudWatch Alarms & Observability)
+- **Lỗi xác thực SigV4 (SigV4 Authentication Failures)**: Các bộ lọc chỉ số CloudWatch (CloudWatch metric filters) phải theo dõi log của ALB để phát hiện các phản hồi HTTP `403 Forbidden` hoặc `401 Unauthorized` và kích hoạt cảnh báo `SigV4AuthFailureAlarm` nếu số lượng vượt quá 5 lần trong vòng 5 phút.
+- **Giới hạn số lượng thực thi đồng thời của Lambda (Lambda Concurrency Throttle)**: Các cảnh báo phải kích hoạt dựa trên chỉ số `Throttles` của hàm container AI Engine.
+
+### 9.4 Giới hạn tốc độ & Đầu dò kiểm thử khói (Rate Limiting & Smoke-Test Probes)
+- **Giới hạn tốc độ (Rate Limiting)**: Được đặt tại lớp Application Load Balancer hoặc sử dụng giới hạn số lượng thực thi đồng thời được đặt trước của Lambda (Reserved Concurrency) (giới hạn tối đa 10 luồng thực thi đồng thời) để ngăn chặn cạn kiệt tài nguyên.
+- **Các đầu dò kiểm thử khói (Smoke-Test Probes)**: Kiểm thử sau khi triển khai phải chạy một trình thực thi tự động (runner) bên trong VPC để gửi các yêu cầu HTTP đã được ký bằng AWS SigV4 tới ALB riêng tư:
+  - Thử nghiệm `/health` để xác minh tính sẵn sàng của container.
+  - Thử nghiệm `/v1/detect` với một payload kiểm thử để xác minh việc xác thực SigV4, kiểm tra tính toàn vẹn của payload (`X-Payload-SHA256`), và tạo khóa kiểm tra trùng lặp (idempotency lock) trên DynamoDB.
 
 ## Related documents
 
