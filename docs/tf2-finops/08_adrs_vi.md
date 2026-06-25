@@ -104,7 +104,7 @@
 
 ## ADR-006 - Nhật ký kiểm toán DynamoDB/S3 với thời gian lưu trữ ít nhất 90 ngày (DynamoDB/S3 audit trail with >=90 days retention)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Partially Superseded by ADR-016
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Tuân thủ tài chính yêu cầu một bản ghi không thể giả mạo và bền vững về tất cả các hành động containment tự động và được đề xuất, phải được giữ lại cho mục đích kiểm toán.
 - **Quyết định (Decision)**: Triển khai một nhật ký kiểm toán hai lớp lưu trữ các bản ghi kiểm toán containment trong DynamoDB (cho việc truy vấn dashboard độ trễ thấp) và S3 có bật Object Lock (cho lưu trữ tuân thủ dài hạn), thực thi thời gian lưu trữ tối thiểu là 90 ngày.
@@ -212,7 +212,7 @@
 
 ## ADR-012 - Gọi trực tiếp Lambda/SQS cho AI Engine thay vì qua Private API Gateway (Direct Lambda/SQS AI Engine invocation over Private API Gateway)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Partially Superseded by ADR-015
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Luồng chạy CDO hiện tại là một quy trình xử lý theo lô (batch workflow) được lập lịch, điều phối bởi EventBridge Scheduler và Step Functions. Hợp đồng API v1.1 của AI yêu cầu các ngữ nghĩa hợp đồng logic `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback`, nhưng kiến trúc không cần đến một Private REST API Gateway riêng biệt khi Step Functions là caller điều phối duy nhất.
 - **Quyết định (Decision)**: Tránh triển khai một Private REST API Gateway vật lý cho luồng chạy lô (batch workflow) lập lịch mặc định, do Step Functions đóng vai trò là caller điều phối duy nhất. Thay vào đó, các giao diện `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, và `/v1/verify` được triển khai thuần túy dưới dạng ngữ nghĩa hợp đồng logic (logical contract semantics). Dưới hạ tầng, Step Functions gọi trực tiếp AI Engine Request Lambda cho `/v1/detect`, hàm này xác thực dữ liệu và đẩy vào hàng đợi SQS để trả về token thực thi nhanh. AI Engine Worker Lambda sẽ xử lý bất đồng bộ hàng đợi, lưu kết quả phát hiện bất thường vào DynamoDB và S3. Quy trình Step Functions thực hiện polling `/v1/status/{correlation_id}` cho đến khi hoàn tất, sau đó gọi `/v1/decide` để lập kế hoạch can thiệp, thực thi các hành động can thiệp đã phê duyệt, và gọi `/v1/verify` để xác minh kết quả. Endpoint rollback `/v1/audit/{audit_id}/rollback` được gọi khi cần hoàn tác thủ công. Private API Gateway bị từ chối trong nền tảng CDO cơ sở để giảm tải chi phí và độ phức tạp dư thừa, chỉ tồn tại như một lựa chọn thiết kế tùy chọn cho việc triển khai đa client trong tương lai.
@@ -261,4 +261,38 @@
   - Glue Crawler cho các hoạt động thông thường: Bị từ chối do chi phí DPU, độ trễ chạy và rủi ro schema dựa trên phỏng đoán (heuristic).
   - Athena SQL DDL làm giải pháp quản lý vĩnh viễn: Bị từ chối vì việc tạo schema thủ công gây ra trôi lệch dữ liệu và khó kiểm soát phiên bản hoặc review code hơn so với IaC.
   - Sửa chữa phân vùng thủ công (MSCK REPAIR TABLE hoặc ALTER TABLE được kích hoạt bởi Lambda): Bị từ chối vì nó làm tăng độ trễ vận hành, chi phí gọi API và tính mong manh của lượt chạy theo lịch trình so với tính năng partition projection phía client.
+
+---
+
+## ADR-015 - Hợp đồng phát hiện AI đồng bộ thay vì cơ chế polling hàng đợi trạng thái SQS bất đồng bộ (Synchronous AI detect contract over async SQS status polling)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Hợp đồng của AI Engine Request Lambda phiên bản v1.1.0 đã chuyển dịch từ mô hình phát hiện bất đồng bộ (trả về `202 Accepted` và yêu cầu polling trên `/v1/status/{correlation_id}`) sang mô hình phát hiện đồng bộ (trả về `200 OK` với danh sách dị thường `anomalies_list` cuối cùng trực tiếp trong phản hồi). Thay đổi hợp đồng API này khiến cho hàng đợi thực thi SQS và logic polling cũ trở nên lỗi thời đối với vòng lặp phát hiện chính.
+- **Quyết định (Decision)**: Sử dụng trực tiếp endpoint `/v1/detect` đồng bộ trong workflow điều phối Step Functions của CDO, gọi Request Lambda một cách đồng bộ. Loại bỏ SQS/DLQ khỏi vòng lặp phát hiện chính (chỉ giữ lại SQS cho mục đích retry/backoff cảnh báo). Quyết định này thay thế các phần về luồng phát hiện của ADR-012.
+- **Hệ quả (Consequence)**:
+  - Pro: Loại bỏ các vòng lặp polling của Step Functions để kiểm tra trạng thái phát hiện, giảm độ phức tạp và số lượng trạng thái thực thi.
+  - Pro: Loại bỏ hàng đợi SQS và Dead Letter Queue khỏi đường dẫn tới hạn của quá trình thu thập chi phí và chấm điểm phát hiện, giảm chi phí chạy thực tế và chi phí vận hành nền tảng.
+  - Pro: Nhận phản hồi tức thì về sự thành công, correlation ID và danh sách các dị thường trực tiếp từ một payload gọi duy nhất.
+  - Trade-off: Thời gian gọi đồng bộ của Step Functions tăng lên, nhưng vẫn nằm trong giới hạn thực thi 15 phút an toàn của AWS Lambda (vì quá trình phân tích CUR và thực thi mô hình Bedrock Nova hoàn tất trong 30-45 giây).
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Giữ lại cơ chế polling SQS bất đồng bộ: Bị từ chối vì hợp đồng API v1.1.0 được đóng băng giữa CDO và AIOps bắt buộc phân phối phản hồi đồng bộ cho route `/v1/detect` để đơn giản hóa việc tích hợp phía client và giảm thiểu sự phình to của hạ tầng AWS.
+
+---
+
+## ADR-016 - Kho lưu trữ kiểm toán và idempotency có thẩm quyền trên S3 (S3 authoritative audit and idempotency store)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Các yêu cầu tuân thủ của chúng tôi đòi hỏi tính bất biến được thực thi bằng phần cứng (WORM) cho nhật ký kiểm toán, trong khi các lượt chạy theo lịch trình của chúng tôi yêu cầu một rào chắn idempotency để tránh xử lý trùng lặp. Chúng tôi cần xác định hệ thống lưu trữ có thẩm quyền cho các tính năng này.
+- **Quyết định (Decision)**: Chỉ định S3 là nguồn sự thật có thẩm quyền (authoritative source of truth) cho cả hồ sơ kiểm toán tuân thủ (được lưu trữ trong S3 có bật Object Lock để tuân thủ WORM) và các khóa idempotency (được lưu trữ dưới dạng các đối tượng S3 dưới `s3://company-cdo-telemetry/idempotency/` với chính sách hết hạn vòng đời 24 giờ). DynamoDB bị hạ cấp xuống thành một cache đọc / view truy vấn dashboard không có thẩm quyền. Quyết định này thay thế các phần về nhật ký kiểm toán trên DynamoDB của ADR-006.
+- **Hệ quả (Consequence)**:
+  - Pro: Đảm bảo tính tuân thủ quy định thực tế (WORM) thông qua tính năng S3 Object Lock gốc, đáp ứng các nguyên tắc kiểm toán nghiêm ngặt mà DynamoDB không thể đáp ứng nếu không có các dịch vụ phụ trợ.
+  - Pro: Bằng 0 chi phí dung lượng chạy (RCUs/WCUs) cho lưu trữ kiểm toán dài hạn, chỉ trả tiền cho lưu trữ S3 GB-tháng và số lượng yêu cầu với chi phí thấp.
+  - Pro: Idempotency được quản lý thông qua các đối tượng S3 sạch sẽ với chính sách tự động xóa sau 24 giờ.
+  - Trade-off: Việc kiểm tra idempotency yêu cầu gọi các hàm S3 HeadObject/GetObject, vốn có độ trễ cao hơn một chút so với tra cứu DynamoDB, mặc dù vẫn không đáng kể đối với tần suất chạy 24 giờ của chúng tôi.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - DynamoDB làm kho lưu trữ kiểm toán có thẩm quyền: Bị từ chối vì DynamoDB không hỗ trợ nguyên bản các ràng buộc write-once-read-many (WORM), vi phạm các NFR tuân thủ nghiêm ngặt.
+  - Giữ DynamoDB làm kho lưu trữ idempotency có thẩm quyền: Bị từ chối để đồng nhất kho lưu trữ giao dịch của chúng tôi và đơn giản hóa mã nguồn thu thập của nền tảng CDO, tận dụng các quy tắc lifecycle của S3 để tự động dọn dẹp thay vì quản lý TTL trên DynamoDB.
+
 

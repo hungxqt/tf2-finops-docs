@@ -10,46 +10,48 @@
 
 The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications occur privately using AWS VPC Endpoints.
 
-The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The Step Functions orchestrator invokes the AI Engine Request Lambda directly. An asynchronous queueing model using SQS/DLQ isolates heavy inference workloads from request validation. The Request Lambda processes incoming detection requests, publishes them to SQS, and returns status immediately. Note that `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` represent logical contract semantics for model integration, not deployed REST/HTTP routes, as no Private API Gateway is deployed. The AI Engine does not receive direct credentials for member account containment actions.
+The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The Step Functions orchestrator invokes the AI Engine Lambda function directly and synchronously. Note that `/v1/detect`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` represent logical contract semantics for model integration, not deployed REST/HTTP routes, as no Private API Gateway is deployed. The AI Engine does not receive direct credentials for member account containment actions. SQS/DLQ are used only for alert routing retry buffers rather than the detection flow.
 
 ```mermaid
 graph TD
     subgraph "CDO Management Account VPC (ap-southeast-1)"
-        subgraph "Private Subnets (Serverless Compute & Queue)"
-            AILambdaReq[AI Engine Request Lambda]
-            AILambdaWorker[AI Engine Worker Lambda]
-            SQSQueue[SQS Ingest Queue]
+        subgraph "Private Subnets (Serverless Compute)"
+            AILambda[AI Engine Lambda Function]
             L_Pull[Ingestion Lambda]
             L_Cont[Containment Lambda]
+            L_Alert[Alert Routing Lambda]
+            SQSQueue[SQS Alert Queue]
         end
 
         subgraph "VPC Endpoint Subnet"
-            VPCE[VPC Endpoints: S3, DDB, Secrets Mgr, ECR, KMS, Logs, STS, Lambda]
+            VPCE[VPC Endpoints: S3, ECR, KMS, Logs, STS, Secrets, Lambda]
         end
     end
 
-    subgraph "External Cloud Environment"
+    subgraph "External Storage & Services"
         S3Raw[(S3 Raw Zone)]
         S3Cur[(S3 Curated Zone)]
-        DDB[(DynamoDB Run State & Results)]
+        S3Audit[(S3 Authoritative Audit & Idempotency Store)]
+        DDB[(DynamoDB Dashboard Cache)]
         SM[Secrets Manager]
     end
 
     %% Network flows
     L_Pull -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| S3Raw
+    VPCE -->|Private link| S3Cur
     L_Cont -->|VPC Endpoint HTTPS| VPCE
-    VPCE -->|Private link| DDB
+    VPCE -->|Private link| S3Audit
+    L_Alert -->|Enqueue retry| SQSQueue
     
     %% Serverless traffic
-    AILambdaReq -->|Enqueue| SQSQueue
-    SQSQueue -->|Trigger| AILambdaWorker
-    AILambdaReq -->|Fetch secrets via SDK| VPCE
-    AILambdaWorker -->|Fetch secrets via SDK| VPCE
+    AILambda -->|Fetch secrets via SDK| VPCE
     VPCE -->|Private link| SM
+    AILambda -->|Read curated data| VPCE
+    VPCE -->|Private link| S3Cur
 ```
 
-*Caption: The AI Engine Request and Worker Lambda functions, along with orchestration and data adapters, are deployed within private-only subnets. They utilize dedicated AWS VPC Interface Endpoints (PrivateLink) to connect to AWS services, preventing data transmission over the public internet. No Private API Gateway is deployed; Step Functions invokes the Request Lambda function directly, and Worker execution is driven asynchronously via SQS.*
+*Caption: The AI Engine Lambda function, along with orchestration and data adapters, are deployed within private-only subnets. They utilize dedicated AWS VPC Interface/Gateway Endpoints (PrivateLink) to connect to AWS services, preventing data transmission over the public internet. No Private API Gateway is deployed; Step Functions invokes the AI Engine Lambda function directly and synchronously. SQS/DLQ are used only for alert routing retry buffers rather than the detection flow.*
 
 ### 1.2 Security Groups
 
@@ -57,8 +59,8 @@ Traffic between compute components is regulated using stateful security groups e
 
 | SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `lambda-sg` | None (Direct programmatic invocation via execution service) | TCP 443 (to `vpce-sg`) | Ingestion, Containment, and AI Engine Request & Worker Lambda functions |
-| `vpce-sg` | TCP 443 (from `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr, KMS, Logs, STS, Lambda) |
+| `lambda-sg` | None (Direct programmatic invocation via execution service) | TCP 443 (to `vpce-sg`) | Ingestion, Containment, Alert Routing, and AI Engine Lambda functions |
+| `vpce-sg` | TCP 443 (from `lambda-sg`) | None | VPC endpoints (S3, ECR, Secrets Mgr, KMS, Logs, STS, Lambda) |
 
 ### 1.3 Network ACL / VPC Endpoint
 
@@ -73,9 +75,9 @@ VPC interface endpoints are configured with private DNS enabled, routing all tra
 - `com.amazonaws.ap-southeast-1.sts` (Interface Endpoint - Security Token Service)
 - `com.amazonaws.ap-southeast-1.lambda` (Interface Endpoint - Lambda execution)
 
-Security groups and IAM resource policies are deployed to restrict communications (e.g., the Request Lambda only accepts invocation actions initiated by the Step Functions role, and the SQS Queue policy allows message publishing exclusively from the Request Lambda role).
+Security groups and IAM resource policies are deployed to restrict communications (e.g., the AI Engine Lambda only accepts invocation actions initiated by the Step Functions role, and the SQS Alert Queue policy allows message publishing exclusively from the Alert Routing Lambda role).
 
-Endpoint policies are scoped to the smallest practical action set. The S3 gateway endpoint allows reads from approved CUR export prefixes and writes only to the CDO raw/curated buckets. The DynamoDB endpoint allows access only to run-state, idempotency, audit, and dashboard-materialization tables. Interface endpoints for Secrets Manager, ECR, and CloudWatch Logs are restricted to the CDO VPC security groups and execution roles. Network ACLs remain simple and stateless, with public ingress denied and ephemeral return traffic allowed only inside private subnet ranges.
+Endpoint policies are scoped to the smallest practical action set. The S3 gateway endpoint allows reads from approved CUR export prefixes, writes only to the CDO raw/curated buckets, and reads/writes to the authoritative `s3_audit_bucket`. The DynamoDB endpoint allows access only to the dashboard-materialization read cache tables. Interface endpoints for Secrets Manager, ECR, and CloudWatch Logs are restricted to the CDO VPC security groups and execution roles. Network ACLs remain simple and stateless, with public ingress denied and ephemeral return traffic allowed only inside private subnet ranges.
 
 ## 2. IAM & Access Control
 
@@ -87,8 +89,7 @@ AWS IAM service roles enforce strict separation. Crucially, no service role has 
 |---|---|---|
 | `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
 | `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (on target account CUR S3 bucket), `s3:PutObject` (on raw S3 bucket), `ce:GetCostAndUsage` |
-| `FinOpsAiRequestExecutionRole` | AI Engine Request Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (via SDK), `sqs:SendMessage` (to queue detect requests), `dynamodb:GetItem` / `dynamodb:Query` (to fetch result state) |
-| `FinOpsAiWorkerExecutionRole` | AI Engine Worker Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (via SDK), `sqs:ReceiveMessage` / `sqs:DeleteMessage` (to poll queue), `s3:GetObject` / `s3:PutObject` (read cost data and write checkpoints/features), `dynamodb:PutItem` (to store inference outputs) |
+| `FinOpsAiExecutionRole` | AI Engine Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (via SDK), `s3:GetObject` (read cost data from curated S3 bucket), `s3:PutObject` / `s3:GetObject` (read/write telemetry & audit checks to S3 Authoritative store), `dynamodb:PutItem` / `dynamodb:UpdateItem` (write read cache to DynamoDB Dashboard Cache, if applicable) |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Explicit deny for `iam:*`, `s3:Delete*`, and prod resource termination. |
 
 > [!IMPORTANT]
@@ -97,8 +98,8 @@ AWS IAM service roles enforce strict separation. Crucially, no service role has 
 ### 2.2 Lambda Execution Roles
 
 AWS Lambda functions utilize Execution Roles to enforce the principle of least privilege:
-1. **Lambda Execution Role** (`FinOpsAiRequestExecutionRole`, `FinOpsAiWorkerExecutionRole`): Used by the Lambda service to run the function code, pull container images from ECR, and write execution logs to CloudWatch.
-2. **Access Isolation**: Application code running inside the Lambda functions uses these roles to query Secrets Manager (via SDK), read/write to S3 curated cost data, poll from SQS queues, or record results in DynamoDB. The CDO team owns these execution roles as part of the hosting platform, while the AIOps team provides the versioned container image artifacts.
+1. **Lambda Execution Role** (`FinOpsAiExecutionRole`): Used by the Lambda service to run the function code, pull container images from ECR, and write execution logs to CloudWatch.
+2. **Access Isolation**: Application code running inside the Lambda function uses this role to query Secrets Manager (via SDK), read/write to S3 curated cost data, and read/write to S3 Authoritative store. The CDO team owns these execution roles as part of the hosting platform, while the AIOps team provides the versioned container image artifacts.
 
 Workloads do not inherit host permissions. Each Lambda function is explicitly associated with its own execution role in the function configuration.
 
@@ -106,8 +107,7 @@ Workloads do not inherit host permissions. Each Lambda function is explicitly as
 
 | Function Name | IAM Execution Role | Managed Policies / Custom Scoped Policies |
 |---|---|---|
-| AI Engine Request Lambda | `FinOpsAiRequestExecutionRole` | Read-only Secrets Manager (contract and API keys), SQS send messages, DynamoDB query run state, CloudWatch Logs write. |
-| AI Engine Worker Lambda | `FinOpsAiWorkerExecutionRole` | Read-write S3 access (cost files & checkpoints), SQS poll messages, DynamoDB write results, CloudWatch Logs write. |
+| AI Engine Lambda | `FinOpsAiExecutionRole` | Read-only Secrets Manager (contract keys), S3 read/write (cost files, audit, and idempotency checks), CloudWatch Logs write, and optional DynamoDB write (read cache). |
 
 ### 2.3 Cross-account Access
 
@@ -154,7 +154,7 @@ The following secrets are stored in AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the Request and Worker Lambda functions do not pull static API keys from Secrets Manager. Instead, the AI Engine Request Lambda validates request integrity and clock skew drift (max 300s) directly from cross-cutting headers.
+Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the AI Engine Lambda function does not pull static API keys from Secrets Manager. Instead, the AI Engine Lambda validates request integrity and clock skew drift (max 300s) directly from cross-cutting headers.
 
 For example, the Lambda container function validates the incoming request using the following python logic:
 
@@ -207,16 +207,16 @@ All platform data is encrypted at rest using Customer Managed Keys (CMKs) in AWS
 | Data | Storage | KMS key | Notes |
 |---|---|---|---|
 | Raw/Curated Cost Data | S3 | `aws/s3` or custom CMK | S3 Bucket Key enabled to reduce KMS API costs. |
-| Run State & Metadata | DynamoDB | `aws/dynamodb` or custom CMK | Encrypted using KMS. |
+| Run State Cache & Dashboard Cache | DynamoDB | `aws/dynamodb` or custom CMK | Encrypted using KMS. DynamoDB is downgraded to a query cache layer for the dashboard. |
 | Secrets Store | Secrets Manager | `finops-secrets-key` | Decryption requires role trust. |
 | Lambda Ephemeral / Container Storage | Lambda Storage | `aws/lambda` or custom CMK | All function storage (including /tmp up to 10 GB) is encrypted by default. |
-| Audit Trail Logs | S3 Object Lock | `finops-audit-key` | Retained for 90 days with compliance lock. |
+| Audit Trail Logs & Idempotency Store | S3 Object Lock / S3 | `finops-audit-key` | S3/Object Lock audit storage is authoritative; retained for 90 days. Idempotency store uses 24h lifecycle expiry. |
 
 ### 4.2 In Transit
 
 - **TLS Requirements**: All ingress and egress traffic requires TLS 1.3 (with TLS 1.2 as a minimum fallback).
 - **Internal Service Traffic**: Function-to-function communication and SQS messaging are fully encrypted in transit natively by AWS services using TLS.
-- **AI Engine Invocations**: Step Functions invokes the internal AI Engine Request Lambda function directly through private VPC networking. The request payload contains standard contract fields such as a version schema pointer and correlation ID, and the payload is validated within the execution environment.
+- **AI Engine Invocations**: Step Functions invokes the internal AI Engine Lambda function directly through private VPC networking. The request payload contains standard contract fields such as a version schema pointer and correlation ID, and the payload is validated within the execution environment.
 - **Alert Webhooks**: Slack or email integrations are called from the alerting Lambda after payload minimization. Sensitive cost evidence is linked through internal dashboard/audit references instead of embedded directly in external messages.
 
 ### 4.3 Key Management
@@ -271,7 +271,7 @@ Every action taken by the CDO platform is documented. For containment actions, t
 }
 ```
 
-The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in DynamoDB and S3, with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in the authoritative S3 bucket (with optional dashboard cache duplication in DynamoDB), with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
 
 ### 5.2 Storage + Retention
 
@@ -279,7 +279,7 @@ Audit logs are stored securely with immutable controls:
 
 | Log type | Storage | Retention | Query interface |
 |---|---|---|---|
-| Containment Audits | S3 + Object Lock | 90 days minimum | Athena / DynamoDB |
+| Containment Audits | S3 + Object Lock | 90 days minimum | Athena / DynamoDB (read cache) |
 | AWS API Calls | CloudTrail (S3 Raw) | 1 year | Athena |
 | AI Engine Lambda Logs | CloudWatch Logs | 30 days | CloudWatch Logs Insights |
 | App/Lambda Logs | CloudWatch Logs | 14 days | CloudWatch Logs Insights |

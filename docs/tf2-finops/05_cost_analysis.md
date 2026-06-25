@@ -19,13 +19,13 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Compute - Lambda adapters** | $0.20/1M requests + $0.0000166667/GB-second | Puller, normalizer, router, containment, audit writer; 24h cadence | Variable per tenant; `Evidence needed: measured Lambda GB-seconds`. |
 | **Orchestration - Step Functions Standard** | $0.025/1K state transitions | 1 workflow/day/account, retries included | Variable per tenant; low but must be measured with actual state count. |
 | **Orchestration - EventBridge Scheduler** | $1.00/1M invocations | 1 scheduled trigger/day plus manual redrive | Shared negligible cost. |
-| **Storage - S3 raw/curated** | $0.023/GB-month Standard, lower after lifecycle | CUR/Cost Explorer pulls, normalized parquet, dashboard extracts | Variable by billing data volume. |
-| **Storage - S3 audit archive** | $0.0125/GB-month IA estimate | Containment and decision evidence retained at least 90 days | Variable by alert/containment volume; retention is mandatory. |
-| **Database - DynamoDB on-demand** | $1.25/million write + $0.25/million read | Run state, idempotency, audit index, dashboard materialization | Variable with runs and dashboard reads. |
+| **Storage - S3 raw/curated/idempotency** | $0.023/GB-month Standard, lower after lifecycle | CUR/Cost Explorer pulls, normalized parquet, dashboard extracts, and 24h idempotency objects | Variable by billing data volume. |
+| **Storage - S3 authoritative audit** | $0.0125/GB-month IA estimate | Containment and decision evidence S3/Object Lock (retained at least 90 days) | Variable by alert/containment volume; retention is mandatory. |
+| **Database - DynamoDB on-demand** | $1.25/million write + $0.25/million read | Read-only cache for dashboard views | Variable with runs and dashboard reads. |
 | **Query - Athena** | $5.00/TB scanned | Dashboard refresh, evidence lookup, operational review | Variable; controlled by partition pruning and query limits. |
 | **Data Catalog - Glue** | Catalog storage/metadata requests | Cost tables, partitions, Partition Projection (ADR-014) | Variable but negligible at capstone scale (free tier; ADR-014). |
-| **Compute - AI Engine Request/Worker Lambdas** | $0.20/1M requests + $0.0000166667/GB-second | AI Engine Request Lambda container function and SQS-triggered worker executions; 24h cadence | Variable AI workload hosting cost; tag separately from CDO adapters. |
-| **Hàng đợi SQS & DLQ** | $0.40/million requests | Buffering requests for async worker Lambda execution | Variable queue operations cost. |
+| **Compute - AI Engine Lambda** | $0.20/1M requests + $0.0000166667/GB-second | AI Engine Lambda container function synchronous execution; 24h cadence | Variable AI workload hosting cost; tag separately from CDO adapters. |
+| **Hàng đợi SQS & DLQ** | $0.40/million requests | Buffering retry requests for alert routing Lambda | Variable queue operations cost. |
 | **ECR repositories** | $0.10/GB-month storage | Versioned AIOps container images and Lambda container image versions | Shared fixed/variable by retained image count. |
 | **VPC endpoints** | Hourly endpoint charge + data processing where applicable | Private connections for ECR, S3, DynamoDB, Secrets Manager, Logs, KMS, STS, and Lambda | Shared fixed security cost. |
 | **Secrets Manager** | $0.40/secret/month + request charges | AI Engine credentials, webhooks, contract signing key, external IDs | Shared fixed plus request volume. |
@@ -81,7 +81,7 @@ As tenant count grows, fixed costs such as VPC endpoints, KMS CMKs, and S3 + Clo
 | **CloudWatch Logs retention** |  Implemented | 50% logs cost | Application logs: 14 days; Audit logs: 90 days then export to S3 |
 | **Lambda reserved concurrency** |  Not applicable | N/A | Low-frequency batch workload, no need to reserve |
 | **Savings Plans / Reserved Instances** |  W12 T4 evaluation | 20-40% compute | Need 2-week baseline to determine commitment; not applied in 2-week capstone |
-| **SQS batching and Lambda execution** | Implemented | 20-40% Lambda cost | Batch SQS messages (e.g., 5 or 10 messages) to invoke fewer worker Lambda executions. |
+| **SQS batching for alerts** | Implemented | 20-40% Lambda cost | Batch SQS messages (e.g., 5 or 10 messages) to invoke fewer alert routing Lambda executions. |
 | **Lambda right-sizing & architecture choice** | Implemented | 15-30% compute cost | Select x86_64 or Graviton2 based on performance/cost ratio, right-sizing memory limits. |
 | **Provisioned Concurrency scaling rules** | Evidence needed | 20-40% concurrency cost | Use scaling policies to disable Provisioned Concurrency outside of daily execution windows. |
 | **Cross-region replication** |  Out of scope | N/A | Single-region `ap-southeast-1`; DR design-only |
@@ -122,11 +122,10 @@ This section must be filled only after running the platform with tagged AWS reso
 | Lambda adapters | `Evidence needed: forecast from memory/runtime` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Puller, normalizer, router, containment, audit writer. |
 | Step Functions | `Evidence needed: state transition count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Include retries and manual redrives. |
 | S3 raw/curated/audit | `Evidence needed: GB-month and request forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Separate cost data and audit evidence prefixes. |
-| DynamoDB | `Evidence needed: read/write forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Run state, idempotency, audit index, dashboard materialization. |
+| DynamoDB | `Evidence needed: read/write forecast` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Read cache for dashboard and metadata. |
 | Athena/Glue | `Evidence needed: scanned TB and catalog queries` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Validate partition pruning and Partition Projection (ADR-014). |
-
-| AI Engine Lambda compute | `Evidence needed: invocation count and GB-seconds` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Request Lambda container and SQS-triggered worker execution duration. |
-| SQS queues & DLQ | `Evidence needed: message count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Buffering operations for asynchronous execution. |
+| AI Engine Lambda compute | `Evidence needed: invocation count and GB-seconds` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | AI Engine Lambda container execution duration. |
+| SQS queues & DLQ | `Evidence needed: message count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Buffering operations for alert routing retry execution. |
 | ECR image storage | `Evidence needed: image count and sizes` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | ECR repository for Lambda container images. |
 | VPC Endpoints | `Evidence needed: 7 endpoints × hourly charge` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Private AWS service access. |
 | CloudWatch/X-Ray | `Evidence needed: log volume and metric count` | `Evidence needed: Cost Explorer tag report` | `Evidence needed` | Lambda, Step Functions, SQS. |

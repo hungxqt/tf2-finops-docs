@@ -55,14 +55,14 @@ Use these defaults unless the user provides different decisions:
 - Data sources: AWS Data Exports/CUR 2.0 or CUR in S3 plus Cost Explorer API.
 - Data lake: S3 raw and curated zones, Glue Data Catalog, Athena views, and governed prefixes for cost, ownership, anomaly, alert, containment, and audit datasets. AWS Glue schemas are managed in Terraform and utilize client-side Athena Partition Projection to avoid Glue Crawler runtime costs (ADR-014).
 - Orchestration: EventBridge Scheduler triggers Step Functions Standard workflows.
-- AI integration: CDO hosts the AIOps-provided AI Engine on Lambda container images; CDO owns the hosting platform, ECR image deployment by digest, Lambda execution roles, reserved concurrency, SQS/DLQ async flow, DynamoDB result/idempotency stores, CloudWatch/X-Ray monitoring, and platform SLOs; AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics.
-- AI Engine runtime: Lambda container image in `ap-southeast-1`, private VPC integration, ECR for container images, Lambda execution roles, Secrets Manager integration. Direct Lambda and SQS invocation is used for the default scheduled batch workflow (Step Functions -> AI Engine Request Lambda -> SQS -> AI Engine Worker Lambda -> DynamoDB/S3 results -> Step Functions result check).
+- AI integration: CDO hosts the AIOps-provided AI Engine on Lambda container images; CDO owns the hosting platform, ECR image deployment by digest, Lambda execution roles, reserved concurrency, S3-backed authoritative audit and idempotency store (with optional DynamoDB dashboard read-caches), CloudWatch/X-Ray monitoring, and platform SLOs; AIOps owns the Lambda-compatible AI Engine container image, model code, detection logic, explanation text, and backtest metrics.
+- AI Engine runtime: Lambda container image in `ap-southeast-1`, private VPC integration, ECR for container images, Lambda execution roles, Secrets Manager integration. Direct synchronous Lambda invocation is used for the default scheduled batch workflow (Step Functions -> AI Engine Lambda synchronous invocation -> S3 results).
 - Lambda concurrency guardrails: Lambda reserved concurrency (e.g., 5-10 concurrent executions baseline) to control blast radius and throttle limits, with Provisioned Concurrency only as a production optimization if cold-start latency demands it.
-- Async execution queue: SQS queues (and DLQ) for asynchronous processing, allowing `/v1/detect` to return `202 Accepted` quickly while a background Lambda function processes the CUR data and writes results to DynamoDB/S3.
-- Database: DynamoDB for tracking execution state, idempotency locks, run results, and audit trails.
+- Ingestion execution path: Direct synchronous Lambda invocation is used for detection; SQS queues (and DLQ) are reserved only for alert routing retry buffers.
+- Data store: S3/Object Lock is the authoritative audit and idempotency store; DynamoDB may be used solely as a read-optimized dashboard cache for fast rendering.
 - Analytics storage/query: S3, Glue Data Catalog, Athena, and materialized dashboard tables/views where needed. Schemas are validated with Athena SQL DDL before promotion into Terraform definitions with Athena Partition Projection (ADR-014).
-- Operational metadata: DynamoDB tables for run state, anomaly records, routing state, idempotency keys, containment audit records, and dashboard materialized views.
-- Dashboard: QuickSight or a lightweight internal web dashboard backed by Athena/DynamoDB views.
+- Operational metadata: S3 authoritative store for run state, anomaly records, routing state, idempotency keys (`s3://company-cdo-telemetry/idempotency/` with 24h lifecycle), and containment audit records; DynamoDB tables serve as a dashboard materialized read cache.
+- Dashboard: QuickSight or a lightweight internal web dashboard backed by S3 JSON summaries and Athena/DynamoDB cache views.
 - Alerting: separate Finance and Engineering channels, such as email/Slack/SNS targets, with routing based on anomaly type and ownership tags.
 - Containment posture: dry-run first, safe automation only for non-prod/dev/sandbox resources.
 
@@ -72,7 +72,7 @@ Use this boundary in every generated document:
 
 - CDO owns cost data ingestion, normalized cost windows, ownership/tag metadata, scheduling, idempotency, workflow state, dashboard views, alert routing, containment guardrails, audit logs, platform operational SLOs, and the Lambda container hosting platform for the AI Engine (Lambda functions, execution roles, reserved concurrency, ECR digest deployment, networking, and platform SLOs).
 - AIOps owns anomaly detection logic, model selection, model training/retraining design, model versioning, confidence scoring, anomaly classification, explanation text, AI Engine code and model internals, and AI backtest metrics. AIOps provides versioned container artifacts (Lambda-compatible ECR container images, weights, configs); CDO deploys and operates them on AWS Lambda.
-- CDO hosts the AI Engine on AWS Lambda container images. CDO consumes the AI Engine through a versioned contract. For the default scheduled batch workflow, the interface is implemented via direct Lambda/SQS integrations, while /v1/detect and /v1/detect/result/{audit_id} represent the contract's logical operation semantics. CDO must document request/response fields, authentication, timeout, retry, circuit-breaker, unavailable-AI fallback, evidence storage, and the Lambda container operations runbook.
+- CDO hosts the AI Engine on AWS Lambda container images. CDO consumes the AI Engine through a versioned contract. For the default scheduled batch workflow, the interface is implemented via direct synchronous Lambda invocation, while /v1/detect represents the contract's logical operation semantics. CDO must document request/response fields, authentication, timeout, retry, circuit-breaker, unavailable-AI fallback, evidence storage, and the Lambda container operations runbook.
 - CDO must not claim responsibility for AI precision/recall internals. It may report AI metrics only as AIOps-provided integration evidence.
 - If AI Engine is unavailable, CDO must fail closed for containment: no automatic apply action, alert operators, preserve the failed run, and write an audit record.
 
@@ -142,7 +142,7 @@ Required sections:
 
 Required sections:
 
-- `## 1. Architecture diagram` — Mermaid diagram showing AWS Data Exports/CUR S3 bucket, Cost Explorer API, S3 raw/curated zones, Glue/Athena, EventBridge Scheduler, Step Functions, Lambda functions (AI Engine Request Lambda, AI Engine Worker Lambda), SQS/DLQ, DynamoDB, ECR, dashboard, alerting, and containment workers. Include a caption explaining the flow.
+- `## 1. Architecture diagram` — Mermaid diagram showing AWS Data Exports/CUR S3 bucket, Cost Explorer API, S3 raw/curated zones, Glue/Athena, EventBridge Scheduler, Step Functions, Lambda functions (AI Engine Lambda direct invocation), alert SQS/DLQ queues, S3 Authoritative store, DynamoDB dashboard cache, ECR, dashboard, alerting, and containment workers. Include a caption explaining the flow.
 - `## 2. Component table` — Table with columns: Component, AWS Service, Reason, Cost note. One row per service.
 - `## 3. Differentiation angle deep-dive`
   - `### 3.1 Why this angle?` — Why lakehouse-centric FinOps control plane with serverless orchestration.
@@ -230,9 +230,9 @@ Required sections:
 
 Required sections:
 
-- `## 1. Cost model per cadence run (forecast)` — Table with columns: Component, Unit cost, Usage per run, $/run. Rows for Lambda container duration/invocations, SQS/DLQ, Step Functions, S3, Glue/Athena, DynamoDB, ECR, dashboard, CloudWatch logs/X-Ray, alerting, NAT/VPC endpoints. Separate CDO platform costs from AI Engine hosting costs. Mark unmeasured numbers with `Evidence needed: ...`.
+- `## 1. Cost model per cadence run (forecast)` — Table with columns: Component, Unit cost, Usage per run, $/run. Rows for Lambda container duration/invocations, S3 transactions, Step Functions, S3 storage, Glue/Athena, DynamoDB dashboard cache, ECR, dashboard, CloudWatch logs/X-Ray, alerting, NAT/VPC endpoints. Separate CDO platform costs from AI Engine hosting costs. Mark unmeasured numbers with `Evidence needed: ...`.
 - `## 2. Cost at scale` — Table comparing monthly cost at different tenant/account counts. Show economies of scale.
-- `## 3. Cost optimization applied` — Checklist of cost optimizations: S3 lifecycle tiering, DynamoDB on-demand vs provisioned, log retention tiering, VPC endpoints to avoid NAT, Athena query limits.
+- `## 3. Cost optimization applied` — Checklist of cost optimizations: S3 lifecycle tiering, DynamoDB cache on-demand vs provisioned, log retention tiering, VPC endpoints to avoid NAT, Athena query limits, Glue Crawler avoidance.
 - `## 4. Cadence cost comparison` — Table comparing 12h, 24h, and 48h cadence costs and operational trade-offs. Defend the chosen 24h cadence.
 - `## 5. Measured actual (Pack #2 only)`
   - `### 5.1 Capstone build-period spend` — Table with columns: Service, Forecast, Actual, Delta. Use `Evidence needed: ...` until measured.
@@ -315,13 +315,20 @@ Required ADR entries (minimum, each as `## ADR-NNN - <Short title>`):
 
 - `## ADR-001 - 24h cadence over 12h/48h` — Defend 24h as the middle trade-off.
 - `## ADR-002 - Lakehouse-centric FinOps control plane architecture` — Why lakehouse-centric over alternatives.
-- `## ADR-003 - CDO/AIOps ownership boundary` — Responsibility split decision.
+- `## ADR-003 - CDO/AIOps responsibility boundary` — Responsibility split decision.
 - `## ADR-004 - CUR S3 plus Cost Explorer API data access` — Data source decision.
 - `## ADR-005 - Dry-run-first containment guardrail` — Safety-first containment approach.
-- `## ADR-006 - DynamoDB/S3 audit trail with >=90 days retention` — Audit storage decision.
+- `## ADR-006 - DynamoDB/S3 audit trail with >=90 days retention` — Audit storage decision (superseded by ADR-016).
 - `## ADR-007 - ECS Fargate for AI Engine hosting over serverless functions` — Why CDO hosts AI Engine on ECS Fargate instead of Lambda (superseded by ADR-010).
 - `## ADR-008 - Always-on plus Spot Fargate task separation` — Cost-performance trade-off for stable vs interruptible workloads (superseded by ADR-010).
+- `## ADR-009 - Shared Task Force AI Engine endpoint` — Shared AI endpoint decision (superseded by ADR-010).
+- `## ADR-010 - AWS Lambda container image hosting for AI Engine inference` — Lambda container hosting decision.
+- `## ADR-011 - Private REST API Gateway over internal ALB` — Private REST API Gateway decision (superseded by ADR-012).
+- `## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway` — Direct invocation flow decision (superseded by ADR-015).
+- `## ADR-013 - S3 + CloudFront dashboard over QuickSight for MVP` — Dashboard technology decision.
 - `## ADR-014 - Athena DDL validation to Terraform Glue schema with Partition Projection` — Use Athena DDL for validation and Terraform + Partition Projection for production schemas.
+- `## ADR-015 - Synchronous AI detect contract over async SQS status polling` — Synchronous /v1/detect contract decision.
+- `## ADR-016 - S3 authoritative audit and idempotency store` — S3 authoritative audit and idempotency decision.
 
 Each ADR must include these fields (matching template format exactly):
 

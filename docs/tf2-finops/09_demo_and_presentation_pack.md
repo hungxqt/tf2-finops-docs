@@ -23,12 +23,12 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
 - **CLI Command**: `aws stepfunctions start-execution --state-machine-arn <State_Machine_ARN> --input "{\"Date\": \"2026-06-24\"}"` (using the rtk wrapper).
 - **Verification**: Step Functions console shows a green "Running" status.
 
-### Step 3 - Invoke AI Engine Request Lambda (Logical POST /v1/detect semantics)
+### Step 3 - Invoke AI Engine Lambda Synchronously (Logical POST /v1/detect semantics)
 - **Action**: Monitor the ingestion Step Functions workflow as it reaches the AI scoring state.
-- **Internal Action**: The CDO orchestration Step Functions workflow directly invokes the AI Engine Request Lambda function using IAM invocation permissions (`lambda:InvokeFunction`).
+- **Internal Action**: The CDO orchestration Step Functions workflow directly invokes the AI Engine Lambda function synchronously using IAM invocation permissions (`lambda:InvokeFunction`).
 - **Request Parameters (passed in Lambda invocation payload)**:
   - `X-Tenant-Id`: Identifies the tenant (e.g., `CDO-01`).
-  - `X-Idempotency-Key`: Composite key format `tenant_id:YYYY-MM-DD` (e.g., `CDO-01:2026-06-24`).
+  - `X-Idempotency-Key`: Composite key format `{tenant_id}:{billing_period_date}:{batch_type}` (e.g., `CDO-01:2026-06-24:daily_batch`).
   - `X-Correlation-Id`: Execution tracking UUID.
   - `X-Payload-SHA256`: SHA256 integrity hash of the body payload.
   - `X-Request-Timestamp`: ISO 8601 timestamp.
@@ -37,22 +37,23 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
   - Data Ingestion Type: `RAW_JSON` for Cost Explorer API queries (<10MB) or `S3_POINTER` for CUR data in S3 (<500MB).
   - Control Flags: `is_ad_hoc` (bypasses 24h idempotency for emergency scan), `is_estimated` (CE estimated spend, lowers confidence and bypasses auto-containment), `is_forced_dry_run` (if telemetry completeness < 0.8, forces dry-run mode).
   - Telemetry Data: Cost, metadata, and CloudWatch performance metrics (with automatic fallback to CUR-only mode if performance metrics are missing).
-- **Verification**: Check Request Lambda execution logs for a successful invocation response containing:
+- **Verification**: Check Lambda execution logs for a successful synchronous response containing:
+  - `success`: `true`
   - `correlation_id` (tracking UUID)
-  - `status`: `"processing"`
-  - `retry_after_seconds`: `30`
+  - `anomalies_detected`: `true`
+  - `anomalies_list` (containing detailed anomaly objects)
 
-### Step 4 - Poll status (Logical GET /v1/status/{correlation_id} semantics)
-- **Action**: Monitor the Step Functions workflow as it polls the DynamoDB execution/result table directly for the completion status of the `correlation_id` every 30 seconds.
-- **Internal Action**: SQS buffers the request; the Worker Lambda container executes the AI model scoring, evaluates anomaly confidence, and compiles RCA details, writing the final result state directly to DynamoDB and S3.
-- **Result Payload (stored in DynamoDB/S3)**:
+### Step 4 - Verify Results & Write to S3 Authoritative Store
+- **Action**: Verify that the Step Functions workflow stores the returned anomalies in the S3 Authoritative store and caches them in DynamoDB for dashboard rendering.
+- **Internal Action**: The CDO platform evaluates the synchronous response. If `anomalies_detected` is true, it writes execution states and audit logs to the S3 Authoritative store (under `s3://company-cdo-telemetry/`) with Object Lock enabled, and updates the DynamoDB dashboard cache.
+- **Result Payload (stored in S3/DynamoDB)**:
   - `correlation_id`: Matching execution UUID.
-  - `status`: `"completed"` or `"failed"`.
+  - `anomalies_list`: Array of detected cost anomalies with fields: `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, `alert_routing`.
 - **Verification & Fail-safes**:
-  - If a duplicate idempotency key is detected, the Request Lambda returns a conflict response structure (representing HTTP `409` semantics).
-  - If a duplicate key with mismatched payload is sent, the Request Lambda returns a payload mismatch response structure (representing HTTP `400` with `ERR_IDEMPOTENCY_MISMATCH` semantics).
-  - If Bedrock times out (45s Bedrock limit, returning `ERR_LLM_TIMEOUT` in the result status) or the service is down (`ERR_SERVICE_DOWN`), the pipeline immediately falls back to static rule execution and alerts SRE.
-  - Check DynamoDB anomaly records table to verify the record has been written with a cryptographic audit trail chain link calculated as `sha256(current_payload + previous_hash)`.
+  - If a duplicate idempotency key is detected, the AI Engine returns a conflict response structure (representing HTTP `409` semantics).
+  - If a duplicate key with mismatched payload is sent, the AI Engine returns a payload mismatch response structure (representing HTTP `400` with `ERR_IDEMPOTENCY_MISMATCH` semantics).
+  - If Bedrock times out (45s Bedrock limit, returning `ERR_LLM_TIMEOUT`) or the service is down (`ERR_SERVICE_DOWN`), the CDO platform synchronously falls back to the static rules engine and alerts SRE.
+  - Check the S3 authoritative audit bucket to verify the record has been written with a cryptographic audit trail chain link calculated as `sha256(current_payload + previous_hash)`.
 
 ### Step 5 - Get Intervention Plan (Logical POST /v1/decide semantics)
 - **Action**: Once the status is complete, Step Functions invokes the AI Engine worker Lambda (representing `/v1/decide` semantics) to retrieve the Root Cause Analysis (RCA) and containment action plan.
@@ -74,7 +75,7 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
 ### Step 8 - Execute dry-run containment (Cognito-authorized execution)
 - **Action**: Log out of the Finance session and log back in as an Engineering Operator (member of the `finops-engineering-operator` group). Locate the active anomaly on the dashboard and click the "Execute Plan" button.
 - **Internal Action**: The dashboard interface triggers the containment handler Lambda. The backend validates the active Cognito JWT cookie, checks group membership, and permits the operation.
-- **Verification**: Verify that the targeted AWS EC2 instance remains running, but the DynamoDB audit log table has a new record showing a proposed action `stop_instance` with `execution_mode: dry-run` and a cryptographically chained block hash.
+- **Verification**: Verify that the targeted AWS EC2 instance remains running, but the authoritative S3 audit store (and the DynamoDB dashboard cache) has a new record showing a proposed action `stop_instance` with `execution_mode: dry-run` and a cryptographically chained block hash.
 
 ### Step 9 - Verify containment effectiveness (Logical POST /v1/verify semantics)
 - **Action**: The CDO platform (or Step Functions workflow) calls `/v1/verify` (or direct Lambda equivalent) passing the `correlation_id` and post-action telemetry.
@@ -84,7 +85,7 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
 ### Step 10 - Execute manual/auto rollback (Logical POST /v1/audit/{audit_id}/rollback semantics)
 - **Action**: While logged in as an Engineering Operator, click the "Revert/Rollback" button on the CDO dashboard. Try the same action while logged in as a Finance user to verify rejection.
 - **Internal Action**: The dashboard triggers the rollback handler Lambda (representing `/v1/audit/{audit_id}/rollback` semantics) with the Cognito session credentials. The backend checks Cognito group claims, verifies tenant context, and triggers the tag reversion.
-- **Verification**: Check CLI logs and DynamoDB records to confirm the audit state changes to `RollbackCompleted` with the operator's Cognito user ID logged in the `actor` field. Confirm that the Finance user's attempt yields an authorization failure (representing HTTP `403 Forbidden` semantics) and writes an `unauthorized_action_blocked` audit entry. If the manual rollback rate exceeds 1% in a rolling 30-day window, verify the tenant is locked into `LOCKED_MODE` (forcing all future decisions to dry-run).
+- **Verification**: Check CLI logs and S3/DynamoDB audit records to confirm the audit state changes to `RollbackCompleted` with the operator's Cognito user ID logged in the `actor` field. Confirm that the Finance user's attempt yields an authorization failure (representing HTTP `403 Forbidden` semantics) and writes an `unauthorized_action_blocked` audit entry. If the manual rollback rate exceeds 1% in a rolling 30-day window, verify the tenant is locked into `LOCKED_MODE` (forcing all future decisions to dry-run).
 
 ---
 
@@ -94,9 +95,9 @@ This checklist outlines the specific log files, database tables, and communicati
 
 - **CUR logs in S3**: Ingestion files stored under `s3://cdo-raw-cost-bucket/exports/` confirming raw data format compatibility.
 - **VPC Flow Logs & IAM Telemetry**: Logs showing direct Lambda invocation execution logs and VPC Endpoint traffic with no internet egress.
-- **DynamoDB records**:
-  - Anomalies table: Record containing `anomaly_id`, `confidence_score`, and `explanation` from the AI Engine, with pagination parameters.
-  - Audit trail table: Record containing all 14 containment action fields, verifying `correlation_id` matches the Step Functions execution, and containing a cryptographic audit trail chain block calculated as `sha256(current_payload + previous_hash)`.
+- **S3 Authoritative logs & DynamoDB cache**:
+  - Anomalies cache: Record containing `anomaly_id`, `confidence_score`, and `explanation` from the AI Engine, with pagination parameters.
+  - Audit trail (authoritative in S3, cached in DynamoDB): Record containing all 14 containment action fields, verifying `correlation_id` matches the Step Functions execution, and containing a cryptographic audit trail chain block calculated as `sha256(current_payload + previous_hash)`.
 - **Slack webhooks**: Webhook logs from the target Slack application channel, confirming correct JSON payload delivery without exposing raw cost structures.
 - **QuickSight / Dashboard screenshots**: High-resolution image references showing:
   - Daily spend trend with anomaly point overlays.
@@ -110,7 +111,7 @@ This checklist outlines the specific log files, database tables, and communicati
 Key selling points of the serverless lakehouse-centric FinOps control plane architecture:
 
 - **Serverless cost savings**: By selecting S3, Glue, and Athena for the data lakehouse, the platform runs at a fraction of the cost of traditional always-on databases (RDS/Redshift). Compute costs are only incurred during the query execution window, resulting in up to 90% savings for daily batch operations.
-- **Shared AI hosting optimization**: Deploying the shared AI Engine as direct Lambda container functions triggered by SQS optimizes compute footprint across multiple CDO platforms (eliminating idle compute costs) while keeping tenant workloads isolated via the `X-Tenant-Id` header and IAM invocation permissions.
+- **Shared AI hosting optimization**: Hosting the shared AI Engine on AWS Lambda container images with direct synchronous invocations optimizes compute footprint across multiple CDO platforms (eliminating idle compute costs) while keeping tenant workloads isolated via the `X-Tenant-Id` header and IAM invocation permissions.
 - **Complete compliance**: The dual-layer audit trail (DynamoDB for UI speed and S3 with Object Lock for immutability) guarantees that all automated and proposed actions are preserved for at least 90 days, meeting financial audit regulations. Every audit trail entry is cryptographically chained via `sha256(current_payload + previous_hash)` for tamper-proofing.
 - **Risk-free operation**: Strict dry-run defaults in production and staging environments prevent accidental service outages. Automation is safely restricted to non-production/sandbox environments where policies are strictly enforced.
 - **Multi-tenant isolation**: Structural S3 prefixes and Glue partitioning separate cost data by account and squad. Cross-account access relies on read-only IAM assume-role policies, preventing unauthorized lateral movements.

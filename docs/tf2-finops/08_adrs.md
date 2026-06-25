@@ -105,7 +105,7 @@
 
 ## ADR-006 - DynamoDB/S3 audit trail with >=90 days retention
 
-- **Status**: Accepted
+- **Status**: Partially Superseded by ADR-016
 - **Date**: 2026-06-24
 - **Context**: Financial compliance requires a tamper-proof, durable record of all automated and proposed containment actions, which must be retained for audit purposes.
 - **Decision**: Implement a dual-layer audit trail storing containment log records in DynamoDB (for low-latency dashboard query) and S3 with Object Lock enabled (for long-term compliance storage), enforcing a minimum retention period of 90 days.
@@ -213,7 +213,7 @@
 
 ## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway
 
-- **Status**: Accepted
+- **Status**: Partially Superseded by ADR-015
 - **Date**: 2026-06-24
 - **Context**: The current CDO flow is a scheduled batch workflow driven by EventBridge Scheduler and Step Functions. The AI API contract v1.1 requires `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` logical contract semantics, but the architecture does not need a separate Private REST API Gateway when Step Functions is the only orchestrating caller.
 - **Decision**: Avoid deploying a physical Private REST API Gateway for the default scheduled batch workflow, since Step Functions acts as the sole orchestrating caller. Instead, the contract's `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, and `/v1/verify` interfaces are implemented purely as logical contract semantics. Under the hood, Step Functions invokes the AI Engine Request Lambda directly for `/v1/detect`, which validates the payload and queues it in SQS, returning a fast execution token. The AI Engine Worker Lambda processes the queue asynchronously, storing findings in DynamoDB and S3. The Step Functions workflow polls `/v1/status/{correlation_id}` until completed, then invokes `/v1/decide` to generate the remediation plan, executes any approved containment actions, and invokes `/v1/verify` to validate the outcome. The rollback endpoint `/v1/audit/{audit_id}/rollback` is called for manual reversions. Private API Gateway is rejected in the baseline CDO platform to reduce unnecessary overhead, remaining only as an optional design choice for future multi-client deployments.
@@ -262,4 +262,38 @@
   - Glue Crawler for routine operations: Rejected due DPU cost, run latency, and heuristic schema risk.
   - Athena SQL DDL as permanent management: Rejected because manual schema creation introduces drift and is harder to version-control or code-review than IaC.
   - Manual partition repair (MSCK REPAIR TABLE or Lambda-triggered ALTER TABLE): Rejected because it adds operational latency, API call costs, and scheduled-run fragility compared to client-side partition projection.
+
+---
+
+## ADR-015 - Synchronous AI detect contract over async SQS status polling
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The AI Engine Request Lambda v1.1.0 contract has shifted from an asynchronous detection model (returning `202 Accepted` and requiring polling on `/v1/status/{correlation_id}`) to a synchronous detection model (returning `200 OK` with the final `anomalies_list` directly in the response). This API contract change makes the old SQS execution queue and polling logic obsolete for the primary detection loop.
+- **Decision**: Adopt the synchronous `/v1/detect` endpoint directly in the CDO Step Functions orchestration workflow, invoking the Request Lambda synchronously. Remove SQS/DLQ from the primary detection loop (retaining SQS only for alerting retries/backoff). This supersedes the detection flow portions of ADR-012.
+- **Consequence**:
+  - Pro: Eliminates Step Functions polling loops for detection status, reducing execution complexity and states.
+  - Pro: Removes the SQS queue and Dead Letter Queue from the critical path of cost ingestion and detection scoring, lowering runtime costs and platform operations overhead.
+  - Pro: Immediate feedback on success, correlation, and list of anomalies directly from the single invoke payload.
+  - Trade-off: The Step Functions synchronous invoke duration increases, which is safely within AWS Lambda's 15-minute execution limit (as CUR parsing and Bedrock Nova model execution completes in 30-45 seconds).
+- **Alternatives considered**:
+  - Keep the async SQS polling: Rejected because the v1.1.0 API contract frozen between CDO and AIOps mandates synchronous response delivery for the `/v1/detect` route to simplify client-side integration and reduce AWS infrastructure sprawl.
+
+---
+
+## ADR-016 - S3 authoritative audit and idempotency store
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: Our compliance requirements demand hardware-enforced immutability (WORM) for audit trails, while our scheduled runs require an idempotency guardrail to avoid double-processing. We need to define the authoritative storage system for these features.
+- **Decision**: Designate S3 as the authoritative source of truth for both compliance audit records (stored in S3 with Object Lock enabled for WORM compliance) and idempotency locks (stored as S3 objects under `s3://company-cdo-telemetry/idempotency/` with a 24-hour lifecycle expiration policy). DynamoDB is demoted to a non-authoritative read-cache / dashboard query view. This supersedes the DynamoDB audit trail portions of ADR-006.
+- **Consequence**:
+  - Pro: True regulatory compliance (WORM) via native S3 Object Lock, satisfying strict audit guidelines that DynamoDB cannot meet without auxiliary services.
+  - Pro: Zero running capacity cost (RCUs/WCUs) for long-term audit storage, paying only for low-cost S3 GB-month and requests.
+  - Pro: Idempotency is managed via clean S3 objects with 24-hour automatic lifecycle expirations.
+  - Trade-off: Checking idempotency require S3 HeadObject/GetObject calls which have slightly higher latency than DynamoDB lookups, though still negligible at our 24h cadence.
+- **Alternatives considered**:
+  - DynamoDB as authoritative audit store: Rejected because DynamoDB does not support write-once-read-many (WORM) constraints natively, violating strict compliance NFRs.
+  - Keep DynamoDB for idempotency authority: Rejected to unify our transaction store and simplify the CDO platform ingestion code, leveraging S3 lifecycle rules for automatic cleanup instead of DynamoDB TTL management.
+
 

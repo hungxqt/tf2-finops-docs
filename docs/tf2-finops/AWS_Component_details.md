@@ -49,7 +49,7 @@ This document documents the CDO-owned components, including the Lambda container
 | 8 | Ingestion Lambda | AWS Lambda | Pulls CUR files and Cost Explorer data. |
 | 9 | State Lambda | AWS Lambda | Checks and updates idempotency and run state. |
 | 10 | Normalization / Validation Lambda | AWS Lambda | Converts raw cost data into contract-ready records. |
-| 11 | AI Engine Request Lambda | AWS Lambda | Validates input payloads and enqueues requests to SQS (representing POST /v1/detect contract semantic). |
+| 11 | AI Engine Lambda Function | AWS Lambda | Executes the synchronous cost anomaly detection algorithm (representing the POST `/v1/detect` contract-level semantic). |
 | 12 | Alert Routing Lambda | AWS Lambda | Routes anomaly decisions to the correct notification path. |
 | 13 | Containment Lambda | AWS Lambda | Executes dry-run, tag, suggest, or approved non-prod containment actions. |
 | 14 | Audit Writer Lambda | AWS Lambda | Writes immutable audit records before and after policy actions. |
@@ -58,16 +58,16 @@ This document documents the CDO-owned components, including the Lambda container
 | 17 | S3 Audit Trail Bucket | Amazon S3 with Object Lock | Durable evidence store for containment and decision records. |
 | 18 | Glue Data Catalog | AWS Glue Data Catalog | Registers schemas and partitions for Athena. |
 | 19 | Athena Query Engine | Amazon Athena | Queries curated data and powers materialized views. |
-| 20 | DynamoDB Run State and Audit | Amazon DynamoDB | Stores run locks, idempotency, audit index, and dashboard materialized data. |
+| 20 | DynamoDB Run State Cache | Amazon DynamoDB | Caches dashboard materialized data and non-authoritative indexes. |
 | 21 | Secrets Provider | AWS Secrets Manager | Stores secret references used by Lambda and alerting integrations. |
 | 22 | IAM Cross-Account Roles | AWS IAM / STS | Allows controlled read and containment access into member accounts. |
 | 23 | Finance Dashboard | Amazon S3 + CloudFront | Presents static web-based finance-readable views without SQL; assets are secured via OAC (Origin Access Control) and verified by Lambda@Edge. |
 | 24 | Alert Channels | Amazon SNS, Slack API, SES | Sends Finance, Engineering, Platform, and Security notifications. |
 | 25 | CloudWatch Monitoring | CloudWatch Logs, Metrics, Alarms | Observes workflow failures, stale data, and delivery failures. |
-| 26 | AI Engine Worker Lambda | AWS Lambda | Consumes requests from SQS, runs the model container, and writes results to S3 and DynamoDB. |
+| 26 | AI Engine Lambda Execution | AWS Lambda | Runs model container synchronously to return anomalies directly. |
 | 27 | ECR Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
-| 28 | AI Engine SQS/DLQ | Amazon SQS | Manages decoupling queues: requests queue, DLQ, and retry. |
-| 29 | AI Engine DynamoDB Stores | Amazon DynamoDB | Persistent state tables for execution results, idempotency, and anomalies. Step Functions polls this store directly for results. |
+| 28 | Alert Routing SQS/DLQ | Amazon SQS | Buffers failed alert messages to Slack/Email for automatic retries and logs failures to DLQ. |
+| 29 | DynamoDB Dashboard Cache | Amazon DynamoDB | Caches run state, anomalies metadata, and dashboard-friendly materialized query views. |
 | 30 | Dashboard Auth Gateway | Amazon Cognito | Authenticates dashboard users and provides group-based authorization (readonly Finance vs Engineering operators). |
 | 31 | Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. |
 
@@ -350,15 +350,15 @@ It ensures CUR and Cost Explorer data can be queried, sent to the AI decision co
 - Validation errors for missing or malformed fields.
 - Ownership fallback such as `unassigned-resources`.
 
-## 11. AI Engine Request Lambda
+## 11. AI Engine Lambda Function
 
 ### Role
 
-Validates input payloads and enqueues requests to SQS (representing the POST `/v1/detect` contract-level semantic).
+Executes the synchronous cost anomaly detection algorithm (representing the POST `/v1/detect` contract-level semantic).
 
 ### Purpose
 
-It serves as the entry point for the AI detection flow. It validates incoming request schemas, checks for idempotency conflicts, and enqueues the request to SQS for asynchronous downstream processing.
+It serves as the entry point for the AI detection flow. It validates incoming request schemas, checks for idempotency conflicts, and runs the anomaly detection model synchronously.
 
 ### Input
 
@@ -367,15 +367,15 @@ It serves as the entry point for the AI detection flow. It validates incoming re
 - Account scope.
 - Contract version.
 - Secrets reference for payload integrity signing.
-- Downstream SQS Queue URL.
 
 ### Output
 
-- Success status (contract-level equivalent of HTTP `202 Accepted`) containing:
-  - `audit_id` (tracking UUID)
-  - `status`: `"processing"`
-  - `retry_after_seconds`: `30`
-- Message successfully enqueued to SQS.
+- Success status (contract-level equivalent of HTTP `200 OK`) containing:
+  - `success` (boolean)
+  - `correlation_id` (UUID v4)
+  - `anomalies_detected` (boolean)
+  - `anomalies_list` (array of detected anomalies)
+  - `error_message` (optional)
 - Error codes or validation failures (contract-level equivalents of HTTP `400 Bad Request` or `409 Conflict`) if idempotency check or payload validation fails.
 
 ## 12. Alert Routing Lambda
@@ -774,27 +774,27 @@ It provides operational detection for failed workflows, stale dashboard data, La
 - Operator alerts.
 - Evidence that the platform ran, failed, retried, or recovered.
 
-## 26. AI Engine Worker Lambda
+## 26. AI Engine Lambda Execution
 
 ### Role
 
-Consumes requests from SQS, runs the AI model container, and writes results to S3 and DynamoDB.
+Runs the AI model container and writes results to S3.
 
 ### Purpose
 
-Executes model inference and anomaly analysis inside a Lambda function initialized from an AIOps-provided container image. It is triggered by SQS messages and utilizes reserved concurrency to control blast radius and throttle limits.
+Executes model inference and anomaly analysis inside a Lambda function initialized from an AIOps-provided container image. It runs synchronously within the direct detect lifecycle, and utilizes reserved concurrency to control blast radius and throttle limits.
 
 ### Input
 
-- SQS messages containing detection targets.
+- Ingested cost and CloudWatch utilization features from S3.
 - Pinned ECR image digest.
-- Downstream DynamoDB tables and S3 bucket ARNs.
+- S3 bucket ARNs for evidence.
 - Lambda execution role ARN.
 - Reserved concurrency configuration.
 
 ### Output
 
-- Anomaly detection results and explanations written directly to the AI Engine DynamoDB store.
+- Anomaly detection results and explanations returned synchronously to the Step Functions orchestrator.
 - Detailed execution reasoning evidence written to the S3 bucket.
 - Execution traces sent to X-Ray and logs sent to CloudWatch.
 
@@ -817,43 +817,43 @@ Acts as the single registry for deployment. Images are pinned by SHA256 digest i
 
 - Pinned image URI (`.dkr.ecr.ap-southeast-1.amazonaws.com/ai-engine@sha256:...`) pulled by AWS Lambda.
 
-## 28. AI Engine SQS/DLQ
+## 28. Alert Routing SQS/DLQ
 
 ### Role
 
-Queue-based asynchronous decoupling between CDO caller and AI Engine worker.
+Buffers failed alert messages to Slack/Email for automatic retries.
 
 ### Purpose
 
-Handles incoming detection requests as SQS messages to allow the Request Lambda to return a success status quickly, and allows the Worker Lambda to consume messages at a controlled rate, routing poison messages to the DLQ after 3 retries.
+Decouples alert notification delivery from the primary workflow execution. It prevents transient Slack/Email API failures from aborting the CDO pipeline, automatically retrying failed deliveries and routing persistent failures to the DLQ.
 
 ### Input
 
-- JSON payloads containing detection targets.
+- JSON alert payloads for Slack/Email.
 - Dead Letter Queue configuration.
 
 ### Output
 
-- Queue triggers for the AI Engine Worker Lambda.
-- DLQ alerts on message delivery failures.
+- Retried alerts sent to Slack/Email targets.
+- DLQ messages on permanent delivery failures.
 
-## 29. AI Engine DynamoDB Stores
+## 29. DynamoDB Dashboard Cache
 
 ### Role
 
-Persistent databases for execution status, results, and idempotency.
+Caching store for run state, anomalies, and containment execution audits.
 
 ### Purpose
 
-Stores the run locks, idempotency records, anomaly detection outputs, and containment execution audits with >=90 days retention.
+Provides low-latency read views to support the S3 + CloudFront finance dashboard, caching precomputed run histories and status updates without querying the authoritative S3/Athena layer.
 
 ### Input
 
-- Writes from the AI Engine Worker Lambda, CDO platform Lambdas.
+- Materialized views written by CDO platform Lambdas after runs.
 
 ### Output
 
-- Low-latency status and result records polled directly by Step Functions and retrieved by the S3 + CloudFront dashboard.
+- Low-latency status and result records retrieved by the S3 + CloudFront dashboard.
 
 ## 30. Amazon Cognito
 
