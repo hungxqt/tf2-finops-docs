@@ -265,12 +265,14 @@ graph TB
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
         CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
+        S3Dashboard2 -->|5. Trigger actions (POST)| APIGateway[AWS API Gateway / Lambda Function URL]
+        APIGateway -->|6. Execute action| ContLambda
         CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
         LambdaEdge["Lambda@Edge Auth Validator"] -->|Validate cookie JWT| CloudFront
     end
 ```
 
-*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write audit logs to DynamoDB, apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. An S3 + CloudFront static web dashboard reads precomputed DynamoDB/S3 JSON audit and spend summaries to present containment status directly to Finance stakeholders. CDO calls `POST /v1/verify` to complete the loop, and supports manual rollbacks via `POST /v1/audit/{audit_id}/rollback`.*
+*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write audit logs to DynamoDB, apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. An S3 + CloudFront static web dashboard reads precomputed DynamoDB/S3 JSON audit and spend summaries to present containment status directly to Finance stakeholders. Dashboard action controls (such as manual rollbacks or containment extensions) are routed securely from the S3 Static Dashboard to the Containment Lambda via an AWS API Gateway (HTTP API) or AWS Lambda Function URL endpoint. CDO calls `POST /v1/verify` to complete the loop, and supports manual rollbacks via `POST /v1/audit/{audit_id}/rollback`.*
 
 The containment engine treats `execution_mode` as a mandatory policy input, not a runtime convenience. Production resources can only receive tag, suggest, or dry-run outcomes, while dev/sandbox resources may receive apply-mode actions only when policy and approval requirements are satisfied. Each proposed or executed action writes an audit record before attempting any member-account operation. Once completed, CDO invokes `POST /v1/verify` to report the telemetry outcome, or triggers manual rollbacks via `POST /v1/audit/{audit_id}/rollback` which initiates resource tagging restoration.
 
@@ -350,6 +352,7 @@ The following infrastructure components are deployed in `ap-southeast-1` to oper
 | Finance Dashboard | Amazon S3 + CloudFront | A lightweight internal web dashboard hosted as static assets in S3 and delivered through CloudFront. Assets are secured via OAC (Origin Access Control) and verified by Lambda@Edge. | CloudFront egress/request fees, S3 storage, and OAC (typically <$3/month). |
 | Dashboard Auth Gateway | Amazon Cognito | Deploys Cognito User Pool, Hosted UI, and groups (finops-finance-readonly, finops-engineering-operator, finops-cdo-admin) to authenticate and authorize dashboard users. | User Pool feature is free up to 50,000 monthly active users (MAUs). |
 | Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. | ~$0.60 per million invocations + execution duration charges. |
+| Dashboard Backend API | AWS API Gateway (HTTP API) or Lambda Function URLs | Provides secure public HTTPS endpoints for the dashboard frontend to trigger interactive action controls (like extend or rollback). Secures endpoints via Amazon Cognito JWT authorization or IAM. | HTTP API: $1.00 per million requests; Lambda Function URL is free. |
 | Alert Channels | Amazon SNS / Slack API | Delivers separate routing paths for alerts (Finance alerts via Slack/Email, Eng alerts via Slack/Jira). | SNS is free up to 100k email notifications/month; Slack API is free. |
 | Containment Worker | AWS Lambda | Assumes roles in member accounts to apply tags or shut down dev/sandbox resources, strictly executing in `dry-run` or `apply` modes. | Pay-per-use. |
 

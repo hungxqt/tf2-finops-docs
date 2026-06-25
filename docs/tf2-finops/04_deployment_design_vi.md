@@ -118,13 +118,12 @@ Sau mỗi lần deploy, pipeline chạy smoke test bằng dữ liệu synthetic 
 3. Kiểm tra dữ liệu được ghi vào S3 raw/curated zone.
 4. Kiểm tra Glue/Athena có thể query dữ liệu curated.
 5. Gọi trực tiếp hàm Request Lambda của AI Engine sử dụng xác thực IAM.
-6. Theo dõi run state và kết quả trong DynamoDB/S3 cho đến khi quá trình thực thi bất đồng bộ hoàn thành.
-7. Kiểm tra alert routing tạo đúng payload cho Finance và Engineering.
-8. Kiểm tra containment vẫn chạy ở dry-run mode.
-9. Kiểm tra run state và audit record được ghi vào DynamoDB.
+6. Xác thực hàm Request Lambda trả về 200 Accepted và đẩy vào hàng đợi SQS thành công.
 ```
 
-Một lần triển khai chỉ được xem là hợp lệ khi toàn bộ bước validate pass, Terraform apply thành công, các hàm Lambda ở trạng thái healthy và smoke test xác nhận được luồng chính: ingest dữ liệu, gọi AI Engine, routing alert, containment dry-run và ghi audit log.
+Lưu ý: Việc xác minh luồng Async chạy xong (theo dõi run state cho đến khi hoàn thành, kiểm tra payload alert routing, kiểm tra trạng thái dry-run của containment, và kiểm toán ghi DynamoDB) được tách ra thành một bộ End-to-End (E2E) Test chạy riêng định kỳ để không block pipeline CI/CD cơ bản hoặc lãng phí thời gian runner.
+
+Một lần triển khai chỉ được xem là hợp lệ khi toàn bộ bước validate pass, Terraform apply thành công, các hàm Lambda ở trạng thái healthy và smoke test xác nhận được luồng chính: ingest dữ liệu, gọi AI Engine và đẩy hàng đợi SQS thành công. Toàn bộ quá trình thực thi bất đồng bộ sẽ được xác minh thông qua bộ End-to-End (E2E) Test định kỳ.
 
 Thiết kế CI/CD này giúp hạ tầng của TF2 FinOps Watch được triển khai nhất quán, có thể review trước khi apply, không dùng credential dài hạn và có bằng chứng rõ ràng cho từng lần thay đổi.
 
@@ -170,8 +169,8 @@ Việc kiểm tra khả năng tương thích không đánh giá chất lượng 
 
 ### 4.1 Strategy
 
-- **AI Engine Lambda Workloads**: Triển khai theo cơ chế **Lambda Weighted Aliases** bằng cách xuất bản các phiên bản Lambda và ghim mã băm ECR. Traffic được chuyển dịch dần dần: chạy thử nghiệm canary `10%` traffic trong 5 phút, và tự động chuyển sang `100%` nếu không phát sinh lỗi thực thi.
-- **Async SQS Lambda Workers**: Triển khai theo các phiên bản Lambda. Các cập nhật về cấu hình worker sẽ áp dụng ngay cho các worker thăm dò (polling) hàng đợi SQS mới.
+- **AI Engine Request Lambda Workloads (Đồng bộ)**: Triển khai theo cơ chế **Lambda Weighted Aliases** bằng cách xuất bản các phiên bản Lambda và ghim mã băm ECR. Traffic được chuyển dịch dần dần: chạy thử nghiệm canary `10%` traffic trong 5 phút, và tự động chuyển sang `100%` nếu không phát sinh lỗi thực thi.
+- **Async AI Engine Worker Lambda (SQS Trigger)**: Triển khai theo chiến lược **All-at-once** (triển khai toàn bộ một lần). Không sử dụng Weighted Aliases cho SQS trigger vì việc thay đổi trọng số Event Source Mapping của SQS yêu cầu tái tạo lại mapping, dễ gây gián đoạn và hành vi không đoán trước được. Thay vào đó, độ an toàn được đảm bảo bằng cấu hình **Dead Letter Queue (DLQ)** cực kỳ nghiêm ngặt để hứng lỗi, kết hợp với cơ chế **Feature Flags** trong mã nguồn để bật tắt logic mới.
 - **Lambda Reserved Concurrency**: Cấu hình với giới hạn reserved concurrency mặc định (ví dụ: baseline 5-10 thực thi đồng thời) để làm rào chắn giới hạn tần suất (rate-limiting) và chi phí, tránh sự tăng vọt số lượng thực thi đồng thời và giới hạn throttling.
 - **Kiểm soát đồng thời SQS (SQS Concurrency Controls)**: Được cấu hình trên mapping nguồn sự kiện (event source mapping) bằng các thiết lập số lượng thực thi đồng thời tối đa và giới hạn kích thước batch để căn chỉnh tiến trình xử lý thông báo với năng lực của AI Engine và tránh cạn kiệt kết nối cơ sở dữ liệu.
 - **Xử lý Timeout & Thử lại khi thực thi Lambda (Lambda Timeout & Retry)**: Các hàm Request và Worker Lambda được tích hợp cơ chế tự động thử lại. SQS đóng vai trò là vùng đệm; nếu quá trình thực thi Lambda bị ngắt quãng (do tái chế container hoặc sự cố nền tảng), tin nhắn sẽ được đưa trở lại hàng đợi để thử lại tối đa trước khi đưa vào Dead Letter Queue (DLQ).
@@ -215,17 +214,17 @@ GitHub secret được giới hạn ở metadata phi đám mây cần thiết đ
 
 ## 7. Scheduled batch deployment
 
-State machine của Step Functions và EventBridge Scheduler được quản lý và triển khai qua các module Terraform. Quy trình deploy tuân thủ quy trình kiểm tra vận hành:
+State machine của Step Functions và EventBridge Scheduler được quản lý và triển khai qua các module Terraform tận dụng tính năng Step Functions Versions and Aliases để chuyển giao tài nguyên nguyên tử (atomic) không gián đoạn. Quy trình deploy tuân thủ quy trình kiểm tra vận hành:
 
 ```
 1. Deploy định nghĩa JSON mới của Step Functions qua Terraform.
-2. Tạm thời vô hiệu hóa (disable) quy tắc EventBridge Scheduler để tránh kích hoạt pipeline giữa chừng.
-3. Chạy thử nghiệm (smoke-test) để xác minh kết nối đến Lambda và các bảng Glue.
-4. Kích hoạt (enable) lại quy tắc EventBridge Scheduler để trỏ vào version state machine mới.
+2. Xuất bản (publish) một Version mới của Step Functions state machine.
+3. Chạy thử nghiệm và xác minh trên Version mới.
+4. Cập nhật Alias (ví dụ: PROD) trỏ sang Version mới một cách nguyên tử (atomic).
 5. Ghi nhận thời gian cập nhật và phiên bản triển khai vào bảng DynamoDB deployment log.
 ```
 
-Trình tự triển khai bộ lập lịch ngăn chặn việc các định nghĩa workflow được cập nhật một nửa xử lý một lượt chạy hàng ngày. Nếu state machine thay đổi payload gọi AI, việc triển khai cũng chạy kiểm tra tính tương thích hợp đồng AI trước khi kích hoạt lại lịch trình. Các smoke test thất bại sẽ giữ lịch trình ở trạng thái vô hiệu hóa và tạo một cảnh báo cho người vận hành với ARN state machine tốt đã biết trước đó.
+Trình tự triển khai dựa trên Step Functions Alias ngăn chặn việc các định nghĩa workflow được cập nhật một nửa xử lý một lượt chạy hàng ngày. EventBridge Scheduler luôn trỏ vào Alias ổn định (ví dụ: `PROD`), triệt tiêu hoàn toàn bước tắt/bật EventBridge Scheduler thủ công khi deploy. Nếu state machine thay đổi payload gọi AI, việc triển khai cũng chạy kiểm tra tính tương thích hợp đồng AI trước khi cập nhật alias. Các kiểm tra thất bại sẽ dừng việc cập nhật alias, giữ alias tiếp tục trỏ vào Version tốt đã biết trước đó và gửi cảnh báo cho người vận hành.
 
 ## 8. Observability stack
 

@@ -34,10 +34,14 @@ Access to the S3 + CloudFront dashboard is strictly controlled and authenticated
 - **Session Management**: Session tokens (ID, access, and refresh tokens) are exchanged and stored as secure cookies (HTTPS-only, SameSite=Strict, Secure flags) with a short lifetime.
 - **Private S3 Origin**: The S3 bucket hosting static assets is completely private. Direct public access is blocked using Origin Access Control (OAC), so the dashboard can only be reached through CloudFront.
 - **Viewer-Request Authorization**: A Lambda@Edge viewer-request function intercepts all requests to CloudFront. It validates Cognito JWT tokens before serving static files or JSON summaries.
+  *(Architectural Note: Lambda@Edge is required here because Cognito session tokens use asymmetric RS256 signatures, which need to fetch public keys dynamically from Cognito's JWKS endpoint. Standard CloudFront Functions do not support asymmetric cryptography or external network calls. However, as a future optimization, if symmetric token verification (HS256) is adopted or public keys are pre-shared via CloudFront KeyValueStore, the gateway can be migrated to CloudFront Functions to achieve 1/6th of the Lambda@Edge execution cost with sub-millisecond latency).*
 - **Group-Based Authorization**:
   - `finops-finance-readonly`: Members can view spend trends, anomaly summaries, Finance alerts, and audit links. Finance users are strictly restricted to read-only views and must never see raw rollback scripts, CLI commands, or execution buttons.
   - `finops-engineering-operator`: Members can view technical anomaly detail, access execution role contexts, and use approved Extend/Snooze or Rollback/Restore controls.
   - `finops-cdo-admin`: Members have full administrative access to manage user pools, groups, dashboard access policies, synthetic-data visibility, and operator settings.
+
+### Backend API Endpoint
+To support interactive actions on the dashboard (such as the "Extend" button invoking the containment duration extension, the "Rollback" button, and the remediation verification flow `/v1/verify`), the Frontend does not call the Lambdas directly. Instead, an **AWS API Gateway (HTTP API)** or **AWS Lambda Function URLs** (secured via Cognito IAM/JWT Authorizers) is provisioned. The frontend makes HTTP requests to this endpoint (representing routes like `POST /v1/action/extend`, `POST /v1/audit/{audit_id}/rollback`, and `POST /v1/verify`), which are then routed to the respective Containment or State Lambdas. This ensures the frontend-backend communication path is secure, authenticated, and not left floating without a public endpoint.
 
 
 ---
@@ -101,7 +105,7 @@ All detected anomalies are routed directly to the squads responsible for the tar
 - **Delivery Channel**: Slack Webhook (Dedicated squad channels) or Jira API (automatic ticket creation).
 - **Content Focus**: Technical resource ID (ARN), service type, environment (Dev/Sandbox/Prod), tag compliance status, and the proposed rollback path.
 - **Action Control**: Includes authenticated, short-lived Verification and Rollback action links (executing against the API layer representing `/v1/verify` and `/v1/audit/{audit_id}/rollback` semantics) where policy and environment settings allow.
-- **Frequency**: Near real-time (within 30 minutes of pipeline completion).
+- **Frequency & Aggregation**: To prevent alert fatigue and Slack spam, the Alert Lambda aggregates (batches) alerts by `Squad_ID` and sends them as a single daily Digest message (instead of sending near real-time spam for individual anomalies like 50 pods failing simultaneously). The digest lists the top most severe anomalies requiring attention.
 
 *Note on telemetry data*: Telemetry processed for detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment.
 

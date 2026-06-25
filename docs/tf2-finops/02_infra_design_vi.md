@@ -268,12 +268,14 @@ graph TB
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
         CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| AuditDB
+        S3Dashboard2 -->|5. Trigger actions (POST)| APIGateway[AWS API Gateway / Lambda Function URL]
+        APIGateway -->|6. Execute action| ContLambda
         CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
         LambdaEdge["Lambda@Edge Auth Validator"] -->|Validate cookie JWT| CloudFront
     end
 ```
 
-*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán vào DynamoDB, áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu DynamoDB/S3 JSON được tính toán trước để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. CDO gọi `POST /v1/verify` để hoàn thành vòng lặp và hỗ trợ rollback thủ công qua `POST /v1/audit/{audit_id}/rollback`.*
+*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán vào DynamoDB, áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu DynamoDB/S3 JSON được tính toán trước để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. Các nút tương tác trên bảng điều khiển (như rollback thủ công hoặc gia hạn containment) được định tuyến bảo mật từ S3 Static Dashboard đến Containment Lambda qua endpoint AWS API Gateway (HTTP API) hoặc AWS Lambda Function URL. CDO gọi `POST /v1/verify` để hoàn thành vòng lặp và hỗ trợ rollback thủ công qua `POST /v1/audit/{audit_id}/rollback`.*
 
 Động cơ containment coi `execution_mode` là một đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên. Sau khi hoàn thành, CDO gọi `POST /v1/verify` để báo cáo kết quả đo lường từ xa, hoặc kích hoạt rollback thủ công qua `POST /v1/audit/{audit_id}/rollback` để bắt đầu khôi phục lại thẻ (tag) của tài nguyên.
 
@@ -354,6 +356,7 @@ Các thành phần hạ tầng sau đây được triển khai tại vùng `ap-s
 | Bảng điều khiển Tài chính (Finance Dashboard) | Amazon S3 + CloudFront | Bảng điều khiển web tĩnh nội bộ nhẹ được lưu trữ dưới dạng tài sản tĩnh trong S3 và phân phối qua CloudFront. Tài sản được bảo vệ bằng OAC (Origin Access Control) và được xác thực bởi Lambda@Edge. | Phí CloudFront truyền dữ liệu/request, lưu trữ S3, và OAC (thường dưới 3 USD/tháng). |
 | Dashboard Auth Gateway | Amazon Cognito | Triển khai Cognito User Pool, Hosted UI, và các nhóm (finops-finance-readonly, finops-engineering-operator, finops-cdo-admin) để xác thực và ủy quyền người dùng bảng điều khiển. | Tính năng User Pool miễn phí tối đa 50.000 người dùng hoạt động hàng tháng (MAUs). |
 | Viewer-Request Auth Gate | Lambda@Edge | Hàm xử lý viewer-request kiểm tra secure HTTP-only cookies và xác thực chữ ký JWT đối với Cognito JWKS trước khi chuyển tiếp yêu cầu đến bucket S3 riêng tư. | ~0,60 USD trên mỗi triệu lượt gọi + chi phí thời gian thực thi. |
+| Dashboard Backend API | AWS API Gateway (HTTP API) hoặc Lambda Function URLs | Cung cấp các HTTPS endpoint công cộng bảo mật để frontend của bảng điều khiển kích hoạt các hành động tương tác (như extend hoặc rollback). Bảo mật các endpoint qua Cognito JWT authorizer hoặc IAM. | HTTP API: 1,00 USD trên mỗi triệu yêu cầu; Lambda Function URL là miễn phí. |
 | Kênh cảnh báo (Alert Channels) | Amazon SNS / Slack API | Cung cấp các đường định tuyến riêng biệt cho cảnh báo (cảnh báo Tài chính qua Slack/Email, cảnh báo Kỹ thuật qua Slack/Jira). | SNS miễn phí tới 100 nghìn thông báo email/tháng; Slack API miễn phí. |
 | Tác nhân thực thi containment (Containment Worker) | AWS Lambda | Giả lập vai trò (assume role) trong các tài khoản thành viên để áp dụng nhãn (tag) hoặc tắt các tài nguyên dev/sandbox, thực thi nghiêm ngặt trong các chế độ dry-run hoặc apply. | Thanh toán theo mức sử dụng. |
 
