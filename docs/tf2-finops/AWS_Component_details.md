@@ -58,18 +58,19 @@ This document documents the CDO-owned components, including the Lambda container
 | 17 | S3 Audit Trail Bucket | Amazon S3 with Object Lock | Durable evidence store for containment and decision records. |
 | 18 | Glue Data Catalog | AWS Glue Data Catalog | Registers schemas and partitions for Athena. |
 | 19 | Athena Query Engine | Amazon Athena | Queries curated data and powers materialized views. |
-| 20 | DynamoDB Run State Cache | Amazon DynamoDB | Caches dashboard materialized data and non-authoritative indexes. |
+| 20 | DynamoDB Idempotency Store | Amazon DynamoDB | Manages scheduled run idempotency checking (`finops-idempotency-{env}`) with conditional writes and 24h TTL. |
 | 21 | Secrets Provider | AWS Secrets Manager | Stores secret references used by Lambda and alerting integrations. |
 | 22 | IAM Cross-Account Roles | AWS IAM / STS | Allows controlled read and containment access into member accounts. |
 | 23 | Finance Dashboard | Amazon S3 + CloudFront | Presents static web-based finance-readable views without SQL; assets are secured via OAC (Origin Access Control) and verified by Lambda@Edge. |
 | 24 | Alert Channels | Amazon SNS, Slack API, SES | Sends Finance, Engineering, Platform, and Security notifications. |
 | 25 | CloudWatch Monitoring | CloudWatch Logs, Metrics, Alarms | Observes workflow failures, stale data, and delivery failures. |
-| 26 | AI Engine Lambda Execution | AWS Lambda | Runs model container synchronously to return anomalies directly. |
+| 26 | AI Engine Lambda Execution | AWS Lambda | Runs model container behind a private internal ALB to return anomalies. |
 | 27 | ECR Repository | Amazon ECR | Stores AIOps container image artifacts deployed by digest pinning. |
 | 28 | Alert Routing SQS/DLQ | Amazon SQS | Buffers failed alert messages to Slack/Email for automatic retries and logs failures to DLQ. |
-| 29 | DynamoDB Dashboard Cache | Amazon DynamoDB | Caches run state, anomalies metadata, and dashboard-friendly materialized query views. |
+| 29 | DynamoDB Rollback Cache | Amazon DynamoDB | Caches `rollback_payload.boto3_equivalent` configuration block (`finops-rollback-cache`) with 90-day TTL. |
 | 30 | Dashboard Auth Gateway | Amazon Cognito | Authenticates dashboard users and provides group-based authorization (readonly Finance vs Engineering operators). |
 | 31 | Viewer-Request Auth Gate | Lambda@Edge | Viewer-request handler checking secure HTTP-only cookies and validating JWT signatures against Cognito JWKS before forwarding requests to private S3 bucket. |
+| 32 | AI Engine Private ALB | Amazon ELB | Exposes a private internal HTTPS interface (/v1/*) with SigV4 authentication routing to Lambda container execution. |
 
 ## Excluded Components
 
@@ -284,11 +285,11 @@ It turns external billing sources and CloudWatch performance metrics into raw pl
 ### Input
 
 - Account list and role-assumption details.
-- CUR bucket names and prefixes (bucket naming standard: `s3://tf2-cdo{NN}-telemetry-{region}/`).
+- CUR bucket names and prefixes (bucket naming standard: `s3://company-cdo-{account_id}-telemetry/`).
 - `telemetry_delay_event` (boolean flag to toggle fallback Cost Explorer daily data pull instead of CUR).
 - Cost Explorer query window.
 - CloudWatch performance telemetry metrics (including raw 24-hourly `cpu_utilization_hourly` array).
-- Raw S3 bucket and prefix (conforming to standard bucket naming).
+- Raw S3 bucket and prefix (conforming to standard bucket naming: `s3://company-cdo-{account_id}-telemetry/raw/`).
 - KMS key ARN for write access.
 - Retry and backoff settings.
 
@@ -367,7 +368,7 @@ It serves as the entry point for the AI detection flow. It validates incoming re
 ### Input
 
 - Normalized cost window payload (with `telemetry_delay_event` flag).
-- Run ID and idempotency key (bucket naming standard: `s3://tf2-cdo{NN}-telemetry-{region}/`).
+- Run ID and idempotency key (cached in DynamoDB table `finops-idempotency-{env}`).
 - Account scope.
 - Contract version.
 - CloudWatch performance telemetry metrics (including raw 24-hourly `cpu_utilization_hourly` array).
@@ -501,7 +502,7 @@ It preserves immutable source evidence before transformation, supporting reproce
 - Billing period.
 - Ingestion timestamp.
 - KMS encryption configuration.
-- Bucket naming convention: standard bucket naming `s3://tf2-cdo{NN}-telemetry-{region}/raw/`.
+- Bucket naming convention: standard bucket naming `s3://company-cdo-{account_id}-telemetry/raw/`.
 
 ### Output
 
@@ -527,7 +528,7 @@ It provides the stable lakehouse layer for Athena queries, AI contract payload c
 - Owner and squad tags.
 - Account, year, and month partition values.
 - Parquet conversion output.
-- Bucket naming convention: standard bucket naming `s3://tf2-cdo{NN}-telemetry-{region}/curated/`.
+- Bucket naming convention: standard bucket naming `s3://company-cdo-{account_id}-telemetry/curated/`.
 
 ### Output
 
@@ -553,7 +554,7 @@ It acts as the durable evidence store for traceability, especially when DynamoDB
 - AI decision evidence references.
 - Retention period, at least 90 days.
 - Object Lock settings when enabled.
-- Bucket naming convention: standard bucket naming `s3://tf2-cdo{NN}-telemetry-{region}/audit/` and `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/`.
+- Bucket naming convention: standard bucket naming `s3://company-cdo-{account_id}-telemetry/audit/` and `s3://company-cdo-{account_id}-telemetry/telemetry/`.
 
 ### Output
 
@@ -615,33 +616,29 @@ It powers materialized cost views, dashboard datasets, anomaly evidence queries,
 - Stale-data signal when latest curated partition is too old.
 - Query cost metrics.
 
-## 20. DynamoDB Run State And Audit
+## 20. DynamoDB Idempotency Store
 
 ### Role
 
-DynamoDB stores operational state, idempotency records, audit indexes, and dashboard materialized records.
+DynamoDB stores operational idempotency records for active runs (`finops-idempotency-{env}`).
 
 ### Purpose
 
-It provides low-latency state checks for the workflow and quick lookups for dashboards and alerts.
+It provides low-latency hot-path idempotency checks using conditional writes to prevent duplicate runs for the same account and billing window.
 
 ### Input
 
 - Run ID.
-- Idempotency key.
+- Idempotency key (format: `{tenant_id}:{billing_period_date}:{batch_type}`).
 - Account and billing window.
 - State status.
-- Audit record ID.
-- Dashboard materialization fields.
-- TTL and retention policy.
+- TTL expiration (24h).
 
 ### Output
 
 - Run lock result.
 - Run state record.
-- Duplicate-run detection.
-- Audit index record.
-- Dashboard summary record.
+- Duplicate-run detection and lock status.
 - Failure state for alarms and redrive.
 
 ## 21. Secrets Provider
@@ -800,7 +797,7 @@ Executes model inference and anomaly analysis inside a Lambda function initializ
 
 ### Input
 
-- Ingested cost and CloudWatch utilization features from S3 (including `cpu_utilization_hourly` array and `telemetry_delay_event` flag; bucket naming standard: `s3://tf2-cdo{NN}-telemetry-{region}/`).
+- Ingested cost and CloudWatch utilization features from S3 (including `cpu_utilization_hourly` array and `telemetry_delay_event` flag; bucket naming standard: `s3://company-cdo-{account_id}-telemetry/`).
 - Pinned ECR image digest.
 - S3 bucket ARNs for evidence.
 - Lambda execution role ARN.
@@ -852,23 +849,25 @@ Decouples alert notification delivery from the primary workflow execution. It pr
 - Retried alerts sent to Slack/Email targets.
 - DLQ messages on permanent delivery failures.
 
-## 29. DynamoDB Dashboard Cache
+## 29. DynamoDB Rollback Cache
 
 ### Role
 
-Caching store for run state, anomalies, and containment execution audits.
+Caching store for rollback execution payloads (`finops-rollback-cache`).
 
 ### Purpose
 
-Provides low-latency read views to support the S3 + CloudFront finance dashboard, caching precomputed run histories and status updates without querying the authoritative S3/Athena layer.
+Provides high-durability, low-latency caching of `rollback_payload.boto3_equivalent` configuration block immediately after `/v1/decide` to execute independent offline Boto3 rollbacks.
 
 ### Input
 
-- Materialized views written by CDO platform Lambdas after runs.
+- `rollback_payload.boto3_equivalent` configuration block from the decide phase.
+- Anomaly ID.
+- TTL (90 days).
 
 ### Output
 
-- Low-latency status and result records retrieved by the S3 + CloudFront dashboard.
+- Cached rollback payloads retrieved by CDO containment worker for Boto3 execution.
 
 ## 30. Amazon Cognito
 
@@ -905,6 +904,27 @@ Intercepts dashboard requests at the CloudFront viewer request event, parses JWT
 ### Output
 
 - Request forwarding to private S3 origin with OAC validation (if authorized) or 302 redirect to Cognito Hosted UI.
+
+## 32. AI Engine Private ALB
+
+### Role
+
+Exposes a private internal HTTPS interface (`/v1/*`) with SigV4 authentication.
+
+### Purpose
+
+Allows secure, VPC-bound programmatic execution of the AI Engine container function behind a private load balancer, enforcing integrity checks (`X-Payload-SHA256`) and request timeout controls.
+
+### Input
+
+- Programmatic Step Functions HTTPS requests on private VPC subnets.
+- AWS Signature Version 4 (SigV4) headers.
+- Request integrity headers (`X-Tenant-Id`, `X-Idempotency-Key`, `X-Correlation-Id`, `X-Payload-SHA256`, `X-Request-Timestamp`, and `X-Dry-Run-Mode`).
+
+### Output
+
+- Target Lambda invocation requests routed securely within the VPC.
+- Secure HTTPS responses returned to Step Functions.
 
 ## Contract-Level Data Flows
 

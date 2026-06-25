@@ -41,11 +41,11 @@ Quyền truy cập vào bảng điều khiển S3 + CloudFront được kiểm s
   - `finops-cdo-admin`: Thành viên có toàn quyền quản trị để quản lý user pool, nhóm, chính sách truy cập bảng điều khiển, khả năng hiển thị dữ liệu giả lập, và các cấu hình vận hành.
 
 ### Backend API Endpoint
-Để hỗ trợ các hành động tương tác trên dashboard (như hoàn tác thủ công, xác minh can thiệp hoặc truy xuất quyết định bất thường), frontend không gọi trực tiếp nhiều microservices hoặc các hàm Lambda CDO riêng biệt. Thay vào đó, nền tảng CDO cấu hình một **AWS Lambda Function URL** bảo mật trực tiếp trên **hàm Lambda của AI Engine** (AI Engine Lambda function).
+Để hỗ trợ các hành động tương tác trên dashboard (như hoàn tác thủ công, xác minh can thiệp hoặc truy xuất quyết định bất thường), đường dẫn API backend sử dụng một Application Load Balancer (ALB) nội bộ riêng tư hoặc HTTPS adapter tương đương fronting hàm AI Engine Lambda container chạy bên trong các subnets private.
 
-Function URL duy nhất này được ánh xạ đằng sau phân phối CloudFront dưới dạng origin cho các hành vi dẫn đường `/v1/*`. Frontend gửi các yêu cầu HTTPS trực tiếp tới CloudFront (dưới dạng các tuyến đường như `POST /v1/decide`, `POST /v1/verify`, `GET /v1/status/{id}`, và `POST /v1/audit/{audit_id}/rollback`), cổng gateway sẽ xác thực các Cognito JWT session token tại ranh giới CloudFront/Lambda@Edge trước khi chuyển tiếp yêu cầu đến Function URL của AI Engine Lambda.
+ALB riêng tư này hiển thị các endpoint HTTPS `/v1/*` (bao gồm `/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, và `/health`) sử dụng xác thực AWS SigV4. Dashboard frontend định tuyến các yêu cầu thông qua CloudFront, nơi xác thực các Cognito JWT session token tại ranh giới CloudFront/Lambda@Edge trước khi chuyển tiếp các yêu cầu một cách an toàn tới ALB nội bộ bên trong VPC.
 
-Tất cả các hàm Lambda khác do CDO sở hữu (như Lambda Thu nhận, Lambda Trạng thái, và Lambda Ngăn chặn) đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions; các hàm này không có endpoint công khai hoặc Function URL riêng biệt. Mô hình endpoint serverless này loại bỏ chi phí vận hành API Gateway vật lý và vượt qua giới hạn timeout 30 giây của API Gateway (cho phép thời gian thực thi lên đến 15 phút cho các vòng lặp xác minh đồng bộ).
+Các Function URL Lambda công khai trực tiếp hoặc các đường dẫn Step Functions-to-AI-Lambda bỏ qua kiểm soát đều bị nghiêm cấm. Việc thực thi rollback độc lập và được xử lý trực tiếp bởi CDO backend worker chạy các cấu hình boto3 đã cache từ bảng DynamoDB `finops-rollback-cache`, tách biệt khỏi tính khả dụng của AI Engine.
 
 
 ---
@@ -169,7 +169,7 @@ Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schem
     "proposed_action": "stop_instance",
     "execution_mode": "dry-run",
     "idempotency_key": "tenant-uuid-1111-2222-3333:2026-06-22:daily_batch",
-    "audit_record_uri": "s3://company-cdo-telemetry/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
+    "audit_record_uri": "s3://company-cdo-123456789012-telemetry/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
   }
 }
 ```

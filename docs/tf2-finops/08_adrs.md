@@ -173,7 +173,7 @@
 
 ## ADR-010 - AWS Lambda container image hosting for AI Engine inference
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-021
 - **Date**: 2026-06-24
 - **Context**: The AI Engine provided by the AIOps team is packaged as a containerized python application requiring CPU/memory flexibility, isolated execution, and network security. The previous decision to use ECS Fargate (ADR-007) and Fargate Spot capacity providers (ADR-008) introduced shared fixed platform costs (idle compute, load balancing) and operational complexity (checkpointing, Spot interruptions).
 - **Decision**: Deploy and host a dedicated, per-CDO instance of the AI Engine container workloads on AWS Lambda using container images, rather than sharing a single host ONCE across the Task Force. This CDO hosts its own endpoint/platform utilizing Lambda Container images built from the ECR repository provided by the AIOps team. The deployment utilizes ECR image digest pinning (pinning specific image SHA digests in Terraform) to guarantee execution immutability. CDO implements SQS buffering for reliable asynchronous execution and configures Lambda reserved concurrency limits (capped to a safe execution ceiling) to prevent scaling spikes from throttling other resources, maintain private network boundaries, and control the operational blast radius.
@@ -213,7 +213,7 @@
 
 ## ADR-012 - Direct Lambda/SQS AI Engine invocation over Private API Gateway
 
-- **Status**: Superseded by ADR-018
+- **Status**: Superseded by ADR-018 and ADR-021
 - **Date**: 2026-06-24
 - **Context**: The current CDO flow is a scheduled batch workflow driven by EventBridge Scheduler and Step Functions. The AI API contract v1.1 requires `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` logical contract semantics, but the architecture does not need a separate Private REST API Gateway when Step Functions is the only orchestrating caller.
 - **Decision**: Avoid deploying a physical Private REST API Gateway for the default scheduled batch workflow, since Step Functions acts as the sole orchestrating caller. Instead, the contract's `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, and `/v1/verify` interfaces are implemented purely as logical contract semantics. Under the hood, Step Functions invokes the AI Engine Request Lambda directly for `/v1/detect`, which validates the payload and queues it in SQS, returning a fast execution token. The AI Engine Worker Lambda processes the queue asynchronously, storing findings in DynamoDB and S3. The Step Functions workflow polls `/v1/status/{correlation_id}` until completed, then invokes `/v1/decide` to generate the remediation plan, executes any approved containment actions, and invokes `/v1/verify` to validate the outcome. The rollback endpoint `/v1/audit/{audit_id}/rollback` is called for manual reversions. Private API Gateway is rejected in the baseline CDO platform to reduce unnecessary overhead, remaining only as an optional design choice for future multi-client deployments.
@@ -283,7 +283,7 @@
 
 ## ADR-016 - S3 authoritative audit and idempotency store
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-022 for hot-path idempotency
 - **Date**: 2026-06-25
 - **Context**: Our compliance requirements demand hardware-enforced immutability (WORM) for audit trails, while our scheduled runs require an idempotency guardrail to avoid double-processing. We need to define the authoritative storage system for these features.
 - **Decision**: Designate S3 as the authoritative source of truth for both compliance audit records (stored in S3 with Object Lock enabled for WORM compliance) and idempotency locks (stored as S3 objects under `s3://company-cdo-telemetry/idempotency/` with a 24-hour lifecycle expiration policy). DynamoDB is demoted to a non-authoritative read-cache / dashboard query view. This supersedes the DynamoDB audit trail portions of ADR-006.
@@ -300,7 +300,7 @@
 
 ## ADR-017 - Lambda Function URLs for dashboard backend API endpoints
 
-- **Status**: Superseded by ADR-018
+- **Status**: Superseded by ADR-018 and ADR-021
 - **Date**: 2026-06-25
 - **Context**: The CDO platform requires secure, authenticated HTTP/HTTPS endpoints for interactive dashboard controls (e.g., manual rollbacks or remediation verification) to trigger backend Containment and State Lambdas. We must decide between provisioning an AWS API Gateway (HTTP API) or utilizing native AWS Lambda Function URLs.
 - **Decision**: Deploy **AWS Lambda Function URLs** to expose the backend Containment and State Lambdas directly. Secure these endpoints by routing them through the CloudFront distribution and validating Cognito session tokens (JWT) using the existing `Lambda@Edge` authentication gateway or inside the target Lambda code.
@@ -317,7 +317,7 @@
 
 ## ADR-018 - Single AIOps Lambda container serves AI API contract operations
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-021
 - **Date**: 2026-06-25
 - **Context**: Previous architecture documentation implied a split Request/Worker Lambda model with SQS buffering for AI Engine anomaly detection, and also suggested separate API Gateway backend functions for the interactive dashboard actions. The platform requires architectural consistency, simplification of deployment, and clear division of responsibility between the CDO platform team and the AIOps model team.
 - **Decision**: Align the CDO platform integration to target a single AIOps-provided ECR image deployed as one AWS Lambda container function. This singular runtime hosts all logical contract operations (`/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, and `/health`). CDO manages the hosting platform (VPC networking, ECR image digest pinning, IAM execution roles, reserved concurrency limits, and monitoring), while AIOps owns the container logic (the model, API logic, confidence scores, and explanations). SQS and DLQ are completely removed from the AI Engine execution loop and are used solely as retry buffers for alert routing. To support interactive dashboard actions, the AI Engine Lambda function is exposed via a secure AWS Lambda Function URL mapped behind the unified CloudFront distribution under the `/v1/*` path behavior. All other CDO-owned Lambdas (Ingestion, State, and Containment) are strictly internal functions orchestrated by the Step Functions workflow and do not have public endpoints or separate Function URLs.
@@ -334,7 +334,7 @@
 
 ## ADR-019 - CUR-primary detection with conditional Cost Explorer fallback
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR-023 for S3 bucket naming convention
 - **Date**: 2026-06-25
 - **Context**: The AI API contract v1.3.0 changed `aws_cost_explorer_daily` from an always-required input to a conditional fallback used only when CUR is delayed. The CDO platform also needs globally unique telemetry bucket names so multiple CDO teams can deploy in parallel without S3 name collisions.
 - **Decision**: Use CUR data in S3 as the default scheduled detection source. Set `telemetry_delay_event = true` and include Cost Explorer daily data only when CUR is not finalized within the accepted 36-hour data timestamp window. Enforce telemetry object URIs under `s3://tf2-cdo{NN}-telemetry-{region}/...json.gz`.
@@ -367,6 +367,53 @@
   - Let AI Engine execute rollback directly: Rejected because CDO owns member-account credentials and containment permissions.
   - Call AI Engine to regenerate rollback instructions during rollback: Rejected because rollback must still work when AI Engine is unavailable.
   - Keep a flat 1 percent lock threshold for every environment: Rejected because v1.3.0 explicitly disables auto-lock in dev/sandbox and raises staging tolerance to 10 percent.
+
+---
+
+## ADR-021 - Lambda container hosting behind private internal ALB for AI Engine endpoints
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The AI Engine container function must satisfy the signed contracts (`docs/contracts/ai-api-contract.md` v1.4.0, `deployment-contract.md` v1.3.0). The previous design (ADR-010, ADR-012, ADR-018) relied on direct synchronous Lambda invocations, public Lambda Function URLs under CloudFront, or SQS buffering for async execution. This is not contract-compliant and poses private networking risks.
+- **Decision**: Host the AWS Lambda container function as the compute target behind a private internal ALB (Application Load Balancer) or equivalent private HTTPS adapter inside private subnets of the VPC. This exposes the private HTTPS endpoint `/v1/*` (exposing `/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, and `/health`). CDO calls this private endpoint using AWS SigV4 signatures, ensuring all traffic stays within the private network. Public Function URLs and direct Lambda invocations are removed from the baseline path.
+- **Consequence**:
+  - Pro: Fully compliant with `deployment-contract.md` v1.3.0 and `ai-api-contract.md` v1.4.0.
+  - Pro: Zero public internet exposure for the AI Engine compute.
+  - Pro: Enforces standardized HTTPS routing and headers (`X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, and `X-Dry-Run-Mode`) at the ALB facade.
+  - Trade-off: Introduces fixed ALB cost (~$16.20/month) and VPC routing complexity.
+- **Alternatives considered**:
+  - Keep Public Lambda Function URL: Rejected due to security requirements of keeping AI Engine compute completely private and protected under SigV4 within the VPC.
+
+---
+
+## ADR-022 - DynamoDB table for hot-path idempotency and rollback cache
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: ADR-016 defined S3 as the authoritative idempotency store. However, S3 PutObject write and check latency (~50-200ms) compromises the P99 performance target (<300ms) of `/v1/detect`. Furthermore, the new contract requires the CDO to cache `rollback_payload.boto3_equivalent` immediately after `/v1/decide` to execute offline rollbacks using boto3 independently of the AI Engine's availability.
+- **Decision**: Implement DynamoDB table `finops-idempotency-{env}` with a 24-hour TTL and conditional writes as the hot path for scheduled run idempotency. S3 remains the storage for compliance audit trails. Implement DynamoDB table `finops-rollback-cache` (with a 90-day TTL) to store the boto3 rollback payload configuration immediately after `/v1/decide`, enabling CDO-owned, AI-independent rollback execution via boto3.
+- **Consequence**:
+  - Pro: Low latency (~5-15ms) for idempotency checks, meeting the P99 <300ms SLA for `/v1/detect`.
+  - Pro: Guarantees rollback execution capability even if the AI Engine is unavailable during an incident.
+  - Pro: Rollback operations use the SQS queue `finops-watch-rollback` strictly for audit completion notifications rather than a command queue.
+  - Trade-off: CDO must secure the DynamoDB rollback cache since it contains executable IAM/Boto3 intents.
+- **Alternatives considered**:
+  - S3 for idempotency: Rejected because S3 request latency is too high to guarantee P99 <300ms for `/v1/detect`.
+
+---
+
+## ADR-023 - Account-scoped telemetry bucket naming convention
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: ADR-019 used the pattern `s3://tf2-cdo{NN}-telemetry-{region}/` for S3 telemetry data. This is legacy and conflicts with the new contract which requires globally unique account-scoped S3 buckets to prevent `BucketAlreadyExists` collisions during parallel multi-tenant infrastructure deployment.
+- **Decision**: Standardize on the account-scoped bucket naming convention `s3://company-cdo-{account_id}-telemetry/` as the primary telemetry and audit store. The legacy pattern is deprecated. Implement namespace prefixes inside this bucket when multiple CDOs share the same AWS account.
+- **Consequence**:
+  - Pro: Prevents bucket naming collisions.
+  - Pro: Aligns with the telemetry-contract.md v3.2.0 naming guidelines.
+- **Alternatives considered**:
+  - Keep legacy bucket naming: Rejected to prevent deployment conflicts in production environments.
+
 
 
 

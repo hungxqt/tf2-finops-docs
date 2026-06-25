@@ -172,7 +172,7 @@
 
 ## ADR-010 - Host thời gian chạy suy luận AI Engine trên AWS Lambda container (AWS Lambda container image hosting for AI Engine inference)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-021
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: AI Engine do nhóm AIOps cung cấp được đóng gói dưới dạng ứng dụng python container hóa, yêu cầu sự linh hoạt về CPU/memory, thực thi độc lập, và bảo mật mạng. Quyết định trước đó sử dụng ECS Fargate (ADR-007) và capacity provider Fargate Spot (ADR-008) phát sinh chi phí nền tảng cố định dùng chung (máy chủ chạy nhàn rỗi, bộ cân bằng tải) và tăng độ phức tạp vận hành (ghi nhận checkpoint, gián đoạn Spot).
 - **Quyết định (Decision)**: Triển khai và host một instance độc lập, dành riêng cho mỗi CDO (per-CDO) của workload container AI Engine trên AWS Lambda sử dụng container images, thay vì chia sẻ một host duy nhất (shared host ONCE) trong toàn bộ Task Force. CDO này tự vận hành endpoint/platform riêng của mình, sử dụng Lambda Container images được xây dựng từ kho lưu trữ ECR do nhóm AIOps bàn giao. Quy trình triển khai sử dụng cơ chế ghim digest ECR (bằng cách ghim mã SHA digest cụ thể của image trong Terraform) để đảm bảo tính bất biến khi thực thi. CDO triển khai bộ đệm SQS (SQS buffering) để thực thi tác vụ không đồng bộ một cách tin cậy và cấu hình giới hạn concurrency dành riêng cho Lambda (Lambda reserved concurrency limits) (giới hạn ở trần thực thi an toàn) nhằm ngăn ngừa đột biến quy mô làm nghẽn các tài nguyên khác, duy trì ranh giới mạng riêng tư, và kiểm soát phạm vi ảnh hưởng (blast radius) vận hành.
@@ -212,7 +212,7 @@
 
 ## ADR-012 - Gọi trực tiếp Lambda/SQS cho AI Engine thay vì qua Private API Gateway (Direct Lambda/SQS AI Engine invocation over Private API Gateway)
 
-- **Trạng thái (Status)**: Superseded by ADR-018
+- **Trạng thái (Status)**: Superseded by ADR-018 and ADR-021
 - **Ngày (Date)**: 2026-06-24
 - **Bối cảnh (Context)**: Luồng chạy CDO hiện tại là một quy trình xử lý theo lô (batch workflow) được lập lịch, điều phối bởi EventBridge Scheduler và Step Functions. Hợp đồng API v1.1 của AI yêu cầu các ngữ nghĩa hợp đồng logic `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback`, nhưng kiến trúc không cần đến một Private REST API Gateway riêng biệt khi Step Functions là caller điều phối duy nhất.
 - **Quyết định (Decision)**: Tránh triển khai một Private REST API Gateway vật lý cho luồng chạy lô (batch workflow) lập lịch mặc định, do Step Functions đóng vai trò là caller điều phối duy nhất. Thay vào đó, các giao diện `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, và `/v1/verify` được triển khai thuần túy dưới dạng ngữ nghĩa hợp đồng logic (logical contract semantics). Dưới hạ tầng, Step Functions gọi trực tiếp AI Engine Request Lambda cho `/v1/detect`, hàm này xác thực dữ liệu và đẩy vào hàng đợi SQS để trả về token thực thi nhanh. AI Engine Worker Lambda sẽ xử lý bất đồng bộ hàng đợi, lưu kết quả phát hiện bất thường vào DynamoDB và S3. Quy trình Step Functions thực hiện polling `/v1/status/{correlation_id}` cho đến khi hoàn tất, sau đó gọi `/v1/decide` để lập kế hoạch can thiệp, thực thi các hành động can thiệp đã phê duyệt, và gọi `/v1/verify` để xác minh kết quả. Endpoint rollback `/v1/audit/{audit_id}/rollback` được gọi khi cần hoàn tác thủ công. Private API Gateway bị từ chối trong nền tảng CDO cơ sở để giảm tải chi phí và độ phức tạp dư thừa, chỉ tồn tại như một lựa chọn thiết kế tùy chọn cho việc triển khai đa client trong tương lai.
@@ -282,7 +282,7 @@
 
 ## ADR-016 - Kho lưu trữ kiểm toán và idempotency có thẩm quyền trên S3 (S3 authoritative audit and idempotency store)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-022 for hot-path idempotency
 - **Ngày (Date)**: 2026-06-25
 - **Bối cảnh (Context)**: Các yêu cầu tuân thủ của chúng tôi đòi hỏi tính bất biến được thực thi bằng phần cứng (WORM) cho nhật ký kiểm toán, trong khi các lượt chạy theo lịch trình của chúng tôi yêu cầu một rào chắn idempotency để tránh xử lý trùng lặp. Chúng tôi cần xác định hệ thống lưu trữ có thẩm quyền cho các tính năng này.
 - **Quyết định (Decision)**: Chỉ định S3 là nguồn sự thật có thẩm quyền (authoritative source of truth) cho cả hồ sơ kiểm toán tuân thủ (được lưu trữ trong S3 có bật Object Lock để tuân thủ WORM) và các khóa idempotency (được lưu trữ dưới dạng các đối tượng S3 dưới `s3://company-cdo-telemetry/idempotency/` với chính sách hết hạn vòng đời 24 giờ). DynamoDB bị hạ cấp xuống thành một cache đọc / view truy vấn dashboard không có thẩm quyền. Quyết định này thay thế các phần về nhật ký kiểm toán trên DynamoDB của ADR-006.
@@ -299,7 +299,7 @@
 
 ## ADR-017 - Sử dụng AWS Lambda Function URL cho các API endpoint của backend dashboard (Lambda Function URLs for dashboard backend API endpoints)
 
-- **Trạng thái (Status)**: Superseded by ADR-018
+- **Trạng thái (Status)**: Superseded by ADR-018 and ADR-021
 - **Ngày (Date)**: 2026-06-25
 - **Bối cảnh (Context)**: Nền tảng CDO yêu cầu các endpoint HTTP/HTTPS bảo mật, được xác thực để phục vụ các hành động tương tác trên dashboard (ví dụ: kích hoạt rollback thủ công hoặc xác minh can thiệp) nhằm gọi các hàm Containment Lambda và State Lambda ở backend. Chúng tôi cần quyết định giữa việc triển khai AWS API Gateway (HTTP API) hoặc sử dụng tính năng AWS Lambda Function URL gốc.
 - **Quyết định (Decision)**: Triển khai **AWS Lambda Function URL** để cung cấp trực tiếp các endpoint cho các hàm Containment Lambda và State Lambda ở backend. Bảo mật các endpoint này bằng cách định tuyến chúng qua phân phối CloudFront hiện tại và xác thực Cognito session token (JWT) thông qua cổng auth `Lambda@Edge` có sẵn hoặc xác thực trực tiếp trong mã nguồn Lambda.
@@ -316,7 +316,7 @@
 
 ## ADR-018 - Sử dụng một container Lambda duy nhất của AIOps để phục vụ các hoạt động hợp đồng AI API (Single AIOps Lambda container serves AI API contract operations)
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-021
 - **Ngày (Date)**: 2026-06-25
 - **Bối cảnh (Context)**: Các tài liệu kiến trúc trước đây đã đề xuất mô hình phân tách hàm Request/Worker Lambda với cơ chế đệm SQS cho việc phát hiện bất thường của AI Engine, đồng thời gợi ý sử dụng các hàm backend API Gateway riêng biệt cho các tương tác trên dashboard. Hệ thống yêu cầu sự nhất quán về mặt kiến trúc, đơn giản hóa quy trình triển khai và phân định rõ ràng trách nhiệm giữa đội ngũ nền tảng CDO và đội ngũ mô hình AIOps.
 - **Quyết định (Decision)**: Nhất quán hóa việc tích hợp nền tảng CDO để hướng tới một hình ảnh ECR duy nhất do AIOps cung cấp được triển khai dưới dạng một hàm Lambda container của AWS. Môi trường chạy duy nhất này sẽ phục vụ tất cả các hoạt động hợp đồng logic (`/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, và `/health`). CDO quản lý nền tảng hosting (mạng VPC, ghim mã băm hình ảnh ECR digest, vai trò thực thi IAM, giới hạn reserved concurrency, và giám sát), trong khi AIOps sở hữu logic bên trong container (mô hình, logic API, điểm số tin cậy và các văn bản giải thích). SQS và DLQ hoàn toàn bị loại bỏ khỏi vòng lặp thực thi của AI Engine và chỉ được sử dụng làm vùng đệm retry cho alert routing. Để hỗ trợ các hành động tương tác trên dashboard, hàm Lambda của AI Engine được công khai qua một AWS Lambda Function URL bảo mật được ánh xạ đằng sau phân phối CloudFront duy nhất dưới dạng hành vi dẫn đường `/v1/*`. Tất cả các hàm Lambda khác do CDO sở hữu (Lambda Thu nhận, Lambda Trạng thái, và Lambda Ngăn chặn) đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions và không có endpoint công khai hoặc Function URL riêng biệt.
@@ -333,7 +333,7 @@
 
 ## ADR-019 - Phát hiện dựa trên CUR là chính kết hợp dự phòng có điều kiện qua Cost Explorer
 
-- **Trạng thái (Status)**: Accepted
+- **Trạng thái (Status)**: Superseded by ADR-023 for S3 bucket naming convention
 - **Ngày (Date)**: 2026-06-25
 - **Bối cảnh (Context)**: Hợp đồng AI API v1.3.0 thay đổi `aws_cost_explorer_daily` từ đầu vào luôn bắt buộc thành phương án dự phòng có điều kiện chỉ được sử dụng khi dữ liệu CUR bị trễ. Nền tảng CDO cũng cần các tên bucket đo lường độc nhất trên toàn cầu để nhiều nhóm CDO có thể triển khai song song mà không bị xung đột tên S3.
 - **Quyết định (Decision)**: Sử dụng dữ liệu CUR trong S3 làm nguồn phát hiện mặc định theo lịch trình. Thiết lập `telemetry_delay_event = true` và chỉ đưa dữ liệu hàng ngày của Cost Explorer vào khi CUR không được hoàn tất trong vòng 36 giờ được chấp nhận của timestamp dữ liệu. Thực thi các URI đối tượng đo lường dưới dạng `s3://tf2-cdo{NN}-telemetry-{region}/...json.gz`.
@@ -366,3 +366,49 @@
   - Để AI Engine thực thi rollback trực tiếp: Bị từ chối vì CDO sở hữu thông tin xác thực tài khoản thành viên và quyền containment.
   - Gọi AI Engine để tạo lại hướng dẫn rollback trong khi thực hiện rollback: Bị từ chối vì rollback vẫn phải hoạt động được ngay cả khi AI Engine ngoại tuyến.
   - Giữ nguyên một ngưỡng khóa 1% khóa phẳng cho tất cả môi trường: Bị từ chối vì v1.3.0 loại bỏ rõ ràng tự động khóa ở dev/sandbox và tăng dung sai của staging lên 10%.
+
+---
+
+## ADR-021 - Host Lambda container đằng sau private internal ALB cho các endpoint AI Engine (Lambda container hosting behind private internal ALB for AI Engine endpoints)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Hàm container của AI Engine phải thỏa mãn các hợp đồng đã ký (`docs/contracts/ai-api-contract.md` v1.4.0, `deployment-contract.md` v1.3.0). Thiết kế trước đây (ADR-010, ADR-012, ADR-018) dựa trên gọi trực tiếp Lambda đồng bộ, AWS Lambda Function URL công khai đằng sau CloudFront, hoặc đệm SQS để thực thi bất đồng bộ. Điều này không tuân thủ hợp đồng và gây ra rủi ro mạng riêng tư.
+- **Quyết định (Decision)**: Host hàm Lambda container của AWS làm mục tiêu tính toán (compute target) đằng sau một ALB (Application Load Balancer) nội bộ riêng tư (private internal ALB) hoặc adapter HTTPS riêng tư tương đương bên trong các subnet riêng tư của VPC. Cổng này công khai endpoint HTTPS riêng tư `/v1/*` (bao gồm `/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, và `/health`). CDO gọi endpoint riêng tư này bằng chữ ký AWS SigV4, đảm bảo toàn bộ lưu lượng nằm trong mạng riêng tư. Lambda Function URL công khai và gọi trực tiếp Lambda bị loại bỏ khỏi luồng cơ sở.
+- **Hệ quả (Consequence)**:
+  - Pro: Hoàn toàn tuân thủ với `deployment-contract.md` v1.3.0 và `ai-api-contract.md` v1.4.0.
+  - Pro: Bằng 0 tiếp xúc internet công cộng cho tài nguyên tính toán của AI Engine.
+  - Pro: Thực thi định tuyến HTTPS chuẩn hóa và các header bắt buộc (`X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, và `X-Dry-Run-Mode`) tại mặt tiền ALB.
+  - Trade-off: Phát sinh chi phí ALB cố định (~16.20 USD/tháng) và độ phức tạp định tuyến VPC.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Giữ Lambda Function URL công khai: Bị từ chối do các yêu cầu bảo mật bắt buộc giữ tài nguyên AI Engine hoàn toàn riêng tư và được bảo vệ bằng SigV4 trong VPC.
+
+---
+
+## ADR-022 - Bảng DynamoDB cho hot-path idempotency và bộ đệm rollback (DynamoDB table for hot-path idempotency and rollback cache)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: ADR-016 định nghĩa S3 là kho lưu trữ idempotency có thẩm quyền. Tuy nhiên, độ trễ ghi và kiểm tra PutObject của S3 (~50-200ms) ảnh hưởng đến mục tiêu hiệu năng P99 (<300ms) của `/v1/detect`. Hơn nữa, hợp đồng mới yêu cầu CDO phải đệm `rollback_payload.boto3_equivalent` ngay sau khi gọi `/v1/decide` để thực thi rollback offline bằng boto3 độc lập với tính sẵn sàng của AI Engine.
+- **Quyết định (Decision)**: Triển khai bảng DynamoDB `finops-idempotency-{env}` với TTL 24 giờ và conditional write làm hot path cho idempotency của các lượt chạy theo lịch trình. S3 vẫn là kho lưu trữ nhật ký kiểm toán tuân thủ. Triển khai bảng DynamoDB `finops-rollback-cache` (với TTL 90 ngày) để lưu cấu hình rollback payload boto3 ngay sau `/v1/decide`, cho phép CDO tự thực thi rollback qua boto3 độc lập với AI Engine.
+- **Hệ quả (Consequence)**:
+  - Pro: Độ trễ thấp (~5-15ms) cho kiểm tra idempotency, đáp ứng SLA P99 <300ms cho `/v1/detect`.
+  - Pro: Đảm bảo khả năng thực thi rollback ngay cả khi AI Engine ngoại tuyến trong quá trình xử lý sự cố.
+  - Pro: Hoạt động rollback sử dụng hàng đợi SQS `finops-watch-rollback` nghiêm ngặt cho thông báo hoàn tất kiểm toán thay vì hàng đợi lệnh.
+  - Trade-off: CDO phải bảo mật bộ đệm rollback trên DynamoDB vì nó chứa các lệnh thực thi IAM/Boto3.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Dùng S3 cho idempotency: Bị từ chối vì độ trễ yêu cầu S3 quá cao để đảm bảo P99 <300ms cho `/v1/detect`.
+
+---
+
+## ADR-023 - Quy ước đặt tên bucket telemetry theo tài khoản AWS (Account-scoped telemetry bucket naming convention)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: ADR-019 sử dụng mẫu `s3://tf2-cdo{NN}-telemetry-{region}/` cho dữ liệu telemetry S3. Đây là quy ước cũ và xung đột với hợp đồng mới yêu cầu các bucket S3 duy nhất toàn cầu và gắn với tài khoản AWS để tránh xung đột `BucketAlreadyExists` khi triển khai hạ tầng song song đa người thuê.
+- **Quyết định (Decision)**: Chuẩn hóa quy ước đặt tên bucket theo tài khoản AWS `s3://company-cdo-{account_id}-telemetry/` làm kho lưu trữ telemetry và kiểm toán chính. Quy ước cũ bị bãi bỏ. Triển khai tiền tố namespace bên trong bucket này khi nhiều CDO dùng chung một tài khoản AWS.
+- **Hệ quả (Consequence)**:
+  - Pro: Ngăn ngừa xung đột đặt tên bucket.
+  - Pro: Nhất quán với hướng dẫn đặt tên trong telemetry-contract.md v3.2.0.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - Giữ nguyên quy ước đặt tên bucket cũ: Bị từ chối để tránh xung đột triển khai trên các môi trường sản xuất.

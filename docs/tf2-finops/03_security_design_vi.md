@@ -10,29 +10,32 @@
 
 CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API đều được định tuyến nội bộ qua AWS VPC Endpoints.
 
-Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Bộ điều phối Step Functions gọi trực tiếp hàm AI Engine Lambda một cách đồng bộ. Lưu ý rằng `/v1/detect`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback` đại diện cho ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai, vì không có Private API Gateway nào được triển khai. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên. SQS/DLQ chỉ được sử dụng cho hàng đợi retry của alert routing chứ không nằm trong luồng phát hiện.
+Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Bộ điều phối Step Functions tương tác với hàm AI Engine Lambda (chạy trong môi trường thực thi container riêng tư) thông qua Application Load Balancer (ALB) nội bộ riêng tư hoặc HTTPS adapter tương đương sử dụng chữ ký AWS SigV4. Các endpoint riêng tư `/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, và `/health` được hiển thị đầy đủ thông qua đích compute ALB riêng tư an toàn này. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên. SQS/DLQ chỉ được sử dụng cho hàng đợi retry của alert routing chứ không nằm trong luồng phát hiện.
 
 ```mermaid
 graph TD
     subgraph "CDO Management Account VPC (ap-southeast-1)"
         subgraph "Private Subnets (Serverless Compute)"
-            AILambda[AI Engine Lambda Function]
             L_Pull[Ingestion Lambda]
             L_Cont[Containment Lambda]
             L_Alert[Alert Routing Lambda]
             SQSQueue[SQS Alert Queue]
+            ALB[Private Internal ALB / HTTPS Adapter]
+            AILambda[AI Engine Lambda Function]
         end
 
         subgraph "VPC Endpoint Subnet"
-            VPCE[VPC Endpoints: S3, ECR, KMS, Logs, STS, Secrets, Lambda]
+            VPCE[VPC Endpoints: S3, DynamoDB, ECR, KMS, Logs, STS, Secrets]
         end
     end
 
     subgraph "External Storage & Services"
         S3Raw[(S3 Raw Zone)]
         S3Cur[(S3 Curated Zone)]
-        S3Audit[(S3 Authoritative Audit & Idempotency Store)]
-        DDB[(DynamoDB Dashboard Cache)]
+        S3Audit[(S3 Authoritative Audit Store)]
+        DDB_Idemp[(DynamoDB finops-idempotency-{env})]
+        DDB_Rollback[(DynamoDB finops-rollback-cache)]
+        DDB_Dash[(DynamoDB Dashboard Cache)]
         SM[Secrets Manager]
     end
 
@@ -40,6 +43,8 @@ graph TD
     L_Pull -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| S3Raw
     VPCE -->|Private link| S3Cur
+    L_Pull -->|HTTPS SigV4| ALB
+    ALB -->|Forward API request| AILambda
     L_Cont -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| S3Audit
     L_Alert -->|Enqueue retry| SQSQueue
@@ -51,7 +56,7 @@ graph TD
     VPCE -->|Private link| S3Cur
 ```
 
-*Chú thích: Hàm AI Engine Lambda, cùng các hàm Lambda điều phối và adapter dữ liệu, được triển khai trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface/Gateway Endpoints (PrivateLink) riêng biệt để kết nối tới các dịch vụ AWS, ngăn chặn mọi luồng truyền tải dữ liệu qua mạng internet công cộng. Không có Private API Gateway nào được triển khai; Step Functions gọi trực tiếp hàm AI Engine Lambda một cách đồng bộ. SQS/DLQ chỉ được sử dụng cho hàng đợi retry của alert routing chứ không nằm trong luồng phát hiện.*
+*Chú thích: Hàm AI Engine Lambda, Application Load Balancer (ALB), và các tác vụ compute nền tảng khác chạy trong các subnets chỉ có quyền private. Các thành phần này sử dụng các AWS VPC Interface/Gateway Endpoints (PrivateLink) riêng biệt để kết nối tới các dịch vụ AWS một cách riêng tư. Step Functions và compute nền tảng truy cập AI Engine thông qua ALB nội bộ bằng HTTPS và xác thực AWS SigV4. SQS/DLQ chỉ được sử dụng cho hàng đợi retry của alert routing chứ không nằm trong luồng phát hiện.*
 
 ### 1.2 Security Groups
 
@@ -59,8 +64,9 @@ Luồng traffic giữa các thành phần compute được kiểm soát thông q
 
 | SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `lambda-sg` | None (Gọi trực tiếp qua dịch vụ thực thi programmatic) | TCP 443 (đến `vpce-sg`) | Các hàm Lambda Ingestion, Containment, Alert Routing, và AI Engine Lambda |
-| `vpce-sg` | TCP 443 (từ `lambda-sg`) | None | VPC endpoints (S3, ECR, Secrets Mgr, KMS, Logs, STS, Lambda) |
+| `alb-sg` | TCP 443 (từ orchestration/compute) | TCP 8080 (đến `lambda-sg`) | Private Internal ALB / HTTPS Adapter |
+| `lambda-sg` | TCP 8080 (chỉ từ `alb-sg`, cho AI Engine Lambda) | TCP 443 (đến `vpce-sg`) | Các hàm Lambda Ingestion, Containment, Alert Routing, và AI Engine Lambda |
+| `vpce-sg` | TCP 443 (từ `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr, KMS, Logs, STS) |
 
 ### 1.3 Network ACL / VPC Endpoint
 
@@ -87,9 +93,9 @@ Các IAM service roles trong AWS thực thi sự phân tách trách nhiệm nghi
 
 | Role | Used by | Permissions |
 |---|---|---|
-| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
+| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution` |
 | `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (trên CUR S3 bucket của tài khoản đích), `s3:PutObject` (trên raw S3 bucket), `ce:GetCostAndUsage` |
-| `FinOpsAiExecutionRole` | AI Engine Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `s3:GetObject` (đọc dữ liệu chi phí từ curated S3 bucket), `s3:PutObject` / `s3:GetObject` (đọc/ghi telemetry & kiểm toán tới S3 Authoritative store), `dynamodb:PutItem` / `dynamodb:UpdateItem` (ghi bộ nhớ đệm read cache tới DynamoDB Dashboard Cache, nếu áp dụng) |
+| `FinOpsAiExecutionRole` | AI Engine Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (qua SDK), `s3:GetObject` (đọc dữ liệu chi phí từ curated S3 bucket), `s3:PutObject` / `s3:GetObject` (đọc/ghi telemetry & kiểm toán tới S3 Authoritative store), `dynamodb:PutItem` / `dynamodb:UpdateItem` / `dynamodb:GetItem` (Ghi điều kiện DynamoDB trên `finops-idempotency-{env}` và đọc/ghi tới `finops-rollback-cache` và DynamoDB Dashboard Cache) |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Cấu hình explicit deny cho các quyền `iam:*`, `s3:Delete*`, và xóa tài nguyên prod. |
 
 > [!IMPORTANT]
@@ -144,10 +150,10 @@ Kiểm soát truy cập cho Bảng điều khiển Tài chính tĩnh S3 + CloudF
 ### 2.6 Tiêu chuẩn đặt tên Bucket S3 & Các chế độ truy cập IAM (S3 Telemetry Bucket Naming & IAM Access Modes)
 
 Để lưu trữ dữ liệu đo lường vận hành (telemetry), bằng chứng bất thường trung gian, và nhật ký kiểm toán, các S3 bucket tuân theo quy tắc đặt tên chuẩn hóa sau:
-- `tf2-cdo{NN}-telemetry-{region}` (trong đó `{NN}` đại diện cho số hiệu nhóm/tenant, và `{region}` đại diện cho vùng triển khai AWS, ví dụ: `ap-southeast-1`).
+- `company-cdo-{account_id}-telemetry` (trong đó `{account_id}` đại diện cho ID tài khoản AWS của thành viên).
 
 Việc truy cập các telemetry bucket này giữa các tài khoản hỗ trợ hai chế độ cấu hình IAM riêng biệt:
-1. **Chế độ per-CDO (Mặc định - per-CDO Mode)**: Mô hình cách ly nghiêm ngặt, đơn bên (single-tenant), trong đó mỗi thực thể CDO platform có quyền đọc/ghi chuyên dụng được giới hạn riêng cho bucket thuộc nhóm của mình (`tf2-cdo{NN}-telemetry-{region}`).
+1. **Chế độ per-CDO (Mặc định - per-CDO Mode)**: Mô hình cách ly nghiêm ngặt, đơn bên (single-tenant), trong đó mỗi thực thể CDO platform có quyền đọc/ghi chuyên dụng được giới hạn riêng cho bucket thuộc tài khoản của mình (`company-cdo-{account_id}-telemetry`).
 2. **Chế độ khung chia sẻ (Shared Skeleton Mode)**: Mô hình điều phối đa bên (multi-tenant) cho phép chia sẻ dữ liệu telemetry chéo tài khoản. Quyền truy cập được quản lý thông qua:
    - Một chính sách tài nguyên S3 chứa ký tự đại diện (wildcard) được giới hạn bởi các điều kiện AWS (AWS conditions) cho các OU cụ thể của tổ chức.
    - Hoặc gọi chéo tài khoản `STS AssumeRole` đi kèm với một mã định danh ngoại (ExternalId) được tạo động dựa trên tiêu đề `X-Tenant-Id` của tenant, đảm bảo ranh giới thuê bao nghiêm ngặt trong quá trình thu thập dữ liệu đa tài khoản.
@@ -168,39 +174,70 @@ Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, hàm AI Engine Lambda không lấy static API keys từ Secrets Manager. Thay vào đó, hàm AI Engine Lambda sẽ xác thực độ toàn vẹn yêu cầu và độ lệch thời gian trực tiếp từ các cross-cutting headers.
+Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, private ALB/HTTPS adapter sẽ xác thực thông tin đăng nhập của yêu cầu. Hàm AI Engine container xác thực tính toàn vẹn của yêu cầu, độ lệch thời gian và ranh giới thuê bao trực tiếp từ các tiêu đề chéo: `X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, và `X-Dry-Run-Mode`.
 
 Hệ thống áp dụng chính sách tách biệt về độ lệch thời gian (clock-skew split policy):
 1. **Độ lệch thời gian của yêu cầu API**: Độ lệch của tiêu đề `X-Request-Timestamp` được giới hạn nghiêm ngặt ở mức **300 giây** để chống lại các cuộc tấn công phát lại (replay attacks). Các yêu cầu nằm ngoài cửa sổ này sẽ tự động bị từ chối.
 2. **Độ trễ truyền dữ liệu CUR đầu vào**: Độ trễ thời gian lên tới **36 giờ** đối với dữ liệu chi phí (tệp xuất CUR trong S3) là bình thường và được chấp nhận do độ trễ cập nhật hóa đơn tiêu chuẩn của đám mây, và không kích hoạt lỗi xác thực độ lệch thời gian hay phát lại.
 
-Ví dụ, hàm container Lambda xác thực yêu cầu đi vào bằng đoạn mã logic Python sau:
+Các kiểm tra idempotency hot-path được thực hiện đối với bảng DynamoDB `finops-idempotency-{env}` sử dụng ghi điều kiện (conditional writes) và TTL 24 giờ (`ttl_expiry`), thay vì lưu trữ các khóa idempotency trong S3. S3/Object Lock được dành riêng cho các log kiểm toán dài hạn, telemetry sao lưu, và bằng chứng rollback.
+
+Ví dụ, hàm container Lambda xác thực yêu cầu đi vào và thực hiện DynamoDB conditional write bằng đoạn mã logic Python sau:
 
 ```python
 import time
 import hashlib
+import boto3
 from datetime import datetime
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource('dynamodb')
 
 def validate_request_integrity(event):
     headers = event.get("headers", {})
     body = event.get("body", "")
     
-    # 1. Verify Clock Skew (max 300s)
+    # 1. Verify Contract Headers
     req_timestamp_str = headers.get("X-Request-Timestamp")
-    if not req_timestamp_str:
-        return {"statusCode": 400, "body": "Missing X-Request-Timestamp"}
+    idempotency_key = headers.get("X-Idempotency-Key")
+    payload_hash = headers.get("X-Payload-SHA256")
+    tenant_id = headers.get("X-Tenant-Id")
+    dry_run_mode = headers.get("X-Dry-Run-Mode", "true")
+    
+    if not all([req_timestamp_str, idempotency_key, payload_hash, tenant_id]):
+        return {"statusCode": 400, "body": "Missing required contract headers"}
         
+    # 2. Verify Clock Skew (max 300s)
     req_time = datetime.fromisoformat(req_timestamp_str.replace("Z", "+00:00"))
     now = datetime.now(req_time.tzinfo)
     drift = abs((now - req_time).total_seconds())
     if drift > 300:
         return {"statusCode": 400, "body": "ERR_REPLAY_DETECTED: Clock skew > 300 seconds"}
         
-    # 2. Verify Payload Hash
-    payload_hash = headers.get("X-Payload-SHA256")
+    # 3. Verify Payload Hash
     calculated_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if payload_hash != calculated_hash:
-        return {"statusCode": 400, "body": "ERR_IDEMPOTENCY_MISMATCH: Hash mismatch"}
+        return {"statusCode": 400, "body": "ERR_PAYLOAD_MISMATCH: Hash mismatch"}
+        
+    # 4. DynamoDB Conditional Write (Idempotency Hot Path)
+    table = dynamodb.Table('finops-idempotency-prod')
+    ttl_expiry = int(time.time()) + 86400  # 24h TTL
+    
+    try:
+        table.put_item(
+            Item={
+                'idempotency_key': idempotency_key,
+                'payload_sha256': payload_hash,
+                'status': 'IN_PROGRESS',
+                'tenant_id': tenant_id,
+                'ttl_expiry': ttl_expiry
+            },
+            ConditionExpression='attribute_not_exists(idempotency_key)'
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            return {"statusCode": 409, "body": "ERR_IDEMPOTENCY_CONFLICT: Key already exists"}
+        raise e
         
     return {"statusCode": 200}
 ```
@@ -224,17 +261,17 @@ Toàn bộ dữ liệu của hệ thống được mã hóa tại chỗ (at rest
 
 | Dữ liệu (Data) | Nơi lưu trữ (Storage) | KMS key | Ghi chú |
 |---|---|---|---|
-| Dữ liệu chi phí Raw/Curated | S3 | `aws/s3` hoặc CMK tùy chỉnh | Bật tính năng S3 Bucket Key để giảm thiểu chi phí gọi KMS API. |
-| Run State Cache & Dashboard Cache | DynamoDB | `aws/dynamodb` hoặc CMK tùy chỉnh | Mã hóa sử dụng KMS. DynamoDB được hạ cấp thành lớp bộ đệm cache đọc cho dashboard. |
+| Dữ liệu chi phí Raw/Curated | S3 | `aws/s3` hoặc CMK tùy chỉnh | Bật tính năng S3 Bucket Key để giảm thiểu chi phí gọi KMS API. Giới hạn trong `company-cdo-{account_id}-telemetry`. |
+| Run State Cache & Dashboard Cache | DynamoDB | `aws/dynamodb` hoặc CMK tùy chỉnh | Mã hóa sử dụng KMS. Bao gồm `finops-idempotency-{env}` và `finops-rollback-cache`. |
 | Secrets Store | Secrets Manager | `finops-secrets-key` | Việc giải mã yêu cầu chính sách role trust rõ ràng. |
 | Lưu trữ tạm thời / Container Lambda | Bộ lưu trữ Lambda | `aws/lambda` hoặc CMK tùy chỉnh | Toàn bộ dung lượng lưu trữ tạm thời của hàm (bao gồm /tmp lên đến 10 GB) được mã hóa mặc định. |
-| Nhật ký kiểm toán & Idempotency Store | S3 Object Lock / S3 | `finops-audit-key` | Lưu trữ audit trên S3/Object Lock là đáng tin cậy nhất; lưu giữ tối thiểu 90 ngày. Kho lưu trữ idempotency có vòng đời tự xóa sau 24 giờ. |
+| Nhật ký kiểm toán & Idempotency Store | S3 Object Lock / S3 | `finops-audit-key` | Lưu trữ audit trên S3/Object Lock là đáng tin cậy nhất; lưu giữ tối thiểu 90 ngày. |
 
 ### 4.2 In Transit
 
 - **Yêu cầu TLS**: Tất cả traffic đi vào và đi ra đều yêu cầu mã hóa TLS 1.3 (với TLS 1.2 là phiên bản tối thiểu được chấp nhận).
 - **Traffic nội bộ**: Giao tiếp function-to-function và tin nhắn SQS được mã hóa hoàn toàn khi truyền tải natively bởi các dịch vụ AWS sử dụng TLS.
-- **Các cuộc gọi AI Engine**: Step Functions gọi trực tiếp hàm AI Engine Lambda nội bộ qua mạng riêng tư VPC. Payload yêu cầu bao gồm một phiên bản hợp đồng và ID tương quan, và payload sẽ được xác thực bên trong môi trường thực thi của hàm.
+- **Các cuộc gọi AI Engine**: Step Functions và compute nền tảng gọi endpoint ALB nội bộ riêng tư bằng HTTPS và xác thực AWS SigV4, định tuyến các yêu cầu tới hàm AI Engine Lambda trong private subnets. Payload yêu cầu bao gồm một phiên bản hợp đồng và ID tương quan, và payload sẽ được xác thực bên trong môi trường thực thi của hàm.
 - **Alert Webhook**: Tích hợp Slack hoặc email được gọi từ Lambda cảnh báo sau khi giảm thiểu payload. Dữ liệu chi phí nhạy cảm được liên kết thông qua các tham chiếu dashboard/audit nội bộ thay vì được nhúng trực tiếp vào các tin nhắn bên ngoài.
 
 ### 4.3 Key Management

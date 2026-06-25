@@ -19,16 +19,17 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **Compute - Lambda adapters** | $0.20/1M requests + $0.0000166667/GB-second | Puller, normalizer, router, containment, audit writer; 24h cadence | Variable per tenant; `Evidence needed: measured Lambda GB-seconds`. |
 | **Orchestration - Step Functions Standard** | $0.025/1K state transitions | 1 workflow/day/account, retries included | Variable per tenant; low but must be measured with actual state count. |
 | **Orchestration - EventBridge Scheduler** | $1.00/1M invocations | 1 scheduled trigger/day plus manual redrive | Shared negligible cost. |
-| **Storage - S3 raw/curated/idempotency** | $0.023/GB-month Standard, lower after lifecycle | CUR/Cost Explorer pulls, normalized parquet, dashboard extracts, and 24h idempotency objects | Variable by billing data volume. |
-| **Storage - S3 authoritative audit** | $0.0125/GB-month IA estimate | Containment and decision evidence S3/Object Lock (retained at least 90 days) | Variable by alert/containment volume; retention is mandatory. |
-| **Database - DynamoDB on-demand** | $1.25/million write + $0.25/million read | Read-only cache for dashboard views | Variable with runs and dashboard reads. |
+| **Storage - S3 raw/curated** | $0.023/GB-month Standard, lower after lifecycle | CUR/Cost Explorer pulls, normalized parquet, and dashboard extracts | Variable by billing data volume. |
+| **Storage - S3 authoritative audit** | $0.0125/GB-month IA estimate | Containment and decision evidence S3/Object Lock (retained at least 90 days), telemetry/history backup, and rollback evidence | Variable by alert/containment volume; retention is mandatory. |
+| **Database - DynamoDB on-demand** | $1.25/million write + $0.25/million read | `finops-idempotency-{env}` (24h TTL), `finops-rollback-cache` (90-day TTL), and Dashboard Cache | Variable with runs and dashboard reads. |
 | **Query - Athena** | $5.00/TB scanned | Dashboard refresh, evidence lookup, operational review | Variable; controlled by partition pruning and query limits. |
 | **Data Catalog - Glue** | Catalog storage/metadata requests | Cost tables, partitions, Partition Projection (ADR-014) | Variable but negligible at capstone scale (free tier; ADR-014). |
 | **Compute - AI Engine Lambda** | $0.20/1M requests + $0.0000166667/GB-second | AI Engine Lambda container function synchronous execution; 24h cadence | Variable AI workload hosting cost; tag separately from CDO adapters. |
 | **Hàng đợi SQS & DLQ** | $0.40/million requests | Buffering retry requests for alert routing Lambda | Variable queue operations cost. |
 | **ECR repositories** | $0.10/GB-month storage | Versioned AIOps container images and Lambda container image versions | Shared fixed/variable by retained image count. |
-| **VPC endpoints** | Hourly endpoint charge + data processing where applicable | Private connections for ECR, S3, DynamoDB, Secrets Manager, Logs, KMS, STS, and Lambda | Shared fixed security cost. |
-| **Secrets Manager** | $0.40/secret/month + request charges | AI Engine credentials, webhooks, contract signing key, external IDs | Shared fixed plus request volume. |
+| **Compute - Private ALB / HTTPS Adapter** | $0.0225/hour + $0.008/LCU-hour | SigV4 internal ALB endpoint for routing to Lambda (~$16.20/month fixed) | Shared fixed routing cost for secure /v1/* endpoints. |
+| **VPC endpoints** | Hourly endpoint charge + data processing where applicable | Private connections for ECR, S3, DynamoDB, Secrets Manager, Logs, KMS, and STS | Shared fixed security cost. |
+| **Secrets Manager** | $0.40/secret/month + request charges | Dashboard database credentials, webhooks, external IDs | Shared fixed plus request volume. |
 | **KMS** | $1.00/CMK/month + request charges | Data, audit, secrets, encryption keys | Shared fixed; consolidation requires Security approval. |
 | **Observability - CloudWatch, Prometheus, OTel & X-Ray** | Logs, metrics, trace analyzer, ADOT/OTel collector, and dashboard charges | Lambda logs, Step Functions traces, queue metrics, performance metrics (CPU, Memory, database utilization), and platform dashboards | Shared and variable; ADOT and telemetry collection can become a top cost driver. |
 | **Query - Cost Explorer API** | $0.01 per request | Fallback cost query ONLY when S3 CUR is delayed (`telemetry_delay_event = true`) | Conditional fallback cost; otherwise $0 under normal CUR operations. |
@@ -59,7 +60,8 @@ As tenant count grows, fixed costs such as VPC endpoints, KMS CMKs, and S3 + Clo
 | **200** | Shared baseline plus scale-out assumptions | `Evidence needed: 200-account run cost` | `Evidence needed: AI Lambda usage` | `Evidence needed` | `Evidence needed` |
 
 **Fixed costs include**:
-- 7× VPC Interface Endpoints (Lambda, ECR, Logs, KMS, Secrets Manager, STS): $50.40 (with S3 and DynamoDB configured as free Gateway Endpoints)
+- 6× VPC Interface Endpoints (ECR, Logs, KMS, Secrets Manager, STS): $43.20 (with S3 and DynamoDB configured as free Gateway Endpoints)
+- 1× Private Internal ALB / HTTPS Adapter: $16.20
 - 3× KMS CMKs: $3.00
 - Dashboard - S3 + CloudFront (MVP): S3 storage & CloudFront request/data transfer fees (typically <$1.00/month)
 - CloudWatch dashboard, logs, metrics, and X-Ray tracing: `Evidence needed: retained log volume`

@@ -41,11 +41,11 @@ Access to the S3 + CloudFront dashboard is strictly controlled and authenticated
   - `finops-cdo-admin`: Members have full administrative access to manage user pools, groups, dashboard access policies, synthetic-data visibility, and operator settings.
 
 ### Backend API Endpoint
-To support interactive dashboard actions (such as manual rollbacks, remediation verification via `/v1/verify`, or fetching anomaly decisions via `/v1/decide`), the frontend does not call multiple backend microservices or separate CDO Lambdas. Instead, the CDO platform provisions a secure **AWS Lambda Function URL** directly on the **AI Engine Lambda container function**. 
+To support interactive dashboard actions (such as manual rollbacks, remediation verification via `/v1/verify`, or fetching anomaly decisions via `/v1/decide`), the backend path utilizes a private internal Application Load Balancer (ALB) or equivalent private HTTPS adapter fronting the AI Engine Lambda container function inside the private subnets. 
 
-This singular Function URL is mapped behind the unified CloudFront distribution as the origin for the `/v1/*` path behaviors. The frontend makes secure HTTPS requests directly to CloudFront (under routes like `POST /v1/decide`, `POST /v1/verify`, `GET /v1/status/{id}`, and `POST /v1/audit/{audit_id}/rollback`), which validates the Cognito JWT session token at the CloudFront/Lambda@Edge boundary before forwarding the request to the AI Engine Lambda Function URL. 
+The private ALB exposes the HTTPS `/v1/*` endpoints (including `/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, and `/health`) using AWS SigV4 authentication. The frontend dashboard routes requests through CloudFront which validates the Cognito JWT session token at the CloudFront/Lambda@Edge boundary before proxying requests securely to the private internal ALB inside the VPC. 
 
-All other CDO-owned Lambdas (such as the Ingestion Lambda, State Lambda, and Containment Lambda) remain strictly internal helper resources orchestrated by the Step Functions workflow; they do not have public endpoints or separate Function URLs. This serverless endpoint model eliminates physical API Gateway overhead, bypasses the 30-second API Gateway timeout constraint (allowing up to 15-minute execution limits for verification loops), and ensures secure end-to-end authentication.
+Direct public Lambda Function URLs or direct Step Functions-to-AI-Lambda bypass routes are strictly prohibited. Rollback execution is independent and handled directly by the CDO backend workers executing cached boto3 configurations from the DynamoDB `finops-rollback-cache` table, decoupled from AI Engine availability.
 
 
 ---
@@ -169,7 +169,7 @@ The Alert Routing Lambda uses a structured JSON contract. The schema below repre
     "proposed_action": "stop_instance",
     "execution_mode": "dry-run",
     "idempotency_key": "tenant-uuid-1111-2222-3333:2026-06-22:daily_batch",
-    "audit_record_uri": "s3://company-cdo-telemetry/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
+    "audit_record_uri": "s3://company-cdo-123456789012-telemetry/audit/year=2026/month=06/corr-uuid-4444-5555-6666.json"
   }
 }
 ```

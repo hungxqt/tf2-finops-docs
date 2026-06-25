@@ -10,7 +10,7 @@
 
 The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications occur privately using AWS VPC Endpoints.
 
-The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The Step Functions orchestrator invokes the AI Engine Lambda function directly and synchronously. Note that `/v1/detect`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` represent logical contract semantics for model integration, not deployed REST/HTTP routes, as no Private API Gateway is deployed. The AI Engine does not receive direct credentials for member account containment actions. SQS/DLQ are used only for alert routing retry buffers rather than the detection flow.
+The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The Step Functions orchestrator interacts with the AI Engine Lambda function (running in a private container execution environment) through a private internal Application Load Balancer (ALB) or equivalent HTTPS adapter using AWS SigV4 signatures. The private endpoints `/v1/detect`, `/v1/decide`, `/v1/verify`, `/v1/status/{id}`, `/v1/audit/{audit_id}/rollback`, and `/health` are fully exposed via this secure private ALB compute target. The AI Engine does not receive direct credentials for member account containment actions. SQS/DLQ are used only for alert routing retry buffers rather than the detection flow.
 
 ```mermaid
 graph TD
@@ -40,6 +40,8 @@ graph TD
     L_Pull -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| S3Raw
     VPCE -->|Private link| S3Cur
+    L_Pull -->|HTTPS SigV4| ALB
+    ALB -->|Forward API request| AILambda
     L_Cont -->|VPC Endpoint HTTPS| VPCE
     VPCE -->|Private link| S3Audit
     L_Alert -->|Enqueue retry| SQSQueue
@@ -51,7 +53,7 @@ graph TD
     VPCE -->|Private link| S3Cur
 ```
 
-*Caption: The AI Engine Lambda function, along with orchestration and data adapters, are deployed within private-only subnets. They utilize dedicated AWS VPC Interface/Gateway Endpoints (PrivateLink) to connect to AWS services, preventing data transmission over the public internet. No Private API Gateway is deployed; Step Functions invokes the AI Engine Lambda function directly and synchronously. SQS/DLQ are used only for alert routing retry buffers rather than the detection flow.*
+*Caption: The AI Engine Lambda function, Application Load Balancer (ALB), and other platform compute tasks run in private-only subnets. They utilize dedicated AWS VPC Interface/Gateway Endpoints (PrivateLink) to connect to AWS services privately. Step Functions and platform compute access the AI Engine through the internal ALB using HTTPS and AWS SigV4 authentication. SQS/DLQ are used only for alert routing retry buffers rather than the detection flow.*
 
 ### 1.2 Security Groups
 
@@ -59,8 +61,9 @@ Traffic between compute components is regulated using stateful security groups e
 
 | SG name | Inbound | Outbound | Attached to |
 |---|---|---|---|
-| `lambda-sg` | None (Direct programmatic invocation via execution service) | TCP 443 (to `vpce-sg`) | Ingestion, Containment, Alert Routing, and AI Engine Lambda functions |
-| `vpce-sg` | TCP 443 (from `lambda-sg`) | None | VPC endpoints (S3, ECR, Secrets Mgr, KMS, Logs, STS, Lambda) |
+| `alb-sg` | TCP 443 (from orchestration/compute) | TCP 8080 (to `lambda-sg`) | Private Internal ALB / HTTPS Adapter |
+| `lambda-sg` | TCP 8080 (from `alb-sg` only, for AI Engine Lambda) | TCP 443 (to `vpce-sg`) | Ingestion, Containment, Alert Routing, and AI Engine Lambda functions |
+| `vpce-sg` | TCP 443 (from `lambda-sg`) | None | VPC endpoints (S3, DynamoDB, ECR, Secrets Mgr, KMS, Logs, STS) |
 
 ### 1.3 Network ACL / VPC Endpoint
 
@@ -87,9 +90,9 @@ AWS IAM service roles enforce strict separation. Crucially, no service role has 
 
 | Role | Used by | Permissions |
 |---|---|---|
-| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution`, `lambda:InvokeFunction` |
+| `FinOpsStepFunctionsRole` | Step Functions | `states:StartExecution`, `states:DescribeExecution` |
 | `FinOpsCURPullerRole` | `LambdaCURPuller` | `s3:GetObject` (on target account CUR S3 bucket), `s3:PutObject` (on raw S3 bucket), `ce:GetCostAndUsage` |
-| `FinOpsAiExecutionRole` | AI Engine Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (via SDK), `s3:GetObject` (read cost data from curated S3 bucket), `s3:PutObject` / `s3:GetObject` (read/write telemetry & audit checks to S3 Authoritative store), `dynamodb:PutItem` / `dynamodb:UpdateItem` (write read cache to DynamoDB Dashboard Cache, if applicable) |
+| `FinOpsAiExecutionRole` | AI Engine Lambda | `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer`, `secretsmanager:GetSecretValue` (via SDK), `s3:GetObject` (read cost data from curated S3 bucket), `s3:PutObject` / `s3:GetObject` (read/write telemetry & audit checks to S3 Authoritative store), `dynamodb:PutItem` / `dynamodb:UpdateItem` / `dynamodb:GetItem` (DynamoDB conditional writes on `finops-idempotency-{env}` and read/write to `finops-rollback-cache` and DynamoDB Dashboard Cache) |
 | `FinOpsContainmentRole` | `LambdaContainment` | `ec2:CreateTags` (non-prod), `asg:UpdateAutoScalingGroup` (non-prod). Explicit deny for `iam:*`, `s3:Delete*`, and prod resource termination. |
 
 > [!IMPORTANT]
@@ -144,10 +147,10 @@ To prevent automated containment runaways and protect resource availability, the
 ### 2.6 S3 Telemetry Bucket Naming & IAM Access Modes
 
 To store operational telemetry, intermediate anomaly evidence, and run audit logs, S3 buckets follow the standardized naming convention:
-- `tf2-cdo{NN}-telemetry-{region}` (where `{NN}` represents the team/tenant number, and `{region}` represents the deployment AWS region, e.g., `ap-southeast-1`).
+- `company-cdo-{account_id}-telemetry` (where `{account_id}` represents the member AWS account ID).
 
 Access to these telemetry buckets across accounts supports two distinct IAM configuration modes:
-1. **Per-CDO Mode (Default)**: A strict, single-tenant isolation model where each CDO platform instance has dedicated read-write permissions scoped exclusively to its own team bucket (`tf2-cdo{NN}-telemetry-{region}`).
+1. **Per-CDO Mode (Default)**: A strict, single-tenant isolation model where each CDO platform instance has dedicated read-write permissions scoped exclusively to its own account bucket (`company-cdo-{account_id}-telemetry`).
 2. **Shared Skeleton Mode**: A multi-tenant orchestration model allowing cross-account telemetry sharing. Access is governed via either:
    - A wildcard S3 resource policy restricted by AWS conditions to specific organization OUs.
    - Cross-account `STS AssumeRole` with an `ExternalId` dynamically generated based on the tenant's `X-Tenant-Id` header, ensuring strict tenant boundaries during multi-account ingestion.
@@ -168,39 +171,70 @@ The following secrets are stored in AWS Secrets Manager:
 
 ### 3.2 Inject Pattern & Integrity Verification
 
-Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the AI Engine Lambda function does not pull static API keys from Secrets Manager. Instead, the AI Engine Lambda validates request integrity and clock skew drift directly from cross-cutting headers.
+Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the private ALB/HTTPS adapter validates request credentials. The AI Engine container function validates request integrity, clock skew drift, and tenant boundaries directly from cross-cutting headers: `X-Tenant-Id`, `X-Idempotency-Key`, `X-Payload-SHA256`, `X-Request-Timestamp`, and `X-Dry-Run-Mode`.
 
 The platform enforces a clock-skew split policy:
 1. **API Requests Clock Skew**: The `X-Request-Timestamp` header skew limit is strictly set to **300 seconds** to prevent replay attacks. Requests outside this window are automatically rejected.
 2. **Ingestion Data Telemetry Delay**: A time delay of up to **36 hours** for cost data (CUR exports in S3) is normal and accepted as part of standard cloud billing latency, and does not trigger replay or clock-skew validation errors.
 
-For example, the Lambda container function validates the incoming request using the following python logic:
+Hot-path idempotency checks are performed against the DynamoDB table `finops-idempotency-{env}` using conditional writes and a 24-hour TTL (`ttl_expiry`), rather than storing idempotency keys in S3. S3/Object Lock is reserved for long-term audit logs, telemetry backups, and rollback evidence.
+
+For example, the Lambda container function validates the incoming request and performs the DynamoDB conditional write using the following Python logic:
 
 ```python
 import time
 import hashlib
+import boto3
 from datetime import datetime
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource('dynamodb')
 
 def validate_request_integrity(event):
     headers = event.get("headers", {})
     body = event.get("body", "")
     
-    # 1. Verify Clock Skew (max 300s)
+    # 1. Verify Contract Headers
     req_timestamp_str = headers.get("X-Request-Timestamp")
-    if not req_timestamp_str:
-        return {"statusCode": 400, "body": "Missing X-Request-Timestamp"}
+    idempotency_key = headers.get("X-Idempotency-Key")
+    payload_hash = headers.get("X-Payload-SHA256")
+    tenant_id = headers.get("X-Tenant-Id")
+    dry_run_mode = headers.get("X-Dry-Run-Mode", "true")
+    
+    if not all([req_timestamp_str, idempotency_key, payload_hash, tenant_id]):
+        return {"statusCode": 400, "body": "Missing required contract headers"}
         
+    # 2. Verify Clock Skew (max 300s)
     req_time = datetime.fromisoformat(req_timestamp_str.replace("Z", "+00:00"))
     now = datetime.now(req_time.tzinfo)
     drift = abs((now - req_time).total_seconds())
     if drift > 300:
         return {"statusCode": 400, "body": "ERR_REPLAY_DETECTED: Clock skew > 300 seconds"}
         
-    # 2. Verify Payload Hash
-    payload_hash = headers.get("X-Payload-SHA256")
+    # 3. Verify Payload Hash
     calculated_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if payload_hash != calculated_hash:
-        return {"statusCode": 400, "body": "ERR_IDEMPOTENCY_MISMATCH: Hash mismatch"}
+        return {"statusCode": 400, "body": "ERR_PAYLOAD_MISMATCH: Hash mismatch"}
+        
+    # 4. DynamoDB Conditional Write (Idempotency Hot Path)
+    table = dynamodb.Table('finops-idempotency-prod')
+    ttl_expiry = int(time.time()) + 86400  # 24h TTL
+    
+    try:
+        table.put_item(
+            Item={
+                'idempotency_key': idempotency_key,
+                'payload_sha256': payload_hash,
+                'status': 'IN_PROGRESS',
+                'tenant_id': tenant_id,
+                'ttl_expiry': ttl_expiry
+            },
+            ConditionExpression='attribute_not_exists(idempotency_key)'
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            return {"statusCode": 409, "body": "ERR_IDEMPOTENCY_CONFLICT: Key already exists"}
+        raise e
         
     return {"statusCode": 200}
 ```
@@ -224,17 +258,17 @@ All platform data is encrypted at rest using Customer Managed Keys (CMKs) in AWS
 
 | Data | Storage | KMS key | Notes |
 |---|---|---|---|
-| Raw/Curated Cost Data | S3 | `aws/s3` or custom CMK | S3 Bucket Key enabled to reduce KMS API costs. |
-| Run State Cache & Dashboard Cache | DynamoDB | `aws/dynamodb` or custom CMK | Encrypted using KMS. DynamoDB is downgraded to a query cache layer for the dashboard. |
+| Raw/Curated Cost Data | S3 | `aws/s3` or custom CMK | S3 Bucket Key enabled to reduce KMS API costs. Scoped to `company-cdo-{account_id}-telemetry`. |
+| Run State Cache & Dashboard Cache | DynamoDB | `aws/dynamodb` or custom CMK | Encrypted using KMS. Includes `finops-idempotency-{env}` and `finops-rollback-cache`. |
 | Secrets Store | Secrets Manager | `finops-secrets-key` | Decryption requires role trust. |
 | Lambda Ephemeral / Container Storage | Lambda Storage | `aws/lambda` or custom CMK | All function storage (including /tmp up to 10 GB) is encrypted by default. |
-| Audit Trail Logs & Idempotency Store | S3 Object Lock / S3 | `finops-audit-key` | S3/Object Lock audit storage is authoritative; retained for 90 days. Idempotency store uses 24h lifecycle expiry. |
+| Audit Trail Logs & Idempotency Store | S3 Object Lock / S3 | `finops-audit-key` | S3/Object Lock audit storage is authoritative; retained for 90 days. |
 
 ### 4.2 In Transit
 
 - **TLS Requirements**: All ingress and egress traffic requires TLS 1.3 (with TLS 1.2 as a minimum fallback).
 - **Internal Service Traffic**: Function-to-function communication and SQS messaging are fully encrypted in transit natively by AWS services using TLS.
-- **AI Engine Invocations**: Step Functions invokes the internal AI Engine Lambda function directly through private VPC networking. The request payload contains standard contract fields such as a version schema pointer and correlation ID, and the payload is validated within the execution environment.
+- **AI Engine Invocations**: Step Functions and compute tasks invoke the private internal ALB endpoint using HTTPS and AWS SigV4, which routes requests to the AI Engine Lambda function inside private subnets. The request payload contains standard contract fields such as a version schema pointer and correlation ID, and the payload is validated within the execution environment.
 - **Alert Webhooks**: Slack or email integrations are called from the alerting Lambda after payload minimization. Sensitive cost evidence is linked through internal dashboard/audit references instead of embedded directly in external messages.
 
 ### 4.3 Key Management
@@ -297,7 +331,7 @@ Every action taken by the CDO platform is documented. For containment actions, t
 }
 ```
 
-The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. When a rollback operation is executed, the audit log is updated with rollback-specific fields including `rollback_status`, `rollback_executed_at`, and the optional `boto3_result` containing the raw API response from AWS. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in the authoritative S3 bucket (with optional dashboard cache duplication in DynamoDB), with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, setting `data_confidence = LOW` and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Immediately after the `/v1/decide` response, the CDO platform extracts the `rollback_payload.boto3_equivalent` and caches it in the DynamoDB table `finops-rollback-cache` (with a 90-day TTL). When a rollback operation is executed, the CDO platform executes this cached boto3 payload directly using its own boto3 execution workers, ensuring rollback independence without depending on AI Engine availability. Once the rollback completes, a notification is written to the SQS queue `finops-watch-rollback` for audit trail completion only, not as a queue to execute the rollback. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in the authoritative S3 bucket (with optional dashboard cache duplication in DynamoDB), with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, setting `data_confidence = LOW` and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
 
 ### 5.2 Storage + Retention
 

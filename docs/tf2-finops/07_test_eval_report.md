@@ -39,10 +39,10 @@ Compliance with the contract-mandated limits from `ai-api-contract.md` §6 is me
 
 | Contract SLO Metric | Target | Measurement Point | Verification Result |
 |---|---|---|---|
-| Request Latency (P99) | < 300 ms | AI Engine Lambda execution time (input validation & synchronous detect run) | Evidence needed: pending Lambda telemetry |
+| Request Latency (P99) | < 300 ms | ALB target response time (input validation & synchronous detect run) | Evidence needed: pending telemetry |
 | Result Store Query Latency (P99) | < 10 ms | S3 GetObject latency for `correlation_id` / `anomaly_id` | Evidence needed: pending S3 telemetry |
 | LLM Inference SLA | < 30 seconds | AI Engine Lambda internal inference logic run time | Evidence needed: pending AI Engine Lambda telemetry |
-| System Availability | >=99.5% | Direct Lambda invocation success rate (excluding client-throttling errors) | Evidence needed: pending CloudWatch metrics |
+| System Availability | >=99.5% | ALB HTTPS API invocation success rate (excluding client-throttling errors) | Evidence needed: pending CloudWatch metrics |
 | Ingestion Failure Rate | < 0.5% | Failed runs (failures / total CUR processing requests) | Evidence needed: pending metrics |
 
 ### 2.2 SLO breach analysis
@@ -67,8 +67,8 @@ Data Ingestion verification focuses on retrieving and parsing cost data from AWS
 
 The pipeline runs on a scheduled cadence (ADR-001) triggered by EventBridge Scheduler. To verify idempotency:
 - **Duplicate Execution Test**: The same date window partition (e.g., 2026-06-22) is sent twice to the ingestion workflow.
-- **State Check**: Step Functions checks if the authoritative S3 store already has a record for the `idempotency_key` (formatted as `AccountID:DateWindow`).
-- **Execution Bypass**: The second run is successfully bypassed, and no duplicate S3 objects or alert messages are generated.
+- **State Check**: Ingestion compute attempts a DynamoDB conditional write on `finops-idempotency-{env}` using the composite key.
+- **Execution Bypass**: The second write fails with `ConditionalCheckFailedException` (key already exists), causing the second run to be successfully bypassed with no duplicate S3 objects or alert messages.
 
 ### 3.3 Dashboard refresh
 
@@ -82,22 +82,22 @@ The pipeline runs on a scheduled cadence (ADR-001) triggered by EventBridge Sche
 ### 4.1 AI contract
 
 The contract-based interface between the CDO platform and the AIOps-provided AI Engine is validated for strict schema adherence:
-- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD:batch_type`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` directly to the AI Engine Lambda function using IAM invocation permissions (`lambda:InvokeFunction`). The test verifies that the request payload conforms to the hybrid telemetry schema (containing CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics`). If CloudWatch metrics are simulated as missing, the test verifies that the Lambda handles the fallback behavior by setting `data_confidence = LOW` and forcing dry-run/alert-only mode.
-- **Response Format Verification**: The test validates that the AI Engine Lambda returns a synchronous payload containing the required parameters: `success`, `correlation_id`, `anomalies_detected`, and `anomalies_list` (containing `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, `alert_routing`).
+- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD:batch_type`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` to the private internal ALB endpoint using HTTPS and SigV4 authentication. The test verifies that the request payload conforms to the hybrid telemetry schema (containing CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics`). If CloudWatch metrics are simulated as missing, the test verifies that the Lambda handles the fallback behavior by setting `data_confidence = LOW` and forcing dry-run/alert-only mode.
+- **Response Format Verification**: The test validates that the AI Engine ALB returns a synchronous payload containing the required parameters: `success`, `correlation_id`, `anomalies_detected`, and `anomalies_list` (containing `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, `alert_routing`).
 - **Ingest Validation with Finalized CUR-only Data**: Verifies that when the ingestion run processes finalized CUR data on-time, the request payload asserts `telemetry_delay_event = false` and the response contains `data_confidence = HIGH`.
 - **Fallback Validation with CUR Delayed**: Verifies that if CUR data delivery is delayed, the request flags `telemetry_delay_event = true` (signaling that daily Cost Explorer query fallback is active) and the response returns `data_confidence = LOW`.
-- **S3 Bucket URI Schema Validation**: Verifies that the `s3_bucket_uri` parameter is validated against the regex pattern `s3://tf2-cdo{NN}-telemetry-{region}/...json.gz` (where `{NN}` represents the team sequence and `{region}` represents the AWS region code, such as `ap-southeast-1`), throwing schema validation errors for malformed URIs.
+- **S3 Bucket URI Schema Validation**: Verifies that the `s3_bucket_uri` parameter is validated against the regex pattern `s3://company-cdo-[0-9]{12}-telemetry/.*$` (matching account-scoped naming), throwing schema validation errors for malformed URIs.
 - **Raw CPU Telemetry Check**: Confirms that the CDO platform sends the raw `cpu_utilization_hourly` array without precomputing SRE metrics like `idle_hours_continuous` on the CDO backend.
 
 ### 4.2 AI Engine timeout
 
 - **Timeout Simulation**: A mock container task is configured to delay its execution by 30 seconds (simulating LLM API delays).
-- **Execution**: The CDO Step Functions orchestrator invokes the AI Engine Lambda function synchronously.
-- **Verification**: If the AI Engine Lambda fails to return the results within the Step Functions execution step timeout, the platform logs a timeout warning and alerts operators.
+- **Execution**: The CDO Step Functions orchestrator or compute task calls the private internal ALB endpoint synchronously.
+- **Verification**: If the ALB request fails to return the results within the Step Functions execution step timeout, the platform logs a timeout warning and alerts operators.
 
 ### 4.3 Unavailable-AI fallback
 
-If the AI Engine is completely unreachable (e.g., Lambda invocation failure or Lambda execution concurrency exhaustion):
+If the AI Engine is completely unreachable (e.g., ALB routing failure or Lambda execution concurrency exhaustion):
 - **Fail Closed Behavior**: The CDO platform immediately aborts any scheduled containment action triggers. No automated policy is applied.
 - **Operator Alert**: A critical incident ticket and PagerDuty alert are routed to the central CDO engineering and finance teams.
 - **Audit Logging**: A failure record is written to the audit bucket, detailing the AI Engine's unavailability.
@@ -137,7 +137,7 @@ If the AI Engine is completely unreachable (e.g., Lambda invocation failure or L
   - The handler validates authorization, `rolled_back_by` email, and matching `X-Tenant-Id`.
   - It successfully initiates rollback, returns `audit_recorded = true` (instead of `rollback_initiated = true`), updates the false positive count, and recalculates `new_error_budget_burned_pct`.
   - The event status is logged to the audit trail as `ROLLED_BACK`.
-- **Rollback Caching & Offline Fallback Test**: Verifies that the CDO backend caches the `rollback_payload.boto3_equivalent` configuration from the decide phase. The test simulates an AI Engine offline/unreachable scenario and verifies that the CDO platform backend successfully executes the rollback via standard Boto3 calls using the cached configuration, and then reports the execution results to the rollback audit endpoint.
+- **Rollback Caching & Offline Fallback Test**: Verifies that the CDO backend caches the `rollback_payload.boto3_equivalent` configuration into the DynamoDB `finops-rollback-cache` table. The test simulates an AI Engine offline/unreachable scenario and verifies that the CDO platform backend successfully executes the rollback via standard Boto3 calls using the cached configuration, and then reports the execution results to the rollback audit endpoint.
 - **Error Budget Lock Tests**: Asserts that containment lock triggers at a rollback rate of >=1% in production (prod), >=10% in staging, and never (disabled) in dev/sandbox environments, utilizing the `error_budget_exceeded_threshold` lock reason.
 
 ### 4.10 Contract Error Codes & Validation Tests
@@ -206,12 +206,12 @@ The containment engine must generate an audit log entry for every action attempt
 The End-to-End demo demonstrates the entire ingestion, detection, alerting, and containment sequence:
 - **Step 1 - Injection**: Synthetic unmanaged cost records (e.g., $500 spend on EC2 g5.4xlarge instances) are written to the CUR S3 bucket.
 - **Step 2 - Trigger**: EventBridge triggers the Step Functions ingestion workflow.
-- **Step 3 - Lambda Invocation**: The ingestion workflow extracts the cost records and invokes the AI Engine Lambda function directly and synchronously, which returns the detection success indicator and the list of anomalies.
+- **Step 3 - Lambda Invocation**: The ingestion workflow extracts the cost records and calls the AI Engine private ALB endpoint synchronously via HTTPS and SigV4, which returns the detection success indicator and the list of anomalies.
 - **Step 4 - Task Execution**: The Step Functions workflow processes the cost data, records the anomaly/audit results in the S3 Authoritative store (with dashboard caching in DynamoDB), and saves the detailed reasoning evidence to S3.
 - **Step 5 - Dashboard Update**: Lambda aggregates the results, writes the updated JSON files to the dashboard S3 bucket, and triggers a CloudFront invalidation.
 - **Step 6 - Alert Routing**: The Alert Routing Lambda is invoked, sending a Slack notification (including engineering alert payload with `slack_routing`) to the `squad-prediction-models` channel and an email notification to the Finance team via SNS/SES.
 - **Step 7 - Dry-run Containment**: The CDO containment engine triggers a dry-run tag update (`FinOpsWatch: ReviewRequired`) and saves the audit record containing the rollback steps to S3.
-- **Step 8 - Rollback Simulation**: The administrator clicks the "Rollback" button on the CDO dashboard, triggering the rollback endpoint (representing `POST /v1/audit/{audit_id}/rollback` semantics), which initiates tag restoration in the member account and updates the error budget burn telemetry.
+- **Step 8 - Rollback Simulation**: The administrator clicks the "Rollback" button on the CDO dashboard, triggering the rollback endpoint (representing `POST /v1/audit/{audit_id}/rollback` semantics), which initiates tag restoration in the member account by executing the cached `rollback_payload.boto3_equivalent` from the DynamoDB `finops-rollback-cache` table and updates the error budget burn telemetry.
 
 ---
 

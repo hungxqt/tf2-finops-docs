@@ -213,9 +213,9 @@ graph TB
     AILambda -.->|Access SDK| SM
 ```
 
-*Chú thích: Yêu cầu phát hiện dị thường từ bộ điều phối Step Functions được gửi qua cuộc gọi Lambda trực tiếp đến hàm AI Engine Lambda (`POST /v1/detect`). AI Engine Lambda xử lý đồng bộ dữ liệu chi phí và các chỉ số hiệu năng CloudWatch từ S3 và trả về kết quả phát hiện ngay lập tức. Bộ điều phối sau đó gửi yêu cầu quyết định (`POST /v1/decide`), thực thi các hành động can thiệp, ghi nhận hồ sơ kiểm toán vào S3, và xác minh hành động khắc phục (`POST /v1/verify`) một cách đồng bộ.*
+*Chú thích: Yêu cầu phát hiện dị thường từ bộ điều phối Step Functions được gửi qua Private ALB nội bộ đến hàm AI Engine Lambda (`POST /v1/detect`). AI Engine Lambda xử lý đồng bộ dữ liệu chi phí và các chỉ số hiệu năng CloudWatch từ S3 và trả về kết quả phát hiện ngay lập tức. Bộ điều phối sau đó gửi yêu cầu quyết định (`POST /v1/decide`), thực thi các hành động can thiệp, ghi nhận hồ sơ kiểm toán vào S3, và xác minh hành động khắc phục (`POST /v1/verify`) một cách đồng bộ.*
 
-Nền tảng dựa trên Lambda lưu trữ AI Engine container hóa để phát hiện bất thường chi phí đồng bộ. Bằng cách gọi trực tiếp hàm Lambda AI Engine, bộ điều phối Step Functions nhận được `anomalies_list` và `data_confidence` trong cùng chu kỳ yêu cầu (độ trễ mục tiêu P99 cho `/v1/detect` là < 300 ms vì nó thực hiện phân tích trực tiếp không qua xử lý LLM; giới hạn cứng 45 giây của Bedrock chỉ áp dụng riêng cho `/v1/decide` khi tạo RCA và kế hoạch hành động), loại bỏ hoàn toàn các vòng lặp và hàng đợi truy vấn trạng thái. Bộ điều phối ghi nhận các khóa idempotency có thẩm quyền và nhật ký kiểm toán tuân thủ trực tiếp vào Amazon S3, sử dụng tính năng Object Lock để đảm bảo tính bất biến WORM. DynamoDB được sử dụng như một bộ đệm đọc (cache) phục vụ các truy vấn độ trễ thấp của bảng điều khiển tài chính và lưu trữ các rollback payload (`rollback_payload.boto3_equivalent`) phục vụ việc tự động rollback bằng Boto3 của các worker CDO. Hướng tiếp cận ưu tiên hợp đồng này cung cấp khả năng thực thi đồng bộ có thể dự đoán trong khi thực thi các ranh giới bảo mật nghiêm ngặt qua các vai trò thực thi IAM và VPC Endpoint riêng tư.
+Nền tảng dựa trên Lambda lưu trữ AI Engine container hóa trong các subnet VPC riêng tư phía sau một Private ALB nội bộ. Bằng cách gọi AI Engine qua các endpoint hợp đồng có phiên bản chạy trên HTTPS với xác thực SigV4, bộ điều phối Step Functions nhận được `anomalies_list` và `data_confidence` trong cùng một chu kỳ vòng đời yêu cầu (độ trễ mục tiêu P99 cho `/v1/detect` là < 300 ms vì nó thực hiện phân tích trực tiếp không qua xử lý LLM; giới hạn cứng 45 giây của Bedrock chỉ áp dụng riêng cho `/v1/decide` để tạo phân tích nguyên nhân gốc rễ và kế hoạch hành động), loại bỏ sự phức tạp của các vòng lặp truy vấn trạng thái. Bộ điều phối ghi nhật ký kiểm toán tuân thủ trực tiếp vào Amazon S3, sử dụng Object Lock để đảm bảo tính bất biến WORM. DynamoDB được sử dụng cho tính không lặp lại trên hot-path (bảng `finops-idempotency-{env}` với TTL 24 giờ) và lưu trữ các rollback payload (bảng `finops-rollback-cache` với TTL 90 ngày) để phục vụ việc tự động thực thi rollback bằng Boto3 bởi các worker CDO. Hướng tiếp cận ưu tiên hợp đồng này cung cấp khả năng thực thi đồng bộ có thể dự đoán trong khi thực thi các ranh giới bảo mật nghiêm ngặt qua các vai trò thực thi IAM và VPC Endpoint riêng tư.
 
 ### 1.4 Động cơ Cảnh báo & Containment (Alerting & Containment Engine)
 
@@ -236,7 +236,7 @@ graph TB
         SF -->|1. Route Alerts| AlertLambda[Alert Routing Lambda]
         SF -->|2. Execute Policy & verify| ContLambda[Containment Lambda]
         
-        StateLambda[State Lambda] -->|Read/Write Run Lock| StateDB[(S3 Idempotency Store)]
+        StateLambda[State Lambda] -->|Query Run Lock| DDBIdempotency[(DynamoDB finops-idempotency-{env})]
         SF -->|Query State| StateLambda
         
         ContLambda -->|Write Audit Record| S3Audit[(S3 Audit Store with Object Lock)]
@@ -251,14 +251,14 @@ graph TB
         AlertLambda -->|Email Alert| SES[SES / Email Targets]
         CloudFront[CloudFront HTTPS] -->|Serve authenticated UI| S3Dashboard2[S3 Static Dashboard]
         S3Dashboard2 -->|Read precomputed summaries| CacheDB
-        S3Dashboard2 -->|5. Trigger actions - POST /v1/*| AILambdaUrl[AI Engine Lambda Function URL]
-        AILambdaUrl -->|6. Read/Write run state| CacheDB
+        S3Dashboard2 -->|5. Trigger actions - POST /v1/*| ALB[Private ALB / API Adapter]
+        ALB -->|6. Read/Write run state| CacheDB
         CloudFront -->|Auth redirect| Cognito[Cognito User Pool]
         LambdaEdge["Lambda@Edge Auth Validator"] -->|Validate cookie JWT| CloudFront
     end
 ```
 
-*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán có thẩm quyền vào S3 (được bảo vệ bằng Object Lock), áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu từ lớp cache đọc DynamoDB để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. Các nút tương tác trên bảng điều khiển (như rollback thủ công hoặc xác minh can thiệp) được định tuyến bảo mật từ S3 Static Dashboard đến hàm Lambda container AI Engine duy nhất qua endpoint AWS Lambda Function URL bảo mật được ánh xạ dưới CloudFront. Tất cả các hàm Lambda khác của CDO đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions; các hàm này không có endpoint công khai hoặc Function URL riêng biệt. CDO gọi `POST /v1/verify` để xác minh containment, thực thi các hành động rollback bằng Boto3 trực tiếp từ cache `rollback_payload.boto3_equivalent` trong DynamoDB, và báo cáo kết quả qua `POST /v1/audit/{audit_id}/rollback`.*
+*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán có thẩm quyền vào S3 (được bảo vệ bằng Object Lock), áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu từ lớp cache đọc DynamoDB để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. Các nút tương tác trên bảng điều khiển (như rollback thủ công hoặc xác minh can thiệp) được định tuyến bảo mật từ S3 Static Dashboard đến hàm Lambda container AI Engine duy nhất qua Private ALB nội bộ. Tất cả các hàm Lambda khác của CDO đều hoàn toàn là các tài nguyên hỗ trợ nội bộ được gọi bởi Step Functions; các hàm này không có endpoint công khai. CDO gọi `POST /v1/verify` để xác minh containment, thực thi các hành động rollback bằng Boto3 trực tiếp từ cache `rollback_payload.boto3_equivalent` trong DynamoDB, và báo cáo kết quả qua `POST /v1/audit/{audit_id}/rollback`.*
 
 Động cơ containment coi `execution_mode` as a đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán có thẩm quyền vào S3 trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên. Sau khi hoàn thành, CDO gọi `POST /v1/verify` để báo cáo kết quả đo lường từ xa. Các hành động rollback thủ công hoặc theo chính sách được CDO thực thi trực tiếp từ DynamoDB cache (bằng cách sử dụng `rollback_payload.boto3_equivalent`), sau đó được báo cáo đến AI Engine qua `POST /v1/audit/{audit_id}/rollback` để cập nhật sổ nhật ký kiểm toán. Về mặt vận hành, `GET /v1/status/{id}` được giữ lại duy nhất để kiểm tra trạng thái khắc phục/tự phục hồi của một hành động containment cụ thể bằng `audit_id` hoặc `anomaly_id`, và không được dùng để poll tiến trình detect hoạt động.
 
@@ -349,7 +349,7 @@ Các thành phần hạ tầng sau đây được triển khai tại vùng `ap-s
 | Bảng điều khiển Tài chính (Finance Dashboard) | Amazon S3 + CloudFront | Bảng điều khiển web tĩnh nội bộ nhẹ được lưu trữ dưới dạng tài sản tĩnh trong S3 và phân phối qua CloudFront. Tài sản được bảo vệ bằng OAC (Origin Access Control) và được xác thực bởi Lambda@Edge. | Phí CloudFront truyền dữ liệu/request, lưu trữ S3, và OAC (thường dưới 3 USD/tháng). |
 | Dashboard Auth Gateway | Amazon Cognito | Triển khai Cognito User Pool, Hosted UI, và các nhóm (finops-finance-readonly, finops-engineering-operator, finops-cdo-admin) để xác thực và ủy quyền người dùng bảng điều khiển. | Tính năng User Pool miễn phí tối đa 50.000 người dùng hoạt động hàng tháng (MAUs). |
 | Viewer-Request Auth Gate | Lambda@Edge | Hàm xử lý viewer-request kiểm tra secure HTTP-only cookies và xác thực chữ ký JWT đối với Cognito JWKS trước khi chuyển tiếp yêu cầu đến bucket S3 riêng tư. | ~0,60 USD trên mỗi triệu lượt gọi + chi phí thời gian thực thi. |
-| AI Engine API Endpoint | AWS Lambda Function URL | Cung cấp một HTTPS endpoint công cộng bảo mật trên AI Engine Lambda để kích hoạt các hành động tương tác (như xác minh can thiệp hoặc rollback thủ công) và các truy vấn. Bảo mật endpoint qua Cognito JWT authorizer tại CloudFront gateway. | Lambda Function URL chạy miễn phí. |
+| AI Engine API Endpoint | Private ALB / Target Group | Cung cấp một HTTPS endpoint nội bộ riêng tư bảo mật trên AI Engine Lambda container trong private VPC subnet cho tất cả các hành động lập trình và tương tác, được bảo mật qua xác thực AWS SigV4. | Phí ALB theo giờ (~16 USD/tháng) + phí xử lý LCU. |
 | Kênh cảnh báo (Alert Channels) | Amazon SNS / Slack API | Cung cấp các đường định tuyến riêng biệt cho cảnh báo (cảnh báo Tài chính qua Slack/Email, cảnh báo Kỹ thuật qua Slack/Jira). | SNS miễn phí tới 100 nghìn thông báo email/tháng; Slack API miễn phí. |
 | Tác nhân thực thi containment (Containment Worker) | AWS Lambda | Giả lập vai trò (assume role) trong các tài khoản thành viên để áp dụng nhãn (tag) hoặc tắt các tài nguyên dev/sandbox, thực thi nghiêm ngặt trong các chế độ dry-run hoặc apply. | Thanh toán theo mức sử dụng. |
 
@@ -409,7 +409,7 @@ Mô hình tài khoản phải bảo toàn ngữ cảnh môi trường vì cùng 
 
 ### 4.2 Mô hình cô lập (Isolation pattern)
 
-- **Cô lập dữ liệu**: Dữ liệu chi phí thu thập từ các tài khoản thành viên được lưu trữ trong một bucket S3 duy nhất, được phân vùng theo mã tài khoản (Account ID): `s3://tf2-cdo{NN}-telemetry-{region}/curated/account_id=123456789012/year=2026/month=06/`.
+- **Cô lập dữ liệu**: Dữ liệu chi phí thu thập từ các tài khoản thành viên được lưu trữ trong các bucket S3 riêng cho từng tài khoản: `s3://company-cdo-{account_id}-telemetry/curated/year=2026/month=06/`.
 - **Cô lập truy vấn**: Các định nghĩa bảng trong Athena sử dụng tính năng chiếu phân vùng (partition projection) của Glue. Các truy vấn Athena được thực thi để phục vụ các materialized view của bảng điều khiển được giới hạn chặt chẽ theo khóa phân vùng `account_id`.
 - **Xác định sở hữu (Ownership)**: Tài nguyên được ánh xạ tới các nhóm kỹ thuật (squad) cụ thể bằng cách sử dụng các thẻ siêu dữ liệu tiêu chuẩn là `owner` và `squad`. Khi pipeline thu thập dữ liệu phát hiện các tài nguyên thiếu các thẻ này, hệ thống sẽ tự động gán chúng vào một nhóm mặc định (`unassigned-resources`) và định tuyến cảnh báo đến kênh hạ tầng của CDO để xử lý thủ công.
 
@@ -428,17 +428,18 @@ Khi thực hiện onboard một tài khoản AWS hoặc squad mới vào nền t
 3. Partition Projection tự động ánh xạ các phân vùng mới bên trong Athena thông qua các cấu hình ngày/chu kỳ được định nghĩa trong IaC (ADR-014).
 4. E2E Validation run:
    - Ingestion Lambda makes a test API call to target account Cost Explorer.
-   - Xác thực việc giả lập quyền IAM cross-account và gọi Lambda trực tiếp.
+   - Xác thực việc giả lập quyền IAM cross-account và định tuyến an toàn qua Private ALB.
 5. Account status marked as 'ACTIVE' in the DynamoDB registry.
 ```
 
 ### 4.4 Tính bất biến (Idempotency)
 
-Nhằm ngăn chặn việc chạy trùng lặp cho cùng một kỳ chi phí (điều này sẽ làm sai lệch dữ liệu trên bảng điều khiển và phát sinh thêm chi phí gọi Cost Explorer API trùng lặp), nền tảng CDO triển khai cơ chế idempotency sử dụng Amazon S3:
-- Mỗi lượt thực thi hàng ngày tạo ra một khóa idempotency tổng hợp: `{tenant_id}:{billing_period_date}:{batch_type}` (ví dụ: `tenant_id:2026-06-25:daily_batch`).
-- Luồng Step Functions bắt đầu bằng cách kiểm tra sự tồn tại của khóa này dưới dạng một đối tượng trống trong kho lưu trữ idempotency có thẩm quyền: `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/{key}`.
-- Nếu đối tượng đã tồn tại, lượt chạy sẽ dừng lại một cách an toàn để tránh xử lý trùng lặp.
-- Nếu đối tượng chưa tồn tại, luồng công việc sẽ ghi đối tượng đó để khóa lượt chạy. Đối tượng được cấu hình với quy tắc S3 Lifecycle để tự động xóa sau 24 giờ.
+Nhằm ngăn chặn việc chạy trùng lặp cho cùng một kỳ chi phí (điều này sẽ làm sai lệch dữ liệu trên bảng điều khiển và phát sinh thêm chi phí gọi Cost Explorer API trùng lặp), nền tảng CDO triển khai cơ chế idempotency sử dụng bảng DynamoDB `finops-idempotency-{env}` như quy định trong hợp đồng:
+- Mỗi lượt thực thi hàng ngày tạo ra một khóa `idempotency_key` tổng hợp: `{tenant_id}:{billing_period_date}:{batch_type}` (ví dụ: `tenant_id:2026-06-25:daily_batch`).
+- Khi gọi `/v1/detect`, CDO Platform truyền khóa này qua header `X-Idempotency-Key`.
+- AI Engine thực hiện ghi có điều kiện (`PutItem` với `ConditionExpression: attribute_not_exists(idempotency_key)`), đặt `status = IN_PROGRESS` và `ttl_expiry = now + 86400` (Unix epoch).
+- Khi xử lý thành công, status được cập nhật thành `COMPLETED` và lưu kết quả phản hồi vào `response_cache`. Nếu kiểm tra trùng lặp thất bại, AI Engine xử lý dựa trên status và payload hash (trả về cache hoặc lỗi `400 ERR_IDEMPOTENCY_MISMATCH` / `409 Conflict`).
+- Thuộc tính `ttl_expiry` cho phép DynamoDB tự động xóa bản ghi sau 24 giờ.
 ### 4.5 Cache dữ liệu chi phí & Kiểm soát giới hạn tần suất Cost Explorer (Cost Explorer Rate Limit Control)
 
 Để bảo vệ AWS Cost Explorer API khỏi việc vượt quá giới hạn tần suất nghiêm ngặt **5 requests/second**, nền tảng CDO triển khai chiến lược cache dựa trên DynamoDB như mô tả trong hợp đồng telemetry:
@@ -451,7 +452,7 @@ Nhằm ngăn chặn việc chạy trùng lặp cho cùng một kỳ chi phí (đ
 
 Nền tảng CDO thực thi tất cả các kiểm soát bảo mật và xác thực trên mặt phẳng dữ liệu (data-plane) được quy định trong `telemetry-contract.md` và `ai-api-contract.md`:
 - **Schema & Kiểu Ingestion**: Telemetry tuân thủ schema phiên bản 3 (`telemetry://finops-watch/v3`). Ingestion hỗ trợ kiểu `RAW_JSON` (<10MB Cost Explorer API data) và `S3_POINTER` (<500MB compressed CUR exports stored in S3) data ingestion types. Telemetry hiệu năng CloudWatch được gửi đến AI Engine để phát hiện (bao gồm `cpu_utilization_hourly` dưới dạng mảng CPU thô mỗi 24 giờ thay thế cho `idle_hours_continuous` cũ, `memory_mib`, `network_in_bytes`, `network_out_bytes`, `disk_io_ops`, `database_connections`, và `gpu_utilization`). Nếu thiếu các chỉ số hiệu năng CloudWatch, nền tảng sẽ tự động chuyển sang chế độ CUR-only, thiết lập `data_confidence = LOW`.
-- **Trường Request & Toàn vẹn (Request & Integrity Fields)**: Mọi payload gọi trực tiếp đến AI Engine phải đính kèm các trường siêu dữ liệu chuẩn đại diện cho các header hợp đồng: `X-Tenant-Id` (`tenant_id`), `X-Idempotency-Key` (định dạng: `{tenant_id}:{billing_period_date}:{batch_type}` được lưu trong `s3://tf2-cdo{NN}-telemetry-{region}/idempotency/` với chu kỳ tự động xóa 24 giờ của S3 Object Lifecycle), `X-Correlation-Id`, `X-Payload-SHA256` (`payload_sha256`), và `X-Request-Timestamp` (`request_timestamp`).
+- **Trường Request & Toàn vẹn (Request & Integrity Fields)**: Mọi yêu cầu API HTTPS đến AI Engine qua ALB nội bộ riêng tư phải đính kèm các trường siêu dữ liệu chuẩn đại diện cho các header hợp đồng: `X-Tenant-Id` (`tenant_id`), `X-Idempotency-Key` (định dạng: `{tenant_id}:{billing_period_date}:{batch_type}` được ánh xạ sang bảng DynamoDB `finops-idempotency-{env}` với chu kỳ tự động xóa 24 giờ), `X-Correlation-Id`, `X-Payload-SHA256` (`payload_sha256`), và `X-Request-Timestamp` (`request_timestamp`).
 - **Trường dữ liệu phản hồi (Response Fields)**: Phản hồi đồng bộ `/v1/detect` trả về các trường chuẩn: `success` (boolean), `correlation_id` (UUID v4), `anomalies_detected` (boolean), `anomalies_list` (chứa `anomaly_id`, `anomaly_type`, `severity`, `confidence_score`, `resource_id`, `environment`, `responsible_team`, `unblended_cost_24h_usd`, `cost_ratio_to_7d_avg`, `ai_model_used`, và `alert_routing`), `data_confidence` (HIGH/LOW), `callback_url` tùy chọn, và `error_message` (tùy chọn).
 - **Các cờ điều khiển**:
   - `is_ad_hoc`: Bỏ qua khóa idempotency 24h khi quét khẩn cấp (tối đa 5 lần/ngày).
@@ -502,7 +503,7 @@ Nền tảng CDO tự động mở rộng quy mô linh hoạt để xử lý lư
 - **Provisioned Concurrency**: Bị tắt theo mặc định để giảm thiểu chi phí cơ sở cố định. Provisioned Concurrency là một tùy chọn tối ưu hóa sản xuất có thể được lập lịch linh hoạt xung quanh thời gian chạy chu kỳ đã biết hoặc các cửa sổ chạy demo, chỉ khi dữ liệu CloudWatch hoặc AWS X-Ray chứng minh rằng độ trễ khởi động lạnh (cold-start) của Lambda container vi phạm các SLO hiệu năng của nền tảng.
 - **Chiến lược Payload (Payload Strategy)**: Để ngăn chặn việc vượt quá giới hạn kích thước payload của cuộc gọi Lambda (6 MB đồng bộ / 256 KB bất đồng bộ), pipeline thu nhận sử dụng các con trỏ S3 (S3 pointers) cho các khung dữ liệu CUR/telemetry lớn. Thay vì nhúng trực tiếp dữ liệu thô lớn vào payload của Step Functions hoặc yêu cầu gọi Lambda, pipeline ghi dữ liệu telemetry vào S3 và truyền URI của đối tượng S3 (S3 pointers) cho hàm Lambda của AI Engine.
 - **Phân vùng Athena & Partition Projection (Athena Partitioning & Partition Projection)**: Các truy vấn Athena được sử dụng cho báo cáo tổng hợp dashboard áp dụng Partition Projection phía client trên các schema của Glue Data Catalog. Các truy vấn cơ sở dữ liệu giới hạn dữ liệu quét bằng cách sử dụng các phân vùng có biên giới (theo `account_id`, `year`, và `month`), giúp các truy vấn luôn nhanh và hiệu quả về mặt chi phí khi số lượng bản ghi chi phí tăng lên.
-- **DynamoDB On-Demand & Thiết kế Khóa (DynamoDB On-Demand & Key Design)**: Các bảng lưu trữ run-state và materialized read-cache cho dashboard trên DynamoDB được cấu hình ở chế độ On-Demand Capacity Mode để mở rộng quy mô tức thì từ không đến hàng nghìn yêu cầu. S3 vẫn là kho lưu trữ có thẩm quyền cho kiểm toán tuân thủ (sử dụng Object Lock) và khóa idempotency. Để ngăn chặn các điểm nóng phân vùng (hot keys) trên DynamoDB, các bảng sử dụng các khóa có độ phân biệt cao (high-cardinality keys) kết hợp từ `tenant_id`, `account_id`, `date`, và `run_id`.
+- **DynamoDB On-Demand & Thiết kế Khóa (DynamoDB On-Demand & Key Design)**: Các bảng lưu trữ run-state và materialized read-cache cho dashboard trên DynamoDB được cấu hình ở chế độ On-Demand Capacity Mode để mở rộng quy mô tức thì từ không đến hàng nghìn yêu cầu. S3 vẫn là kho lưu trữ có thẩm quyền cho kiểm toán tuân thủ (sử dụng Object Lock), trong khi DynamoDB là hot-path cho kiểm tra idempotency lượt chạy. Để ngăn chặn các điểm nóng phân vùng (hot keys) trên DynamoDB, các bảng sử dụng các khóa có độ phân biệt cao (high-cardinality keys) kết hợp từ `tenant_id`, `account_id`, `date`, và `run_id`.
 
 Giả định mở rộng quy mô trong sản xuất là số lượng dòng chi tiết chi phí tăng nhanh hơn số lượng tài khoản. Do đó, payload con trỏ S3, phân vùng S3, quét phân vùng truy vấn Athena và kiểm soát đồng thời của Step Functions quan trọng đối với sự ổn định của hệ thống hơn là việc tăng giới hạn thực thi Lambda thô.
 
@@ -518,7 +519,7 @@ Bảng dưới đây trình bày các chế độ lỗi, cơ chế phát hiện 
 | **Giới hạn tần suất Cost Explorer (Throttling)** | Hàm Ingestion Lambda bắt được lỗi `LimitExceededException` từ AWS API. | Áp dụng thuật toán exponential backoff với random jitter trong mã nguồn Lambda; thử lại tối đa 5 lần. | 30 phút | 0 |
 | **Lỗi Hàm / Hết thời gian phản hồi AI Engine** | Bộ điều phối nhận được lỗi thực thi Lambda, hết thời gian SDK, hoặc hết thời gian Bedrock (Nova LLM hard limit). | **CDO fail closed**: Quy trình thu thập kết thúc, khóa các hành động containment tự động, ghi log thất bại và ngay lập tức chuyển sang hệ thống cảnh báo tĩnh Fallback đến SRE. | 4 giờ | 24 giờ |
 | **Quy trình chạy bị lỗi** | Trạng thái thực thi của Step Functions chuyển sang `FAILED`; kích hoạt CloudWatch Alarm. | Step Functions ghi log khối lỗi vào kho lưu trữ kiểm toán S3 và cập nhật bộ nhớ cache. Kỹ sư khắc phục sự cố và kích hoạt tính năng chạy lại thủ công (redrive) của state machine từ bước bị lỗi. | 2 giờ | 24 giờ |
-| **Nỗ lực chạy trùng lặp** | Kiểm tra đối tượng S3 chỉ ra rằng khóa idempotency tổng hợp đã tồn tại. | Quy trình CDO dừng lại ngay lập tức để ngăn xử lý trùng lặp và ghi nhận nỗ lực chạy trùng lặp vào kho kiểm toán S3. | < 5 giây | 0 |
+| **Nỗ lực chạy trùng lặp** | Truy vấn DynamoDB chỉ ra rằng khóa idempotency tổng hợp đã tồn tại. | Quy trình CDO dừng lại ngay lập tức để ngăn xử lý trùng lặp và ghi nhận nỗ lực chạy trùng lặp vào kho kiểm toán S3. | < 5 giây | 0 |
 | **Sai lệch dữ liệu payload trùng khóa** | API trả về mã lỗi `400` với mã lỗi nội bộ `ERR_IDEMPOTENCY_MISMATCH`. | Ghi log cảnh báo nghiêm trọng, chặn lượt chạy và thông báo SRE kiểm tra logic tạo khóa. | 2 giờ | 0 |
 | **Dữ liệu bảng điều khiển bị cũ** | CloudWatch Alarm kích hoạt nếu mốc thời gian phân vùng curated mới nhất cũ hơn 26 giờ. | Cảnh báo cho kỹ sư để kiểm tra log của pipeline và kích hoạt thủ công chạy lại lượt thu thập dữ liệu hàng ngày. | 1 giờ | 24 giờ |
 | **Lỗi gửi cảnh báo** | `LambdaAlertRouting` bắt được lỗi hết thời gian kết nối hoặc mã lỗi HTTP 5xx từ Slack API. | Hàm Lambda gửi payload cảnh báo vào hàng đợi SQS Dead Letter Queue (DLQ) và thử gửi qua kênh dự phòng email SES. | 10 phút | 0 |
@@ -534,4 +535,4 @@ Bảng dưới đây trình bày các chế độ lỗi, cơ chế phát hiện 
 - [`03_security_design_vi.md`](03_security_design_vi.md) - Các vai trò IAM, Security Groups, các vai trò Lambda execution roles, và khóa mã hóa KMS.
 - [`04_deployment_design_vi.md`](04_deployment_design_vi.md) - Cấu hình Terraform IaC dạng mô-đun, các pipeline triển khai GitHub Actions (CI/CD).
 - [`05_cost_analysis_vi.md`](05_cost_analysis_vi.md) - Dự toán ngân sách vận hành pipeline và so sánh chu kỳ chạy.
-- [`08_adrs_vi.md`](08_adrs_vi.md) - Các quyết định kiến trúc liên quan đến chu kỳ chạy 24 giờ, các hình ảnh Lambda container và gọi trực tiếp Lambda.
+- [`08_adrs_vi.md`](08_adrs_vi.md) - Các quyết định kiến trúc liên quan đến chu kỳ chạy 24 giờ, các hình ảnh Lambda container và host private ALB.

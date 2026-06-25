@@ -3,6 +3,18 @@
 <!-- Owner: Nhóm AI — TF2 FinOps Watch
      Signed by: AI Lead + CDO Lead (CDO-01) + CDO Lead (CDO-02) + Reviewer Panel
      Date signed: 2026-06-25 (W11 T5)
+     Version: v1.3.0 (đồng bộ ai-api-contract.md v1.4.0 + telemetry-contract.md v3.2.0)
+     Changelog từ v1.2.0:
+       [D6] §Secrets — Thêm `DYNAMODB_IDEMPOTENCY_TABLE`, tách idempotency hot path khỏi S3
+       [D7] §Secrets — `S3_TELEMETRY_BUCKET` pattern `company-cdo-{account_id}-telemetry`
+       [D8] §CDO Rollback Cache — S3 path dùng account-scoped bucket
+       [D9] §Appendix C — DynamoDB Idempotency table spec + stale lock recovery
+     Changelog từ v1.1.0:
+       [D1] §6.2 — CDO IAM: thêm Service Quotas cho quota-cap (Appendix B)
+       [D2] §6.3 — Khóa rate_limit_per_tenant: 100 req/min
+       [D3] §7   — SQS finops-watch-rollback: audit completion only (không dispatch rollback)
+       [D4] §10  — CDO Rollback Cache DynamoDB + boto3 offline execution (CDO-P1)
+       [D5] §11  — Error Budget Lock phân tầng theo môi trường (CDO-P3)
      🔒 FREEZE — Không thay đổi nếu không có Formal Change Request được cả hai bên ký -->
 
 ---
@@ -22,7 +34,13 @@
 11. [Health Check Specification](#health-check)
 12. [Observability & Tracing](#observability)
 13. [Failure Modes & Phản ứng Sự cố](#failure-modes--response)
-14. [Giải đáp các câu hỏi mở (Resolved Questions)](#resolved-questions)
+14. [CDO Containment & IAM Boundaries](#cdo-containment--iam-boundaries)
+15. [Rate Limiting](#rate-limiting)
+16. [Message Queues (SQS)](#message-queues-sqs)
+17. [CDO Rollback Cache](#cdo-rollback-cache)
+18. [Error Budget Lock — Phân tầng môi trường](#error-budget-lock)
+19. [Giải đáp các câu hỏi mở (Resolved Questions)](#resolved-questions)
+20. [Appendix B: CDO IAM Policy Mẫu](#appendix-b-cdo-iam-policy-mẫu)
 
 ---
 
@@ -34,7 +52,7 @@
 
 ## Key principle
 
-**Nhóm AI bàn giao engine dưới dạng artifact (Container Image đăng ký trên ECR) kèm bản spec triển khai này. MỖI CDO trong Task Force tự deploy engine lên platform riêng của mình** (ví dụ: CDO-01 dùng Serverless/ECS Fargate, CDO-02 dùng AWS App Runner / ECS Fargate... - mỗi CDO một góc tiếp cận kỹ thuật khác nhau và compete ở cách host, giám sát và tối ưu vận hành). 
+**. MỖI CDO trong Task Force tự deploy engine lên platform riêng của mình** (ví dụ: CDO-01 dùng Serverless/ECS Fargate, CDO-02 dùng AWS App Runner / ECS Fargate... - mỗi CDO một góc tiếp cận kỹ thuật khác nhau và compete ở cách host, giám sát và tối ưu vận hành). 
 
 Các thông số kỹ thuật bên dưới là **spec tham chiếu tối thiểu CDO phải đáp ứng** (CDO Fargate/App Runner map sang ECS Task / App Runner instance / Lambda - miễn là năng lực xử lý tương đương). Mỗi CDO sở hữu **endpoint riêng**, mỗi instance được cách ly dữ liệu multi-tenant hoàn toàn dựa trên `tenant_id`.
 
@@ -81,7 +99,10 @@ Quản lý thông tin nhạy cảm tập trung, cấm hardcode credentials trong
 |---|---|---|
 | `BEDROCK_API_KEY` | AWS Secrets Manager: `tf-2/ai-engine/bedrock` | API Key sơ cua (hoặc Token) nếu gọi qua API Gateway ngoài. Mặc định ưu tiên IAM Role. |
 | `AWS_REGION` | Environment Variable | Thiết lập mặc định: `ap-southeast-1` (Singapore) |
-| `DYNAMODB_TABLE_NAME` | Environment Variable | Tên bảng DynamoDB lưu audit trail cache |
+| `S3_TELEMETRY_BUCKET` | Environment Variable | Pattern: `company-cdo-{account_id}-telemetry` — CUR, features, audit backup |
+| `S3_CDO_NAMESPACE` | Environment Variable | `cdo-01` hoặc `cdo-02` khi nhiều CDO dùng chung account |
+| `DYNAMODB_IDEMPOTENCY_TABLE` | Environment Variable | `finops-idempotency-{env}` — hot path idempotency (TTL 24h) |
+| `DYNAMODB_FEATURE_STORE_TABLE` | Environment Variable | `finops-feature-store-{env}` — rolling stats (thay S3 list/get cho prod) |
 
 > 🔒 **Quy tắc an toàn mạng:** Tuyệt đối không sử dụng IAM User static access key. Toàn bộ hạ tầng của CDO phải gán IAM Task Execution Role có gắn Policy cho phép truy cập Bedrock và Secrets Manager. Secrets Manager rotation policy được thiết lập tự động xoay vòng mỗi 30 ngày.
 
@@ -97,7 +118,7 @@ AI Engine chạy trong Private Subnet, ngăn chặn tấn công từ internet pu
 | **Load Balancer** | Internal Application Load Balancer (ALB) only. Cấm Internet-facing ALB. |
 | **Security Group** | `tf-2-ai-engine-sg` |
 | **Ingress Rules** | Chỉ cho phép giao thức HTTPS (port 8080/443) đi từ Security Group của CDO Worker/Platform gọi đến AI Engine |
-| **Egress Rules** | Chỉ cho phép đi ra Internet qua NAT Gateway tới Bedrock Endpoint (`bedrock.ap-southeast-1.amazonaws.com`) và các VPC Gateway Endpoints cho Secrets Manager + DynamoDB |
+| **Egress Rules** | Chỉ cho phép đi ra Internet qua NAT Gateway tới Bedrock Endpoint (`bedrock.ap-southeast-1.amazonaws.com`) và các VPC Gateway Endpoints cho Secrets Manager + S3 |
 | **DNS Resolution** | Sử dụng Route 53 Private Hosted Zone để phân giải tên miền nội bộ |
 
 ---
@@ -167,7 +188,12 @@ Mỗi CDO thiết lập DNS nội bộ riêng để phân phối request tới i
 
 ## Cơ chế Rollback (Hoàn tác)
 
-Quy định phương thức khôi phục trạng thái cũ nhanh nhất khi xảy ra lỗi nghiêm trọng:
+> [!NOTE]
+> **v1.2.0 — Phân tách hai loại rollback:**
+> - **AI Engine deployment rollback** (bảng dưới): hoàn tác phiên bản container khi canary fail.
+> - **CDO containment rollback** (§CDO Rollback Cache): hoàn tác hành động can thiệp tài nguyên AWS — CDO tự thực thi boto3, không phụ thuộc AI Engine availability.
+
+Quy định phương thức khôi phục trạng thái cũ nhanh nhất khi xảy ra lỗi nghiêm trọng **triển khai AI Engine**:
  
 | Thuộc tính (Aspect) | Giá trị đặc tả (Value) |
 |---|---|
@@ -213,6 +239,203 @@ Quy định phương thức khôi phục trạng thái cũ nhanh nhất khi xả
  | **Lỗi mạng diện rộng (Region outage)** | CloudWatch Route53 Health check / DNS Failover alarm | Định tuyến failover sang Secondary Region (Active-Passive). |
  | **Bedrock throttling** | HTTP Code 429 (App-level metric) | Tự động kích hoạt **Exponential Backoff với Jitter**, nếu kéo dài >15s → Rule-based Fallback. |
  | **Rò rỉ bộ nhớ (Memory leak)** | Bộ nhớ container đạt ngưỡng $\ge 90\%$ | Thực hiện khởi động lại luân phiên (Rolling restart). |
+ | **AI Engine unavailable khi cần containment rollback** | `POST /v1/audit/{id}/rollback` timeout | CDO đọc `boto3_equivalent` từ DynamoDB cache (§CDO Rollback Cache) và thực thi trực tiếp — không block outage recovery. |
+
+---
+
+## CDO Containment & IAM Boundaries
+
+CDO Containment Worker thực thi AWS CLI/boto3 từ `DecideResponse.applied_payload` và `rollback_payload`. IAM Permission Boundary **phải** enforce hard boundary khớp ai-api-contract.md §7.
+
+| Containment Action | Môi trường được phép | IAM Enforcement |
+|---|---|---|
+| `tag-for-review` | Tất cả | `ec2:CreateTags`, `rds:AddTagsToResource` |
+| `time-gated-countdown` | dev, staging, sandbox, ml-research | Tag + SNS publish |
+| `auto-shutdown` | dev, sandbox, ml-research, staging | `ec2:StopInstances`, `rds:StopDBInstance`, `sagemaker:StopNotebookInstance` |
+| `quota-cap` | dev, sandbox, data-analytics | `servicequotas:GetServiceQuota`, `servicequotas:RequestServiceQuotaIncrease` |
+
+> ⛔ **Hard Boundary:** `resource_tags_user_environment NOT IN ('prod', 'prod-core', 'prod-payments')` được enforce ở cả AI Engine **và** IAM Condition `StringNotEquals` trên tag `environment` (xem Appendix B).
+
+---
+
+## Rate Limiting
+
+Khóa cứng đồng bộ với ai-api-contract.md §3:
+
+| Parameter | Value | Enforcement |
+|---|---|---|
+| `rate_limit_per_tenant` | **100 requests/phút** | API Gateway / ALB WAF rate-based rule |
+| Burst allowance | 20 requests (1 giây) | Token bucket |
+| Response khi vượt | `429 ERR_RATE_LIMITED` | CDO exponential backoff 1s→16s |
+
+---
+
+## Message Queues (SQS)
+
+| Queue Name | Producer | Consumer | Mục đích |
+|---|---|---|---|
+| `finops-watch-audit` | CDO Platform | AI Engine audit writer | Ghi audit trail bất đồng bộ |
+| `finops-watch-rollback` | CDO Platform | CDO audit completion worker | **Audit completion notification only** — KHÔNG dùng để dispatch rollback command |
+
+> [!IMPORTANT]
+> **v1.2.0 clarification:** Queue `finops-watch-rollback` nhận sự kiện **sau khi** CDO đã tự thực thi boto3 rollback thành công. Payload chứa `audit_id`, `rollback_status`, `rollback_executed_at` — khớp `POST /v1/audit/{audit_id}/rollback` request body. AI Engine consume để cập nhật feedback loop, không trả lệnh rollback.
+
+---
+
+## CDO Rollback Cache
+
+> **v1.2.0 — Đồng bộ ai-api-contract.md §5.2 + §5.6 (CDO-P1)**
+
+| Thuộc tính | Giá trị |
+|---|---|
+| **Storage** | DynamoDB table `finops-rollback-cache` (CDO account) + S3 backup `s3://company-cdo-{account_id}-telemetry/rollback-cache/{cdo_namespace}/{anomaly_id}` |
+| **TTL** | 90 ngày (khớp audit retention) |
+| **Write trigger** | Ngay khi nhận `DecideResponse` — cache `rollback_payload.boto3_equivalent` |
+| **Read trigger** | `next_action = ROLLBACK` hoặc engineer manual rollback |
+| **Execution** | CDO boto3 client gọi `service.method(**parameters)` — không gọi AI Engine |
+| **Post-execution** | `POST /v1/audit/{audit_id}/rollback` + publish SQS `finops-watch-rollback` |
+
+**Schema cache item:**
+
+```json
+{
+  "anomaly_id": "ANM-2026-0623A",
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "boto3_equivalent": {
+    "service": "ec2",
+    "method": "delete_tags",
+    "parameters": {
+      "Resources": ["i-0fbgpu00000004"],
+      "Tags": [{"Key": "finops:review"}, {"Key": "finops:anomaly-id"}]
+    }
+  },
+  "cached_at": "2026-06-23T17:05:46Z",
+  "ttl_epoch": 1750000000
+}
+```
+
+---
+
+## Error Budget Lock
+
+> **v1.2.0 — Đồng bộ ai-api-contract.md §3.3 (CDO-P3)**
+
+| Môi trường | Ngưỡng Rollback Rate (30 ngày) | Hành vi khi vượt |
+|---|---|---|
+| `prod`, `prod-core`, `prod-payments` | **1%** | `LOCKED_MODE` — mọi `/v1/decide` chỉ `dry_run_mode: true` |
+| `staging` | **10%** | `LOCKED_MODE` + cảnh báo; auto-unlock sau 24h nếu rate về dưới ngưỡng |
+| `dev`, `sandbox`, `ml-research`, `data-analytics` | **Không áp dụng** | Không bao giờ tự động khóa |
+
+CDO Platform đọc header `X-Containment-Status: LOCKED` từ AI Engine response và disable real containment execution tại IAM boundary level.
+
+---
+
+## Appendix B: CDO IAM Policy Mẫu
+
+Policy mẫu cho CDO Containment Worker Role. CDO customize per-account nhưng **không được** mở rộng quyền trên prod.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowContainmentOnNonProd",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags",
+        "ec2:DeleteTags",
+        "ec2:StopInstances",
+        "ec2:StartInstances",
+        "rds:AddTagsToResource",
+        "rds:RemoveTagsFromResource",
+        "rds:StopDBInstance",
+        "rds:StartDBInstance",
+        "sagemaker:StopNotebookInstance",
+        "sagemaker:StartNotebookInstance"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:ResourceTag/environment": ["prod", "prod-core", "prod-payments"]
+        }
+      }
+    },
+    {
+      "Sid": "AllowQuotaContainment",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:RequestServiceQuotaIncrease"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/environment": ["dev", "sandbox", "data-analytics"]
+        }
+      }
+    },
+    {
+      "Sid": "AllowAICallSigV4",
+      "Effect": "Allow",
+      "Action": "execute-api:Invoke",
+      "Resource": "arn:aws:execute-api:ap-southeast-1:*:*/v1/*"
+    },
+    {
+      "Sid": "AllowRollbackCacheRW",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:ap-southeast-1:*:table/finops-rollback-cache"
+    }
+  ]
+}
+```
+
+---
+
+## Appendix C: AI Engine DynamoDB Idempotency Table (v1.3.0)
+
+> **v3.2.0 telemetry-contract.md:** Idempotency hot path = DynamoDB, không phải S3.
+
+| Attribute | Value |
+|---|---|
+| **Table name** | `finops-idempotency-{env}` |
+| **Partition key** | `idempotency_key` (String) |
+| **Attributes** | `payload_sha256`, `status`, `response_cache`, `created_at`, `ttl_expiry` |
+| **TTL** | Attribute `ttl_expiry` (Number, Unix epoch) — auto-delete 24h |
+| **Billing** | On-demand (PAY_PER_REQUEST) — phù hợp batch 24h cadence |
+| **PITR** | Enabled (production) |
+
+**Write flow:**
+
+```
+1. PutItem ConditionExpression: attribute_not_exists(idempotency_key)
+   → status = IN_PROGRESS, ttl_expiry = now + 86400
+2. Process detect → UpdateItem status = COMPLETED, response_cache = DetectResponse JSON
+3. ConditionalCheckFailedException:
+   → GetItem → if COMPLETED + same sha256 → return cache
+   → if COMPLETED + different sha256 → 400 ERR_IDEMPOTENCY_MISMATCH
+   → if IN_PROGRESS + created_at < 5 min ago → 409 Conflict
+   → if IN_PROGRESS + created_at > 5 min ago → stale lock, allow re-process
+```
+
+**AI Engine IAM (minimum):**
+
+```json
+{
+  "Sid": "AllowIdempotencyRW",
+  "Effect": "Allow",
+  "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"],
+  "Resource": "arn:aws:dynamodb:ap-southeast-1:*:table/finops-idempotency-*"
+}
+```
+
+**Feature Store (production path):** Table `finops-feature-store-{env}` với PK=`resource_id`, SK=`date`. S3 feature path chỉ dùng capstone/backtest fallback.
+
+---
 
 ## Open questions (Đã làm rõ / Clarified)
 

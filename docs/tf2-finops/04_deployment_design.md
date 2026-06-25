@@ -16,7 +16,7 @@ The CDO platform uses a dual-layer deployment strategy to separate infrastructur
 1. **Infrastructure Layer (AWS Resources)**: Provisioned using **Terraform (v1.5+)** to ensure immutable resources (VPC, Lambda functions, ECR, DynamoDB, S3, IAM roles).
 2. **Workload Layer (Lambda Container Functions)**: Deployed using **Terraform Lambda configuration** and **GitHub Actions (CI/CD) deployment pipelines** by pinning ECR container image digests.
 
-Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda execution roles, ECR repositories, DynamoDB tables, and secrets plumbing. CDO owns the serverless hosting infrastructure deployment (VPC, subnets, reserved concurrency settings, security groups, Lambda execution roles, and S3-based audit and idempotency stores), while AIOps owns the container image builds, contract management, and model logic. Runtime Lambda desired state is managed through Terraform and GitHub Actions (CI/CD) deployment pipelines, so application image versions can move independently from infrastructure modules while still depending on Terraform outputs.
+Terraform owns the AWS platform foundation: networking, lakehouse buckets, Glue/Athena metadata, Step Functions, Lambda execution roles, ECR repositories, DynamoDB tables, and secrets plumbing. CDO owns the serverless hosting infrastructure deployment (VPC, subnets, reserved concurrency settings, security groups, Lambda execution roles, DynamoDB-based idempotency stores, and S3-based audit logs), while AIOps owns the container image builds, contract management, and model logic. Runtime Lambda desired state is managed through Terraform and GitHub Actions (CI/CD) deployment pipelines, so application image versions can move independently from infrastructure modules while still depending on Terraform outputs.
 
 ### 1.2 Module structure
 
@@ -49,7 +49,7 @@ The module boundary is intentionally service-oriented rather than team-oriented.
 
 ### 1.4 S3 Bucket Creation Standards
 
-During Terraform provisioning, the `s3-lakehouse` module enforces the `tf2-cdo{NN}-telemetry-{region}` standard for S3 bucket creation. Any bucket resource definition must match this naming convention, using variables for the CDO tenant number `{NN}` and AWS deployment region `{region}` to prevent non-standard S3 bucket namespaces.
+During Terraform provisioning, the `s3-lakehouse` module enforces the `company-cdo-{account_id}-telemetry` standard for S3 bucket creation. Any bucket resource definition must match this naming convention, using variables for the member account ID `{account_id}` to prevent non-standard S3 bucket namespaces.
 
 ## 2. CI/CD pipeline
 
@@ -119,14 +119,16 @@ The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 
 ```text
 1. Trigger the Step Functions workflow manually.
-2. Run the ingestion Lambda against synthetic CUR/Cost Explorer data.
-3. Confirm raw and curated data are written to S3 buckets adhering to the 'tf2-cdo{NN}-telemetry-{region}' naming standard.
+2. Run the ingestion Lambda against CUR/Cost Explorer data.
+3. Confirm raw and curated data are written to S3 buckets adhering to the 'company-cdo-{account_id}-telemetry' naming standard.
 4. Confirm Glue/Athena can query the curated cost dataset.
-5. Invoke the AI Engine Lambda function directly using IAM authorization:
-   - Verify that '/v1/detect' returns 'data_confidence' (LOW/MEDIUM/HIGH).
-   - Verify that '/v1/decide' returns 'rollback_payload.boto3_equivalent', which the CDO caches.
-6. Verify that the CDO can successfully run a rollback from the local cache while the AI Engine is simulated to be offline.
-7. Verify the AI Engine Lambda returns a synchronous 200 OK with success indicator.
+5. Invoke the AI Engine private ALB endpoint using HTTPS and AWS SigV4 authorization:
+   - Verify that `/v1/detect` returns 'data_confidence' (HIGH/LOW classification).
+   - Verify that `/v1/decide` returns 'rollback_payload.boto3_equivalent'.
+   - Verify that `/v1/status/{id}` and `/v1/verify` endpoints are responsive.
+6. Verify that the CDO platform caches the 'rollback_payload.boto3_equivalent' into the DynamoDB table 'finops-rollback-cache' immediately.
+7. Verify that the CDO can successfully run a rollback from the local cache while the AI Engine is simulated to be offline, ensuring rollback independence.
+8. Verify the AI Engine ALB returns a synchronous 200 OK with success indicator on '/health'.
 ```
 
 Note: Verification of the workflow execution (confirming alert routing payloads, checking containment dry-run behavior, and verifying audit records in S3) is decoupled from the deployment pipeline and run via a dedicated, periodic End-to-End (E2E) test suite to avoid blocking CI/CD runners.
@@ -156,11 +158,11 @@ The destructive-change gate is stricter for stateful resources. S3 buckets, Dyna
 
 ### 3.3 AI contract compatibility
 
-Before Lambda container image updates are allowed, a pre-deployment script runs validation checks to enforce the **v1.3.0 schema contract**:
+Before Lambda container image updates are allowed, a pre-deployment script runs validation checks to enforce the contract schemas (ai-api-contract.md v1.4.0, telemetry-contract.md v3.2.0, deployment-contract.md v1.3.0):
 1. Compares the AIOps model version registry against the target ECR image manifest.
-2. Performs JSON schema validation on the AI Engine's logical `/v1/detect` and `/v1/decide` contracts (direct Lambda invocation), specifically verifying:
-   - Request payloads include the `telemetry_delay_event` boolean flag, `callback_url` target, and `s3_bucket_uri` validated against the strict regex `^s3://tf2-cdo[0-9]{2}-telemetry-[a-z0-9-]+/.*$`.
-   - Response payloads contain `data_confidence` (LOW/MEDIUM/HIGH classification) and `rollback_payload.boto3_equivalent`.
+2. Performs JSON schema validation on the AI Engine's HTTPS `/v1/*` contracts behind the private ALB, verifying:
+   - Request payloads include the `telemetry_delay_event` boolean flag, `callback_url` target, `business_context`, `traffic_volume`, and `s3_bucket_uri` validated against the regex `^s3://company-cdo-[0-9]{12}-telemetry/.*$`.
+   - Response payloads contain `data_confidence` (HIGH/LOW classification) and `rollback_payload.boto3_equivalent`. The `cost_per_request` is derived by the AI Engine from the incoming `business_context.traffic_volume` telemetry rather than being a standalone response validation check.
 3. If schemas mismatch, the build fails before updating the Lambda function configuration, ensuring deployment compatibility.
 
 The compatibility check does not evaluate model quality or inspect AIOps training data. It verifies only the operational contract CDO depends on: endpoint health, request schema, response schema, required fields, model version field, timeout behavior, and failure modes. If the AI Engine is unavailable or incompatible, CDO deployment can proceed only for infrastructure changes that do not enable containment apply paths.
@@ -206,7 +208,7 @@ We enforce isolation across three AWS accounts:
 | Env | Purpose | Account | Auto-deploy |
 |---|---|---|---|
 | **Sandbox** | Fast iteration, integration smoke tests, and non-prod containment examples. | `1111-2222-3333` | True, from `develop` after checks pass |
-| **Staging** | Validation of AIOps container artifacts, direct Lambda invocation, and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True, from `main` after reviewed merge |
+| **Staging** | Validation of AIOps container artifacts, ALB HTTPS APIs, and full Step Functions E2E pipeline execution. | `4444-5555-6666` | True, from `main` after reviewed merge |
 | **Prod** | Production control plane. Monitors approved company accounts. Auto-containment is strictly tag/suggest/dry-run. | `7777-8888-9999` | False, requires GitHub environment approval |
 
 Environment-specific values live only in `environments/*`. Sandbox may enable limited non-prod apply-mode examples; staging validates dry-run and integration behavior; prod must keep containment apply disabled by default.
