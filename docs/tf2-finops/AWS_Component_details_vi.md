@@ -563,7 +563,7 @@ Nó giúp dữ liệu thô và dữ liệu chuẩn hóa trong S3 có thể truy 
 - Các vị trí lưu trữ S3 thô (raw) và chuẩn hóa (curated).
 - Schema của các bảng.
 - Các khóa phân vùng (partition keys) như `account_id`, `year` và `month`.
-- Cấu hình bảng IaC và các tham số partition projection.
+- Cấu hình bảng IaC và các tham số partition projection (ADR-014).
 - Các định nghĩa kiểu dữ liệu.
 
 ### Đầu ra (Output)

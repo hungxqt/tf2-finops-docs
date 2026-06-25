@@ -563,7 +563,7 @@ It makes raw and curated S3 data queryable by Athena without moving it into a fi
 - Raw and curated S3 locations.
 - Table schemas.
 - Partition keys such as `account_id`, `year`, and `month`.
-- IaC table configuration and partition projection parameters.
+- IaC table configuration and partition projection parameters (ADR-014).
 - Data type definitions.
 
 ### Output
