@@ -1,2 +1,21 @@
 .agents
 .codex
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+
+# State Lambda build artifacts
+services/state-lambda/build/
+services/state-lambda/*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+services/state-lambda/terraform/backend.tf

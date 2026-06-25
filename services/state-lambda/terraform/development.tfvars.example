@@ -1,0 +1,8 @@
+aws_region  = "ap-southeast-1"
+environment = "development"
+owner       = "finops-platform"
+
+lambda_architecture    = "x86_64"
+lambda_memory_size     = 128
+lambda_timeout_seconds = 15
+log_retention_days     = 14
