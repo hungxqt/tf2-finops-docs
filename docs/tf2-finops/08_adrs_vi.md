@@ -295,4 +295,22 @@
   - DynamoDB làm kho lưu trữ kiểm toán có thẩm quyền: Bị từ chối vì DynamoDB không hỗ trợ nguyên bản các ràng buộc write-once-read-many (WORM), vi phạm các NFR tuân thủ nghiêm ngặt.
   - Giữ DynamoDB làm kho lưu trữ idempotency có thẩm quyền: Bị từ chối để đồng nhất kho lưu trữ giao dịch của chúng tôi và đơn giản hóa mã nguồn thu thập của nền tảng CDO, tận dụng các quy tắc lifecycle của S3 để tự động dọn dẹp thay vì quản lý TTL trên DynamoDB.
 
+---
+
+## ADR-017 - Sử dụng AWS Lambda Function URL cho các API endpoint của backend dashboard (Lambda Function URLs for dashboard backend API endpoints)
+
+- **Trạng thái (Status)**: Accepted
+- **Ngày (Date)**: 2026-06-25
+- **Bối cảnh (Context)**: Nền tảng CDO yêu cầu các endpoint HTTP/HTTPS bảo mật, được xác thực để phục vụ các hành động tương tác trên dashboard (ví dụ: kích hoạt rollback thủ công hoặc xác minh can thiệp) nhằm gọi các hàm Containment Lambda và State Lambda ở backend. Chúng tôi cần quyết định giữa việc triển khai AWS API Gateway (HTTP API) hoặc sử dụng tính năng AWS Lambda Function URL gốc.
+- **Quyết định (Decision)**: Triển khai **AWS Lambda Function URL** để cung cấp trực tiếp các endpoint cho các hàm Containment Lambda và State Lambda ở backend. Bảo mật các endpoint này bằng cách định tuyến chúng qua phân phối CloudFront hiện tại và xác thực Cognito session token (JWT) thông qua cổng auth `Lambda@Edge` có sẵn hoặc xác thực trực tiếp trong mã nguồn Lambda.
+- **Hệ quả (Consequence)**:
+  - Pro: **Vượt qua giới hạn timeout của API Gateway**: Loại bỏ giới hạn timeout tích hợp cứng 30 giây của API Gateway. Luồng xác minh (`POST /v1/verify`) và các hành động rollback có thể chạy đồng bộ tối đa 15 phút nếu cần thiết.
+  - Pro: **Bằng 0 chi phí nền tảng**: Function URL hoàn toàn miễn phí (không tính phí yêu cầu hoặc phí triển khai hàng tháng), chỉ tính phí dựa trên tài nguyên compute thực tế của Lambda.
+  - Pro: **Đơn giản hóa hạ tầng**: Loại bỏ các cấu hình Terraform phức tạp để quản lý API Gateway routes, deployments, stages, và các tích hợp mapping.
+  - Trade-off: Thiếu tính năng liên kết trực tiếp Cognito JWT Authorizer gốc trên tài nguyên. Việc xác thực token phải được triển khai trong mã nguồn Lambda hoặc kiểm tra tại ranh giới của phân phối CloudFront.
+  - Trade-off: Mỗi hàm nhận được một URL ngẫu nhiên duy nhất. Điều này được giảm thiểu bằng cách cấu hình các URL này thành các origin path riêng biệt (ví dụ: `/api/containment/*` và `/api/state/*`) đằng sau một phân phối CloudFront duy nhất.
+- **Các phương án thay thế đã xem xét (Alternatives considered)**:
+  - AWS API Gateway (HTTP API): Bị từ chối vì giới hạn timeout tích hợp 30 giây cứng có thể gây lỗi kết nối cho các tác vụ kiểm tra đồng bộ kéo dài, và để tránh thêm các thành phần hạ tầng không cần thiết vào mặt phẳng điều khiển serverless.
+
+
 

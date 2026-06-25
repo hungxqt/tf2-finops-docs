@@ -296,4 +296,22 @@
   - DynamoDB as authoritative audit store: Rejected because DynamoDB does not support write-once-read-many (WORM) constraints natively, violating strict compliance NFRs.
   - Keep DynamoDB for idempotency authority: Rejected to unify our transaction store and simplify the CDO platform ingestion code, leveraging S3 lifecycle rules for automatic cleanup instead of DynamoDB TTL management.
 
+---
+
+## ADR-017 - Lambda Function URLs for dashboard backend API endpoints
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The CDO platform requires secure, authenticated HTTP/HTTPS endpoints for interactive dashboard controls (e.g., manual rollbacks or remediation verification) to trigger backend Containment and State Lambdas. We must decide between provisioning an AWS API Gateway (HTTP API) or utilizing native AWS Lambda Function URLs.
+- **Decision**: Deploy **AWS Lambda Function URLs** to expose the backend Containment and State Lambdas directly. Secure these endpoints by routing them through the CloudFront distribution and validating Cognito session tokens (JWT) using the existing `Lambda@Edge` authentication gateway or inside the target Lambda code.
+- **Consequence**:
+  - Pro: **Bypasses API Gateway timeouts**: Removes the hard 30-second integration timeout of API Gateway. The verification flow (`POST /v1/verify`) and rollback actions can run synchronously for up to 15 minutes if necessary.
+  - Pro: **Zero baseline cost**: Function URLs are free of request or monthly provisioning fees, charging only for the underlying Lambda compute usage.
+  - Pro: **Infrastructure simplification**: Eliminates Terraform configuration overhead for API Gateway routes, deployments, stages, and integration mappings.
+  - Trade-off: Lacks native Cognito JWT authorizer bindings directly on the resource. Authentication must be verified inside the Lambda code or at the CloudFront distribution boundary.
+  - Trade-off: Each function gets a unique, randomly generated URL. This is mitigated by mapping them behind a unified CloudFront distribution as separate backend origin paths (e.g., `/api/containment/*` and `/api/state/*`).
+- **Alternatives considered**:
+  - AWS API Gateway (HTTP API): Rejected because the hard 30-second integration timeout poses a risk for synchronous verification loops, and to avoid unnecessary deployment complexity in the serverless control plane.
+
+
 
