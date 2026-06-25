@@ -1,4 +1,5 @@
-# Phân tích Yêu cầu (Requirements Analysis) - Task Force 2 · FinOps Watch<!-- Doc owner: CDO Team
+# Phân tích Yêu cầu (Requirements Analysis) - Task Force 2 · FinOps Watch
+<!-- Doc owner: CDO Team
      Status: Final (W11 T6 Pack #1) -> Refined (W12 T4 Pack #2)
 -->
 
