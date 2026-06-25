@@ -34,10 +34,14 @@ Quyền truy cập vào bảng điều khiển S3 + CloudFront được kiểm s
 - **Quản lý phiên (Session Management)**: Các session token (ID, access, và refresh token) được trao đổi và lưu trữ dưới dạng secure cookies (chỉ HTTPS, cờ SameSite=Strict và Secure) với vòng đời ngắn.
 - **S3 Origin Riêng tư**: Bucket S3 chứa các tài nguyên tĩnh được cấu hình hoàn toàn riêng tư. Mọi truy cập công cộng trực tiếp đều bị chặn bằng Origin Access Control (OAC), đảm bảo bảng điều khiển chỉ có thể truy cập qua CloudFront.
 - **Ủy quyền Viewer-Request (Viewer-Request Authorization)**: Một hàm Lambda@Edge viewer-request sẽ chặn mọi yêu cầu đến CloudFront. Nó xác thực JWT token của Cognito trước khi trả về các file tĩnh hoặc dữ liệu JSON.
+  *(Lưu ý kiến trúc: Lambda@Edge là bắt buộc ở đây do session token của Cognito sử dụng chữ ký bất đối xứng RS256, yêu cầu truy xuất public key động từ endpoint JWKS của Cognito. CloudFront Functions thông thường không hỗ trợ mật mã bất đối xứng hoặc gọi mạng ra ngoài. Tuy nhiên, như một tối ưu hóa trong tương lai, nếu cấu hình xác thực token đối xứng (HS256) hoặc phân phối public key qua CloudFront KeyValueStore, cổng auth có thể chuyển đổi sang CloudFront Functions để đạt chi phí bằng 1/6 so với Lambda@Edge và độ trễ dưới 1 mili-giây).*
 - **Ủy quyền theo nhóm (Group-Based Authorization)**:
   - `finops-finance-readonly`: Thành viên có quyền xem xu hướng chi tiêu, tóm tắt bất thường, cảnh báo Finance, và liên kết kiểm toán. Người dùng Finance bị giới hạn nghiêm ngặt ở chế độ xem đọc-ghi và không bao giờ được thấy các rollback script thô, lệnh CLI, hoặc nút thực thi containment.
   - `finops-engineering-operator`: Thành viên có quyền xem chi tiết kỹ thuật bất thường, truy cập context role thực thi, và sử dụng các nút điều khiển Extend/Snooze hoặc Rollback/Restore đã phê duyệt.
   - `finops-cdo-admin`: Thành viên có toàn quyền quản trị để quản lý user pool, nhóm, chính sách truy cập bảng điều khiển, khả năng hiển thị dữ liệu giả lập, và các cấu hình vận hành.
+
+### Backend API Endpoint
+To support interactive actions on the dashboard (such as the "Extend" button invoking the containment duration extension, the "Rollback" button, and the remediation verification flow `/v1/verify`), the Frontend does not call the Lambdas directly. Instead, an **AWS API Gateway (HTTP API)** or **AWS Lambda Function URLs** (secured via Cognito IAM/JWT Authorizers) is provisioned. The frontend makes HTTP requests to this endpoint (representing routes like `POST /v1/action/extend`, `POST /v1/audit/{audit_id}/rollback`, and `POST /v1/verify`), which are then routed to the respective Containment or State Lambdas. This ensures the frontend-backend communication path is secure, authenticated, and not left floating without a public endpoint.
 
 
 ---
@@ -101,7 +105,7 @@ Tất cả các bất thường được phát hiện được định tuyến t
 - **Kênh phân phối**: Slack Webhook (Các kênh squad chuyên dụng) hoặc Jira API (tự động tạo ticket).
 - **Trọng tâm nội dung**: ID tài nguyên kỹ thuật (ARN), loại dịch vụ, môi trường (Dev/Sandbox/Prod), trạng thái tuân thủ tag và đường dẫn rollback đề xuất.
 - **Kiểm soát hành động (Action Control)**: Bao gồm các liên kết hành động Xác thực và Hoàn tác ngắn hạn, được xác thực (thực thi đối với lớp API đại diện cho ngữ nghĩa `/v1/verify` và `/v1/audit/{audit_id}/rollback`) khi chính sách và cấu hình môi trường cho phép.
-- **Tần suất**: Gần như thời gian thực (trong vòng 30 phút sau khi pipeline hoàn thành).
+- **Frequency & Aggregation**: To prevent alert fatigue and Slack spam, the Alert Lambda aggregates (batches) alerts by `Squad_ID` and sends them as a single daily Digest message (instead of sending near real-time spam for individual anomalies like 50 pods failing simultaneously). The digest lists the top most severe anomalies requiring attention.
 
 *Ghi chú về dữ liệu telemetry*: Dữ liệu đo lường được xử lý để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, giảm nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only.
 

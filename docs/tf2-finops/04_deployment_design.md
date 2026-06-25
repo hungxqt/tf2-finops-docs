@@ -119,13 +119,12 @@ The post-deployment smoke test uses synthetic data and runs in dry-run mode:
 3. Confirm raw and curated data are written to S3.
 4. Confirm Glue/Athena can query the curated cost dataset.
 5. Invoke the AI Engine Request Lambda function directly using IAM authorization.
-6. Poll the run state and results in DynamoDB/S3 until the async execution completes.
-7. Confirm alert routing produces Finance/Engineering payloads.
-8. Confirm containment stays in dry-run mode unless the target is dev/sandbox.
-9. Confirm run state and audit records are written to DynamoDB.
+6. Verify the Request Lambda returns 200 Accepted and successfully pushes the task to the SQS queue.
 ```
 
-A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, Lambda functions become healthy, and the smoke test confirms that ingestion, AI invocation, alert routing, containment dry-run, and audit logging work together.
+Note: Verification of the asynchronous workflow completion (polling run state until execution completes, confirming alert routing payloads, checking containment dry-run behavior, and verifying audit records in DynamoDB) is decoupled from the deployment pipeline and run via a dedicated, periodic End-to-End (E2E) test suite to avoid blocking CI/CD runners.
+
+A deployment is accepted only when the workflow passes validation, Terraform apply completes successfully, Lambda functions become healthy, and the smoke test confirms that ingestion, AI request acceptance, and SQS queuing work together. The full asynchronous execution is verified by the periodic E2E test suite.
 
 ### 2.2 Branch strategy
 
@@ -169,8 +168,8 @@ To ensure secure software delivery and prevent tampering in compliance with the 
 
 ### 4.1 Strategy
 
-- **AI Engine Lambda Workloads**: Deployed using **Lambda Weighted Aliases** by publishing Lambda versions and pinning ECR digests. Traffic shifts gradually: a `10%` canary window for 5 minutes, transitioning to `100%` if no execution errors occur.
-- **Async SQS Lambda Workers**: Deployed using Lambda versions. Updates to worker configurations affect new SQS message pollers immediately.
+- **AI Engine Request Lambda Workloads (Synchronous)**: Deployed using **Lambda Weighted Aliases** by publishing Lambda versions and pinning ECR digests. Traffic shifts gradually: a `10%` canary window for 5 minutes, transitioning to `100%` if no execution errors occur.
+- **Async AI Engine Worker Lambda (SQS Triggered)**: Deployed using an **All-at-once** strategy. Weighted aliases are not used for SQS triggers because changing SQS event source mapping weights can trigger mapping recreation and cause disruptions. Instead, safe deployment is ensured via a strict **Dead Letter Queue (DLQ)** configuration to capture message failures, combined with **Feature Flags** inside the application code to safely toggle new logic.
 - **Lambda Reserved Concurrency**: Configured with a default reserved concurrency limit (e.g., 5-10 concurrent executions baseline) to act as a rate-limiting and cost guardrail, avoiding execution spikes and throttling limits.
 - **SQS Concurrency Controls**: Configured on the event source mapping using maximum concurrency settings and batch size constraints to align message processing with AI Engine capacity and prevent database connection exhaustion.
 - **Lambda Timeout & Execution Retry Handling**: The Request and Worker Lambda functions are built with automatic retry handling. SQS acts as a buffer; if a Lambda execution is interrupted (e.g., container recycling or platform issue), the message is returned to the queue for a retry, up to a maximum limit, before being routed to the Dead Letter Queue (DLQ).
@@ -214,17 +213,17 @@ GitHub secrets are limited to non-cloud metadata needed to bootstrap OIDC, not l
 
 ## 7. Scheduled batch deployment
 
-The Step Functions state machine and EventBridge Scheduler are deployed using Terraform modules. The deployment process incorporates operational check runbooks:
+The Step Functions state machine and EventBridge Scheduler are deployed using Terraform modules leveraging Step Functions Versions and Aliases to enable zero-downtime atomic transitions. The deployment process incorporates operational checks:
 
 ```
-1. Deploy updated Step Functions JSON definition via Terraform.
-2. Temporarily disable the EventBridge Scheduler rule to prevent triggering midway.
-3. Execute smoke-test run to verify Lambda connectivity and Glue tables.
-4. Enable the EventBridge Scheduler rule targeting the new state machine version.
-5. Record pipeline transition and execution time in the DynamoDB deployment log.
+1. Deploy the updated Step Functions JSON definition via Terraform.
+2. Publish a new Version of the Step Functions state machine.
+3. Perform validation checks on the new version.
+4. Update the target Alias (e.g. PROD) to point to the new Version atomically.
+5. Record the pipeline transition and execution time in the DynamoDB deployment log.
 ```
 
-The scheduler deployment sequence prevents half-updated workflow definitions from processing a daily run. If the state machine changes the AI invocation payload, the deployment also runs the AI contract compatibility check before re-enabling the schedule. Failed smoke tests leave the schedule disabled and create an operator alert with the previous known-good state machine ARN.
+The Step Functions Alias deployment sequence prevents half-updated workflow definitions from processing a daily run. The EventBridge Scheduler rule always targets the stable Alias (e.g., `PROD`), completely eliminating the need to disable/enable the scheduler rule during deployment. If the state machine changes the AI invocation payload, the deployment also runs the AI contract compatibility check before updating the alias version. Failed verification checks halt the alias update, leaving the alias pointing to the previous known-good state machine Version and alerting the operator.
 
 ## 8. Observability stack
 
