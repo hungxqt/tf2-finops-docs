@@ -10,7 +10,7 @@
 
 The CDO platform enforces isolation within a dedicated VPC. All compute resources run in isolated private subnets with no internet gateway route. All AWS API communications occur privately using AWS VPC Endpoints.
 
-The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The Step Functions orchestrator invokes the AI Engine Request Lambda directly. An asynchronous queueing model using SQS/DLQ isolates heavy inference workloads from request validation. The Request Lambda processes incoming detection requests, publishes them to SQS, and returns status immediately. Note that `/v1/detect` and `/v1/detect/result/{audit_id}` represent logical contract semantics for model integration, not deployed REST/HTTP routes, as no Private API Gateway is deployed. The AI Engine does not receive direct credentials for member account containment actions.
+The security design assumes two primary trust boundaries: the CDO management account boundary and the member account boundary. Cost data, AI decision payloads, alert payloads, and containment audit records stay inside the CDO-controlled AWS network path. The Step Functions orchestrator invokes the AI Engine Request Lambda directly. An asynchronous queueing model using SQS/DLQ isolates heavy inference workloads from request validation. The Request Lambda processes incoming detection requests, publishes them to SQS, and returns status immediately. Note that `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` represent logical contract semantics for model integration, not deployed REST/HTTP routes, as no Private API Gateway is deployed. The AI Engine does not receive direct credentials for member account containment actions.
 
 ```mermaid
 graph TD
@@ -125,8 +125,18 @@ Access control for the static S3 + CloudFront Finance Dashboard is enforced thro
 - **Lambda@Edge Token Validation**: The CloudFront viewer-request Lambda@Edge function intercepts all requests, parses JWT cookies, checks signatures against the Cognito JWKS endpoint, and validates claims (expiration, audience, issuer). Invalid or expired tokens trigger automatic redirects to the Hosted UI login page.
 - **Group-Based Access Policies**:
   - `finops-finance-readonly`: Members are authorized for read-only visualization of spend trends, anomaly summaries, and audit trail records. The UI blocks rendering of CLI commands, raw rollback scripts, or containment execution triggers.
-  - `finops-engineering-operator`: Members are authorized to access technical detail, view the raw `rollback_script_encapsulated` execution commands, and trigger approved programmatic snoozing (representing `/v1/action/extend` semantics) and rollback (representing `/v1/action/rollback` semantics) actions.
+  - `finops-engineering-operator`: Members are authorized to access technical detail, view raw execution plans, and trigger approved programmatic validation (representing `/v1/verify` semantics) and manual rollback (representing `/v1/audit/{audit_id}/rollback` semantics) actions.
   - `finops-cdo-admin`: Members are granted permissions to manage access policies, adjust user group assignments, and configure global platform control flags.
+
+### 2.5 Error Budget Security Lock (LOCKED_MODE)
+
+To prevent automated containment runaways and protect resource availability, the platform enforces an automatic Error Budget Security Lock:
+1. **Trigger Condition**: If the rollback rate (manually triggered rollbacks due to false positives) exceeds **1% within a 30-day rolling window**, the AI Engine automatically transitions the tenant to `LOCKED_MODE`.
+2. **Behavior**:
+   - Every request to `/v1/decide` automatically returns `dry_run_mode: true`, and the AI Engine refuses to provide active remediation payloads.
+   - All response headers include the `X-Containment-Status: LOCKED` and `X-Lock-Reason: error_budget_exceeded_1pct` fields.
+   - The CDO platform forces all downstream containment executions to dry-run (alert-only) mode, ignoring any manual override attempts.
+3. **Recovery**: Transitioning out of `LOCKED_MODE` requires manual review and approval by the AI Team Lead, who must explicitly reset the error budget parameters.
 
 ## 3. Secrets Management
 
@@ -136,26 +146,45 @@ The following secrets are stored in AWS Secrets Manager:
 
 | Secret | Storage | Rotation | Accessed by |
 |---|---|---|---|
-| `finops/ai-engine/api-key` | AWS Secrets Manager (KMS CMK encrypted) | 30 days automatic | AI Engine Request Lambda (via SDK during cold start) |
+| `finops/ai-engine/api-key` (Deprecated) | Deprecated | N/A | Superseded by AWS IAM SigV4 credentials |
 | `finops/dashboard/db-creds` | AWS Secrets Manager | 60 days automatic | Athena crawler / Future QuickSight dataset engine |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | 90 days manual | `LambdaAlertRouting` |
-| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | 90 days automatic | Step Functions validation Lambda and AI Engine Request Lambda |
+| `finops/ai-engine/contract-signing-key` (Deprecated) | Deprecated | N/A | Superseded by request payload integrity checks (`X-Payload-SHA256`) |
 | `finops/containment/external-id-seed` | AWS Secrets Manager | Manual rotation on incident | Containment role provisioning workflow |
 
-### 3.2 Inject Pattern
+### 3.2 Inject Pattern & Integrity Verification
 
-We use AWS Secrets Manager SDK to retrieve secrets in Lambda functions at runtime, rather than passing them as plaintext environment variables. Secrets are resolved during function cold-starts, cached in the function's global execution context, and checked against cache TTL policies (e.g. 5 minutes) to avoid direct API invocation overhead on subsequent requests.
+Because the platform uses AWS IAM SigV4 for service-to-service authentication instead of static API keys, the Request and Worker Lambda functions do not pull static API keys from Secrets Manager. Instead, the AI Engine Request Lambda validates request integrity and clock skew drift (max 300s) directly from cross-cutting headers.
 
-For example, the Lambda container function retrieves its API key dynamically using the AWS SDK:
+For example, the Lambda container function validates the incoming request using the following python logic:
+
 ```python
-import boto3
-import os
+import time
+import hashlib
+from datetime import datetime
 
-def get_api_key():
-    secret_name = os.environ["API_KEY_SECRET_ARN"]
-    client = boto3.client("secretsmanager")
-    response = client.get_secret_value(SecretId=secret_name)
-    return response["SecretString"]
+def validate_request_integrity(event):
+    headers = event.get("headers", {})
+    body = event.get("body", "")
+    
+    # 1. Verify Clock Skew (max 300s)
+    req_timestamp_str = headers.get("X-Request-Timestamp")
+    if not req_timestamp_str:
+        return {"statusCode": 400, "body": "Missing X-Request-Timestamp"}
+        
+    req_time = datetime.fromisoformat(req_timestamp_str.replace("Z", "+00:00"))
+    now = datetime.now(req_time.tzinfo)
+    drift = abs((now - req_time).total_seconds())
+    if drift > 300:
+        return {"statusCode": 400, "body": "ERR_REPLAY_DETECTED: Clock skew > 300 seconds"}
+        
+    # 2. Verify Payload Hash
+    payload_hash = headers.get("X-Payload-SHA256")
+    calculated_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if payload_hash != calculated_hash:
+        return {"statusCode": 400, "body": "ERR_IDEMPOTENCY_MISMATCH: Hash mismatch"}
+        
+    return {"statusCode": 200}
 ```
 
 The injection path uses secure runtime lookup. Lambda functions read secrets directly through the Secrets Manager SDK because they are short-lived, containerized tasks. Terraform creates secret containers and IAM permissions, but it does not store secret values in `.tfvars`, Terraform state, or build configurations.
@@ -242,7 +271,7 @@ Every action taken by the CDO platform is documented. For containment actions, t
 }
 ```
 
-The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in DynamoDB and S3, with the integrity hash calculated as `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Telemetry gửi tới AI Engine để phát hiện bất thường là dữ liệu chi phí CUR-only và tuyệt đối không bao gồm các tín hiệu hiệu năng CloudWatch. Hệ thống log và metrics của CloudWatch chỉ phục vụ cho việc giám sát vận hành của CDO và cảnh báo SRE. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
+The audit record is written before any apply-mode operation is attempted, and it is updated after the operation with the final status. Every containment action record is cryptographically linked to the previous one in an append-only chain stored in DynamoDB and S3, with the integrity hash calculated as `sha256(current_payload + previous_hash)` to ensure tamper-evidence. Dry-run operations still generate audit logs because Finance needs to see what the platform would have done and why the action is safe. AI model training datasets are not logged by the CDO; the CDO only logs call metadata, returned decision fields, and operational evidence references required for alerting and containment. Telemetry sent to the AI Engine for anomaly detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and SRE alerts. All dashboard authentication activities (successful logins, logouts, expired session renewals), authentication failures (failed login attempts, invalid token signatures, replay window breaches), and unauthorized group access attempts (such as a readonly Finance user attempting to invoke an operator action) are logged immediately to CloudWatch Logs and streamed to S3 for audit trail preservation.
 
 ### 5.2 Storage + Retention
 

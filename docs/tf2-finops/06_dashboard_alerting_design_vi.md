@@ -70,19 +70,18 @@ Một bảng kiểm toán tương tác liệt kê tất cả các hành động 
 - **Hành động containment đang hoạt động**: Bảng hiển thị ID tài nguyên, tài khoản, squad sở hữu, loại hành động (ví dụ: Tagging, Sandbox Shutdown, Quota Cap) và thời gian thực thi.
 - **Chế độ thực thi (Execution Mode)**: Gắn nhãn rõ ràng cho các hành động là `dry-run` (giả lập containment hoặc chỉ đề xuất) hoặc `apply` (áp dụng tự động chính sách trên môi trường non-production).
 - **Đường liên kết bản ghi kiểm toán**: Một đường liên kết trực tiếp, có thể nhấp để xem bản ghi kiểm toán không thể sửa đổi được lưu trữ dưới dạng đối tượng S3 JSON. Mỗi liên kết tham chiếu đến Correlation ID và Idempotency Key duy nhất của lượt chạy.
-- **Các trường trạng thái & đếm ngược dựa trên hợp đồng (Contract-Backed Countdown & Status Fields)**: Giao diện người dùng hiển thị các tham số chính được truy vấn trực tiếp từ bảng DynamoDB run-state, đại diện cho ngữ nghĩa hợp đồng logic `/v1/detect/result/{audit_id}`:
-  - `audit_id`: Mã định danh duy nhất cho phiên kiểm toán chi phí.
-  - `enforcement_countdown.time_lock_seconds`: Khoảng thời gian đếm ngược ban đầu (thường là 14400 giây / 4 giờ trên môi trường Staging).
-  - `fallback_action`: Hành động chính sách tự động được áp dụng khi đếm ngược hết hạn (ví dụ: `schedule-shutdown`).
-  - **Thời gian hết hạn hiện tại**: Dấu thời gian động hiển thị thời điểm hành động sẽ thực thi.
-  - **Cờ khả dụng của điều khiển**: Các nút hiển thị liệu tính năng Gia hạn (Extend) hoặc Khôi phục (Rollback) có khả dụng đối với trạng thái tài nguyên và môi trường hiện tại hay không.
-- **Hành vi Gia hạn/Tạm ẩn (Extend/Snooze Behavior)**: Cho phép các kỹ sư trì hoãn thời gian đếm ngược bằng cách gọi trực tiếp hàm containment Lambda (đại diện cho ngữ nghĩa `/v1/action/extend`).
-  - *Tham số request*: `audit_id`, `extend_seconds`, và `reason` (lý do gia hạn).
-  - *Phản hồi/Trạng thái giao diện mong muốn*: Chuyển trạng thái sang `extended` và cập nhật đếm ngược để hiển thị `new_expiration_time` mới.
-- **Hành vi Khôi phục/Hoàn tác (Rollback/Restore Behavior)**: Cho phép các kỹ sư hoàn tác một hành động containment bằng cách gọi trực tiếp hàm containment Lambda (đại diện cho ngữ nghĩa `/v1/action/rollback`), được hiển thị dưới dạng nút **Revert** hoặc **Restore**.
-  - *Tham số request*: `audit_id`, `requested_by_user` (email người thực hiện), và `justification_on_rollback` (giải trình hoàn tác).
-  - *Phản hồi/Trạng thái giao diện mong muốn*: Chuyển trạng thái sang `rollback_initiated`, hiển thị `rollback_payload.action_type` và `original_resource_id` tương ứng.
-- **Giới hạn kiểm soát truy cập (Access Control Restriction)**: Các câu lệnh khôi phục thô và kịch bản thực thi (ví dụ: `rollback_script_encapsulated`) bị giới hạn nghiêm ngặt, chỉ hiển thị và có khả năng thực thi bởi các kỹ sư CDO/Kỹ thuật được phân quyền dưới các IAM policy riêng biệt và nhóm người dùng Cognito. Người dùng Tài chính (Finance) chỉ tương tác với các trường trạng thái trực quan cấp cao và không bao giờ nhìn thấy hoặc thực thi các CLI script.
+- **Các trường trạng thái & thông tin chi tiết sự cố dựa trên hợp đồng (Contract-Backed Status & Incident Detail Fields)**: Giao diện người dùng hiển thị các tham số chính được truy vấn trực tiếp từ bảng DynamoDB run-state, đại diện cho ngữ nghĩa hợp đồng API v1.1:
+  - `audit_id`: Mã định danh duy nhất cho phiên kiểm toán sự cố (ví dụ: `ANM-YYYY-MMDD[A-Z]`).
+  - `status`: Trạng thái sự cố (ví dụ: `PENDING_APPROVAL`, `IN_PROGRESS`, `SUCCESS`, `ROLLED_BACK`, `ESCALATED`).
+  - `containment_locked`: Cờ Boolean cho biết liệu việc tự động can thiệp có bị khóa hay không (chỉ cho phép `dry_run_mode: true`) do vi phạm ngân sách lỗi.
+  - `error_budget_remaining_pct`: Tỷ lệ ngân sách lỗi còn lại của tenant (0% đến 100%).
+  - **Nhật ký hành động (Actions Log)**: Lịch sử từng bước bao gồm dấu thời gian, loại hành động, trạng thái và tác nhân thực hiện (ví dụ: `tag-for-review`, `auto-shutdown`, `quota-cap`).
+- **Chỉ báo Khóa ngân sách lỗi (Error Budget Lock - LOCKED_MODE)**: Một biểu ngữ nổi bật trên bảng điều khiển hiển thị `X-Containment-Status: LOCKED` nếu tỷ lệ hoàn tác (rollback) vượt quá 1% trong 30 ngày. Biểu ngữ hiển thị lý do khóa (`error_budget_exceeded_1pct`), dấu thời gian khóa và vô hiệu hóa mọi nút chuyển đổi "Apply", bắt buộc mọi quyết định chạy ở chế độ dry-run.
+- **Quy trình xác thực (Verification Flow)**: Người vận hành được phân quyền có thể kích hoạt xác thực việc khắc phục bằng cách gửi báo cáo thực thi và dữ liệu telemetry sau can thiệp (qua lệnh gọi API `/v1/verify`). Giao diện người dùng hiển thị giá trị `next_action` được trả về (như `DONE`, `RETRY`, `ROLLBACK`, hoặc `ESCALATE`).
+- **Hành vi Khôi phục/Hoàn tác (Rollback/Restore Behavior)**: Cho phép các kỹ sư kích hoạt khôi phục thủ công (đại diện cho ngữ nghĩa `/v1/audit/{audit_id}/rollback`), được hiển thị dưới dạng nút **Rollback**.
+  - *Tham số request*: `reason` (lý do rollback) và `rolled_back_by` (email người thực hiện).
+  - *Phản hồi/Trạng thái giao diện mong muốn*: Xác nhận khởi tạo rollback, cập nhật tỷ lệ hao hụt ngân sách lỗi (`new_error_budget_burned_pct`) và chuyển trạng thái sự cố sang `ROLLED_BACK`.
+- **Giới hạn kiểm soát truy cập (Access Control Restriction)**: Các lệnh khôi phục thô và kế hoạch thực thi bị giới hạn nghiêm ngặt, chỉ hiển thị và có khả năng thực thi bởi các kỹ sư CDO/Kỹ thuật được phân quyền dưới các IAM policy riêng biệt và nhóm người dùng Cognito. Người dùng Tài chính (Finance) chỉ tương tác với các trạng thái trực quan cấp cao và không bao giờ nhìn thấy hoặc thực thi các CLI command.
 
 ---
 
@@ -101,18 +100,22 @@ Các bất thường mức độ nghiêm trọng cao hoặc các sự kiện vư
 Tất cả các bất thường được phát hiện được định tuyến trực tiếp đến các squad chịu trách nhiệm về tài nguyên mục tiêu.
 - **Kênh phân phối**: Slack Webhook (Các kênh squad chuyên dụng) hoặc Jira API (tự động tạo ticket).
 - **Trọng tâm nội dung**: ID tài nguyên kỹ thuật (ARN), loại dịch vụ, môi trường (Dev/Sandbox/Prod), trạng thái tuân thủ tag và đường dẫn rollback đề xuất.
-- **Kiểm soát hành động (Action Control)**: Bao gồm các tùy chọn hành động Extend/Snooze và Rollback/Restore ngắn hạn, được xác thực (các liên kết gọi trực tiếp programmatic thực thi đối với lớp tính toán Lambda đại diện cho ngữ nghĩa `/v1/action/extend` và `/v1/action/rollback`) khi chính sách và cấu hình môi trường cho phép.
+- **Kiểm soát hành động (Action Control)**: Bao gồm các liên kết hành động Xác thực và Hoàn tác ngắn hạn, được xác thực (thực thi đối với lớp API đại diện cho ngữ nghĩa `/v1/verify` và `/v1/audit/{audit_id}/rollback`) khi chính sách và cấu hình môi trường cho phép.
 - **Tần suất**: Gần như thời gian thực (trong vòng 30 phút sau khi pipeline hoàn thành).
 
-*Ghi chú về dữ liệu telemetry*: Dữ liệu telemetry được xử lý để phát hiện hoàn toàn không bao gồm các chỉ số hiệu suất sử dụng (CPU, Bộ nhớ, kết nối). Các số liệu CloudWatch chỉ được sử dụng cho việc giám sát sức khỏe vận hành của nền tảng CDO và dựng hiển thị dashboard.
+*Ghi chú về dữ liệu telemetry*: Dữ liệu đo lường được xử lý để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, giảm nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only.
 
 ### 3.3 Xử lý lỗi API hợp đồng (API contract error handling)
 Khi người vận hành kích hoạt các nút điều khiển hành động, hệ thống bảng điều khiển và cảnh báo sẽ xử lý các lỗi hợp đồng sau:
-- **`ERR_ROLLBACK_NOT_SUPPORTED`** (mã lỗi): Xảy ra khi cố gắng rollback một tài nguyên không hỗ trợ hoàn tác (ví dụ: tài nguyên trên production nơi containment chỉ ở mức tag/suggest). Giao diện người dùng sẽ vô hiệu hóa (disable) nút revert và hướng dẫn người vận hành liên hệ đội SRE để xem xét thủ công.
-- **`ERR_ALREADY_ROLLED_BACK`** (mã lỗi): Được kích hoạt nếu hành động rollback đã được thực thi trước đó. Giao diện cập nhật trạng thái tài nguyên thành "Restored" (Đã phục hồi) và vô hiệu hóa các lượt nhấp tiếp theo để ngăn ngừa xung đột trạng thái.
-- **`ERR_RESOURCE_NOT_FOUND`** (mã lỗi): Xảy ra khi tài nguyên mục tiêu đã bị xóa vật lý khỏi hạ tầng AWS. Bảng điều khiển xóa bộ đếm ngược và hiển thị "Resource Deleted Externally" (Tài nguyên đã bị xóa bên ngoài).
-- **`ERR_STATE_CONFLICT`** (mã lỗi): Kích hoạt bởi các hành động đồng thời của người vận hành trên cùng một tài nguyên (ví dụ: nhấp đúp hoặc hai kỹ sư cùng thực hiện rollback đồng thời). Giao diện sẽ yêu cầu tải lại trang để đồng bộ hóa trạng thái mới nhất từ DynamoDB.
-- **`ERR_CROSS_TENANT_DENIED`** (lỗi xác thực): Xảy ra nếu ngữ cảnh tenant của người vận hành không trùng khớp với chủ sở hữu bất thường. Giao diện sẽ chặn thực thi và ghi lại nhật ký cảnh báo sự cố bảo mật.
+- **`ERR_INVALID_SCHEMA`**: Body không tuân thủ schema hoặc thiếu các trường bắt buộc. Giao diện cảnh báo cho người vận hành và ghi nhật ký lỗi mà không thử lại.
+- **`ERR_IDEMPOTENCY_MISMATCH`**: Yêu cầu sử dụng trùng `X-Idempotency-Key` nhưng body yêu cầu khác nhau.
+- **`ERR_REPLAY_DETECTED`**: Độ lệch thời gian của yêu cầu vượt quá 300 giây. Client thực hiện đồng bộ hóa thời gian NTP và thử lại.
+- **`ERR_CROSS_TENANT_DENIED`**: Mã định danh tenant trong `X-Tenant-Id` không khớp với ngữ cảnh tài nguyên. Truy cập bị chặn ngay lập tức và tạo cảnh báo bảo mật.
+- **`ERR_ANOMALY_NOT_FOUND`**: Không tìm thấy `anomaly_id` tương ứng trong cơ sở dữ liệu.
+- **`ERR_DUP_IDEMPOTENCY`**: Khóa yêu cầu đang được xử lý (`IN_PROGRESS`). Nền tảng CDO thực hiện thăm dò `GET /v1/status/{id}` cho đến khi hoàn thành.
+- **`ERR_CONTAINMENT_NOT_SUPPORTED`**: Loại bất thường không hỗ trợ tự động containment. Giao diện hướng dẫn người dùng liên hệ đội SRE.
+- **`ERR_RATE_LIMITED`**: Lượt gọi vượt quá 100 requests/phút. Client thực hiện exponential backoff.
+- **`ERR_LLM_TIMEOUT` / `ERR_SERVICE_DOWN`**: AI Engine không khả dụng hoặc bị timeout. Nền tảng CDO kích hoạt hệ thống luật fallback tĩnh nội bộ.
 
 ### 3.4 Payload cảnh báo mẫu (Example alert payload)
 Alert Routing Lambda sử dụng một hợp đồng JSON có cấu trúc. Schema dưới đây đại diện cho một payload cảnh báo điển hình được gửi đến các kênh thông báo:

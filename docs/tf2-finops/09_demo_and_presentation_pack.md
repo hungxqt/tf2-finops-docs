@@ -14,7 +14,7 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
 
 ### Step 1 - Inject synthetic cost anomaly
 - **Action**: Run the synthetic injection script to insert cost records into the raw S3 billing bucket.
-- **Telemetry Specifications**: The telemetry data is strictly CUR-only (S3 CUR partition pulls and Cost Explorer API calls). It excludes any CloudWatch performance telemetry (utilization signals like CPUUtilization, DatabaseConnections, or memory_mib) to keep the AI Engine detection focused purely on cost. CloudWatch metrics are used strictly by the CDO platform for operational observability.
+- **Telemetry Specifications**: The telemetry data is hybrid, combining cost data (S3 CUR partition pulls and Cost Explorer API queries) with CloudWatch utilization telemetry (`resource_utilization_metrics` such as CPU utilization, memory, database connections, and disk I/O). If CloudWatch performance telemetry is missing, the system automatically falls back to CUR-only mode, halving detection confidence (`confidence *= 0.5`) and forcing dry-run/alert-only containment.
 - **Payload**: A batch of mock EC2 usage records showing a sudden 10x cost increase on an unmanaged GPU instance cluster (e.g., $500 spend on EC2 g5.4xlarge).
 - **Verification**: Check S3 raw zone file path: `s3://cdo-raw-cost-bucket/exports/year=2026/month=06/`.
 
@@ -36,46 +36,55 @@ This script guides presenters through demonstrating the end-to-end FinOps Watch 
   - Schema URL: `telemetry://finops-watch/v3`.
   - Data Ingestion Type: `RAW_JSON` for Cost Explorer API queries (<10MB) or `S3_POINTER` for CUR data in S3 (<500MB).
   - Control Flags: `is_ad_hoc` (bypasses 24h idempotency for emergency scan), `is_estimated` (CE estimated spend, lowers confidence and bypasses auto-containment), `is_forced_dry_run` (if telemetry completeness < 0.8, forces dry-run mode).
-  - Telemetry Data: Cost and metadata attributes only, excluding CloudWatch performance metrics.
+  - Telemetry Data: Cost, metadata, and CloudWatch performance metrics (with automatic fallback to CUR-only mode if performance metrics are missing).
 - **Verification**: Check Request Lambda execution logs for a successful invocation response containing:
-  - `audit_id` (tracking UUID)
+  - `correlation_id` (tracking UUID)
   - `status`: `"processing"`
   - `retry_after_seconds`: `30`
 
-### Step 4 - Poll results (Logical GET /v1/detect/result/{audit_id} semantics) & Execute AI Engine task
-- **Action**: Monitor the Step Functions workflow as it polls the DynamoDB execution/result table directly for the completion status of the `audit_id` every 30 seconds.
+### Step 4 - Poll status (Logical GET /v1/status/{correlation_id} semantics)
+- **Action**: Monitor the Step Functions workflow as it polls the DynamoDB execution/result table directly for the completion status of the `correlation_id` every 30 seconds.
 - **Internal Action**: SQS buffers the request; the Worker Lambda container executes the AI model scoring, evaluates anomaly confidence, and compiles RCA details, writing the final result state directly to DynamoDB and S3.
 - **Result Payload (stored in DynamoDB/S3)**:
-  - `audit_id`: Matching execution UUID.
-  - `anomalies_list`: Array of detected anomalies with confidence scores and explanations.
-  - `pagination`: Pagination object containing `next_token` and `limit`.
+  - `correlation_id`: Matching execution UUID.
+  - `status`: `"completed"` or `"failed"`.
 - **Verification & Fail-safes**:
   - If a duplicate idempotency key is detected, the Request Lambda returns a conflict response structure (representing HTTP `409` semantics).
   - If a duplicate key with mismatched payload is sent, the Request Lambda returns a payload mismatch response structure (representing HTTP `400` with `ERR_IDEMPOTENCY_MISMATCH` semantics).
   - If Bedrock times out (45s Bedrock limit, returning `ERR_LLM_TIMEOUT` in the result status) or the service is down (`ERR_SERVICE_DOWN`), the pipeline immediately falls back to static rule execution and alerts SRE.
   - Check DynamoDB anomaly records table to verify the record has been written with a cryptographic audit trail chain link calculated as `sha256(current_payload + previous_hash)`.
 
-### Step 5 - Authenticate and access CDO dashboard (Cognito Hosted UI)
+### Step 5 - Get Intervention Plan (Logical POST /v1/decide semantics)
+- **Action**: Once the status is complete, Step Functions invokes the AI Engine worker Lambda (representing `/v1/decide` semantics) to retrieve the Root Cause Analysis (RCA) and containment action plan.
+- **Request Parameters**: `X-Correlation-Id` and `X-Tenant-Id` headers.
+- **Verification**: Verify that the AI Engine returns a plan containing the exact AWS CLI commands (e.g. `aws ec2 create-tags` in dry-run mode) and corresponding rollback CLI commands.
+
+### Step 6 - Authenticate and access CDO dashboard (Cognito Hosted UI)
 - **Action**: Open the dashboard CloudFront URL in a browser. Verify you are automatically redirected to the Cognito Hosted UI login screen. Log in using a Finance user account (associated with the `finops-finance-readonly` group).
 - **Internal Action**: CloudFront forwards the request after the Lambda@Edge auth layer intercepts the request, validates the Cognito JWT token, and passes the request to the private S3 bucket. The dashboard parses the JWT group claim.
-- **Verification**: Confirm the daily spend trends and anomaly overlays render successfully, but the Extend/Snooze and Rollback action controls are completely disabled or hidden.
+- **Verification**: Confirm the daily spend trends and anomaly overlays render successfully, but the manual Action Plan execution triggers and Rollback controls are completely disabled or hidden. If the error budget lock is active (>1% manual rollback rate in a rolling 30-day window), verify that a prominent red warning indicates the tenant is in `LOCKED_MODE`.
 
-### Step 6 - Route alerts
+### Step 7 - Route alerts
 - **Action**: Check the notification channels.
 - **Internal Action**: The Alert Routing Lambda inspects the anomaly severity and squad ownership tags.
 - **Verification**: 
-  - Slack: Verify that a notification message has arrived in the `#squad-prediction-models` channel containing the resource ARN, cost delta, and dashboard link.
-  - SES/SNS: Verify that the Finance mailing list received an email summary of the cost spike.
+  - Slack: Verify that a notification message has arrived in the `#squad-prediction-models` channel containing the resource ARN, cost delta, correlation ID, and dashboard link.
+  - SES/SNS: Verify that the Finance mailing list received an email summary of the cost spike and proposed action plan.
 
-### Step 7 - Execute dry-run containment and countdown control (Cognito-authorized)
-- **Action**: Log out of the Finance session and log back in as an Engineering Operator (member of the `finops-engineering-operator` group). Locate the active anomaly on the dashboard and click the "Snooze/Extend" button.
-- **Internal Action**: The dashboard interface triggers the extend handler Lambda (representing `/v1/action/extend` semantics). The backend Lambda@Edge validates the active JWT cookie, checks group membership, and permits the operation.
-- **Verification**: Verify that the targeted AWS EC2 instance remains running, but the DynamoDB audit log table has a new record showing a proposed action `stop_instance` with `execution_mode: dry-run`. Confirm that the countdown timer displays the new extended expiration time.
+### Step 8 - Execute dry-run containment (Cognito-authorized execution)
+- **Action**: Log out of the Finance session and log back in as an Engineering Operator (member of the `finops-engineering-operator` group). Locate the active anomaly on the dashboard and click the "Execute Plan" button.
+- **Internal Action**: The dashboard interface triggers the containment handler Lambda. The backend validates the active Cognito JWT cookie, checks group membership, and permits the operation.
+- **Verification**: Verify that the targeted AWS EC2 instance remains running, but the DynamoDB audit log table has a new record showing a proposed action `stop_instance` with `execution_mode: dry-run` and a cryptographically chained block hash.
 
-### Step 8 - Execute rollback simulation (Logical POST /v1/action/rollback semantics)
+### Step 9 - Verify containment effectiveness (Logical POST /v1/verify semantics)
+- **Action**: The CDO platform (or Step Functions workflow) calls `/v1/verify` (or direct Lambda equivalent) passing the `correlation_id` and post-action telemetry.
+- **Internal Action**: AI Engine compares post-remediation utilization metrics with historical baseline to evaluate containment outcome.
+- **Verification**: Verify the API returns status `DONE`, `RETRY`, or `ROLLBACK` and logs the verification result.
+
+### Step 10 - Execute manual/auto rollback (Logical POST /v1/audit/{audit_id}/rollback semantics)
 - **Action**: While logged in as an Engineering Operator, click the "Revert/Rollback" button on the CDO dashboard. Try the same action while logged in as a Finance user to verify rejection.
-- **Internal Action**: The dashboard triggers the rollback handler Lambda (representing `/v1/action/rollback` semantics) with the Cognito session credentials. The backend checks Cognito group claims, verifies tenant context, and triggers the tag reversion.
-- **Verification**: Check CLI logs and DynamoDB records to confirm the audit state changes to `RollbackCompleted` with the operator's Cognito user ID logged in the `actor` field. Confirm that the Finance user's attempt yields an authorization failure (representing HTTP `403 Forbidden` semantics) and writes an `unauthorized_action_blocked` audit entry.
+- **Internal Action**: The dashboard triggers the rollback handler Lambda (representing `/v1/audit/{audit_id}/rollback` semantics) with the Cognito session credentials. The backend checks Cognito group claims, verifies tenant context, and triggers the tag reversion.
+- **Verification**: Check CLI logs and DynamoDB records to confirm the audit state changes to `RollbackCompleted` with the operator's Cognito user ID logged in the `actor` field. Confirm that the Finance user's attempt yields an authorization failure (representing HTTP `403 Forbidden` semantics) and writes an `unauthorized_action_blocked` audit entry. If the manual rollback rate exceeds 1% in a rolling 30-day window, verify the tenant is locked into `LOCKED_MODE` (forcing all future decisions to dry-run).
 
 ---
 
@@ -115,7 +124,7 @@ Architectural justifications for common challenging questions:
 - **How do you handle AWS CUR data export lag (up to 24 hours)?**
   - *Response*: While CUR exports have an inherent lag, our 24-hour scheduled cadence (ADR-001) is designed to align with this cycle. To bridge the gap for critical real-time alerts, our data plane combines CUR exports with daily calls to the AWS Cost Explorer API, which provides lower-latency cost aggregates.
 - **How do you handle AI Engine false positives (normal scaling classified as anomaly)?**
-  - *Response*: Our safety-first containment posture (ADR-005) ensures that no automated destructive action is ever taken on production resources. Furthermore, engineering squads receive Slack alerts with a "Snooze" button that triggers the extend handler Lambda (representing `/v1/action/extend` semantics) to snooze/extend the countdown, allowing them to mark the classification as normal scaling and suppress subsequent containment triggers for that resource. Additionally, detection telemetry is strictly CUR-only and does not send any CloudWatch utilization metrics (such as CPU, Memory, or DatabaseConnections) to the AI Engine for detection, keeping the data plane lightweight and compliant.
+  - *Response*: Our safety-first containment posture (ADR-005) ensures that no automated destructive action is ever taken on production resources. Furthermore, engineering squads receive Slack and dashboard alerts detailing the proposed containment plans. An Engineering Operator can manually review and click the "Execute Plan" button, or revert actions if they are determined to be false alarms. Additionally, detection telemetry is hybrid (CUR + Cost Explorer + CloudWatch utilization metrics), which improves classification accuracy. If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving detection confidence (`confidence *= 0.5`) and locking containment to dry-run or alert-only, preventing false positive actions.
 - **What happens if a bug triggers automated containment on production assets?**
   - *Response*: Production environment containment is hardcoded at the IAM policy and Lambda runtime levels to dry-run mode (Safety Value: `Never`). Even in the event of database corruption or code malfunction, the IAM roles assigned to the containment Lambda do not possess the permissions necessary to delete, terminate, or shut down production resources.
 - **How does the platform handle AWS Cost Explorer API throttling during scaling?**
@@ -123,7 +132,7 @@ Architectural justifications for common challenging questions:
 - **What happens if the dashboard becomes out-of-sync with actual AWS resources?**
   - *Response*: The static dashboard assets are updated immediately at the end of each pipeline run. A CloudFront invalidation is triggered programmatically to clear edge caches. A manual "Sync Now" button is also provided on the interface to query DynamoDB records directly.
 - **How is rollback security enforced to prevent unauthorized resource changes?**
-  - *Response*: Rollback execution invokes the rollback handler Lambda (representing `/v1/action/rollback` semantics). It requires identical IAM permissions and MFA verification. Every rollback request must be tied to a valid incident ID or change ticket, and the action is fully logged to the WORM audit trail in S3.
+  - *Response*: Rollback execution invokes the rollback adapter Lambda, which triggers the `/v1/audit/{audit_id}/rollback` endpoint. It requires identical IAM permissions and MFA validation. Every rollback request is checked for Cognito authorization, verified for tenant context, and logged to the WORM audit trail in S3. If the manual rollback rate exceeds 1% in a rolling 30-day window, the system automatically triggers an error budget lock (`LOCKED_MODE`), forcing all future actions to dry-run/alert-only until resolved.
 - **Who owns the Lambda container deployment and operational lifecycle of the shared AI Engine?**
   - *Response*: CDO owns the hosting infrastructure deployment (VPC, subnets, Lambda functions, concurrency limits, execution roles, queues, and DynamoDB state stores) to guarantee platform availability, security, and IAM execution controls. AIOps owns the AI model logic, RCA/recommendation logic, local fallback rules engine execution, internal API contract enforcement, and container image builds.
 - **What happens if the AI Engine fails, times out, or receives duplicate requests?**

@@ -61,7 +61,7 @@ In the event of an SLO breach, the following escalation and remediation protocol
 Data Ingestion verification focuses on retrieving and parsing cost data from AWS Data Exports (CUR 2.0) and AWS Cost Explorer API:
 - **Raw Ingestion**: The raw ingestion Lambda retrieves parquet/CSV files from the billing S3 bucket and verifies that schema definitions match the defined layout.
 - **Cost Explorer Queries**: Validates that mock responses from the Cost Explorer API match historical expectations and are mapped to normalized cost windows.
-- **Glue Crawler & Athena Views**: Tests verify that the Glue Crawler successfully catalogs the S3 raw partition structure and that Athena queries can aggregate cost metrics by service, region, account, and resource tags without syntax errors. Under the CUR-only telemetry design, no utilization signals from CloudWatch (CPU, memory, database connections) are gathered or sent to the AI Engine for detection. Utilization signals are verified to be used solely for CDO platform operational health observability (alerts, logging, metrics, dashboard).
+- **Glue Crawler & Athena Views**: Tests verify that the Glue Crawler successfully catalogs the S3 raw partition structure and that Athena queries can aggregate cost metrics by service, region, account, and resource tags without syntax errors. Under the hybrid telemetry design, CUR and Cost Explorer data are combined with CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment. CloudWatch logs and metrics are also used for CDO platform operational health monitoring and dashboards.
 
 ### 3.2 Scheduled run idempotency
 
@@ -82,8 +82,8 @@ The pipeline runs on a scheduled cadence (ADR-001) triggered by EventBridge Sche
 ### 4.1 AI contract
 
 The contract-based interface between the CDO platform and the AIOps-provided AI Engine is validated for strict schema adherence:
-- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` directly to the AI Engine Request Lambda function using IAM invocation permissions (`lambda:InvokeFunction`). The test verifies that the request payload is strictly CUR-only (either `RAW_JSON` or `S3_POINTER` types) and contains no CloudWatch utilization metrics.
-- **Response Format Verification**: The test validates that the AI Engine Request Lambda returns a payload containing the required parameters: `audit_id`, `status` (`processing`), and `retry_after_seconds`. It also validates that the final processed payload written to DynamoDB/S3 by the Worker Lambda contains `status` (`completed` | `failed`), `anomalies_list` (containing `anomaly_metadata`, `finance_dashboard_data`, and `engineering_dashboard_data`), and `pagination` controls (`next_token` and `limit`).
+- **Request Format Verification**: The test harness sends requests with schema version `telemetry://finops-watch/v3` containing headers `X-Tenant-Id`, `X-Idempotency-Key` (composite key: `tenant_id:YYYY-MM-DD`), `X-Correlation-Id`, `X-Payload-SHA256`, and `X-Request-Timestamp` directly to the AI Engine Request Lambda function using IAM invocation permissions (`lambda:InvokeFunction`). The test verifies that the request payload conforms to the hybrid telemetry schema (containing CUR, Cost Explorer, and CloudWatch `resource_utilization_metrics`). If CloudWatch metrics are simulated as missing, the test verifies that the Request Lambda handles the fallback behavior by halving the confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only mode.
+- **Response Format Verification**: The test validates that the AI Engine Request Lambda returns a payload containing the required parameters: `success`, `status` (`processing`), and `correlation_id`. It also validates that the final processed payload written to DynamoDB/S3 by the Worker Lambda contains `status` (`COMPLETED` | `FAILED`), `anomalies_list` (containing `anomaly_metadata`, `finance_dashboard_data`, and `engineering_dashboard_data`).
 
 ### 4.2 AI Engine timeout
 
@@ -123,16 +123,17 @@ If the AI Engine is completely unreachable (e.g., Lambda invocation failure, SQS
 
 ### 4.8 Result Polling & Pagination Tests
 
-- **Polling Response Verification**: The test framework queries the DynamoDB execution/result table for the corresponding `audit_id` (simulating the logical `GET /v1/detect/result/{audit_id}` semantics). It verifies the contract's response states (`completed` vs. `processing` vs. `failed`) and validates the structure of the returned `anomalies_list` objects.
+- **Polling Response Verification**: The test framework queries the DynamoDB execution/result table for the corresponding `correlation_id` (simulating the logical `GET /v1/status/{id}` semantics). It verifies the contract's response states (`COMPLETED` vs. `PROCESSING` vs. `FAILED`) and validates the structure of the returned `anomalies_list` objects.
 - **Pagination Validation**: Under test loads that generate multiple anomalies, the framework requests results with query limits and validates that `next_token` is generated. It then queries subsequent pages using the token, confirming correct result index ordering.
 
 ### 4.9 Extend & Rollback Semantics Tests
 
-- **Extend/Snooze Action Test**: Simulates an engineer action by triggering the extend handler Lambda (representing `/v1/action/extend` semantics) with `extend_seconds` and `reason`. The test verifies that the handler updates the resource's countdown timer in DynamoDB and returns `new_expiration_time`.
-- **Rollback Action Test**: Simulates clicking "Revert" on the dashboard by invoking the rollback handler Lambda (representing `/v1/action/rollback` semantics). The test verifies that:
-  - The handler checks authorization and matching `X-Tenant-Id`.
-  - It successfully generates and returns the required rollback CLI command (e.g., `aws rds start-db-instance`).
-  - The event status is logged to the audit trail as `rollback_initiated`.
+- **Decide Action Plan Test**: Simulates the orchestrator calling the AI Engine Worker Lambda (representing `POST /v1/decide` semantics) to retrieve the intervention plan. The test verifies that the returned plan contains `dry_run_mode`, `applied_payload` (with `aws_cli_command`), and `rollback_payload` (with `aws_cli_rollback_command`), along with Cognito-group-based access rules and the `X-Containment-Status: LOCKED` header if the tenant's rollback rate is breached.
+- **Rollback Action Test**: Simulates triggering manual rollback on the dashboard by calling the rollback endpoint (representing `POST /v1/audit/{audit_id}/rollback` semantics). The test verifies that:
+  - The handler validates authorization, `rolled_back_by` email, and matching `X-Tenant-Id`.
+  - It successfully initiates rollback, returns `rollback_initiated = true`, updates the false positive count, and recalculates `new_error_budget_burned_pct`.
+  - If the error budget burn exceeds 1%, it verifies that the tenant is transitioned to `LOCKED_MODE` (the `containment_locked = true` flag is returned).
+  - The event status is logged to the audit trail as `ROLLED_BACK`.
 
 ### 4.10 Contract Error Codes & Validation Tests
 
@@ -180,8 +181,8 @@ The containment engine must generate an audit log entry for every action attempt
 ### 5.4 Dashboard Auth & Cognito Group Validation
 
 - **Hosted UI Redirection Test**: Verifies that any unauthenticated access request to the CloudFront dashboard URL is intercepted by the Lambda@Edge auth layer and redirected (302 redirect) to the Cognito Hosted UI login endpoint.
-- **Finance Group Read-Only Access Test**: Validates that users belonging to the `finops-finance-readonly` Cognito user group are authenticated successfully but are restricted to read-only views on the dashboard. Probes to execute containment actions (Extend or Rollback) via requests to the action handlers (representing `/v1/action/extend` or `/v1/action/rollback` semantics) are rejected with authorization errors (representing HTTP `403 Forbidden` / `ERR_INSUFFICIENT_PERMISSIONS`).
-- **Engineering Group Action Authorization Test**: Verifies that users in the `finops-engineering-operator` and `finops-cdo-admin` Cognito user groups can successfully trigger Extend/Rollback actions on the dashboard, confirming the JWT tokens contain correct group claims when forwarded to the action Lambda handlers.
+- **Finance Group Read-Only Access Test**: Validates that users belonging to the `finops-finance-readonly` Cognito user group are authenticated successfully but are restricted to read-only views on the dashboard. Probes to execute containment actions (Verification or Rollback) via requests to the action handlers (representing `/v1/verify` or `/v1/audit/{audit_id}/rollback` semantics) are rejected with authorization errors (representing HTTP `403 Forbidden` / `ERR_CROSS_TENANT_DENIED` or `ERR_AUTH_FAILED`).
+- **Engineering Group Action Authorization Test**: Verifies that users in the `finops-engineering-operator` and `finops-cdo-admin` Cognito user groups can successfully trigger Verification and Rollback actions on the dashboard, confirming the JWT tokens contain correct group claims when forwarded to the Lambda handlers.
 - **Session Expiration & Token Lifetime Test**: Validates that expired sessions (JWT token older than the 15-minute lifetime config) or tampered JWT cookie signatures are rejected by Lambda@Edge, causing immediate session termination and redirecting the user to re-authenticate.
 - **Audit Logging for Auth Events**: Confirms that login/logout events, token validation failures, and unauthorized action attempts (e.g., Finance user attempting to rollback) are captured in the DynamoDB and S3 audit trail logs (e.g., logging `auth_success`, `auth_failure`, or `unauthorized_action_blocked`).
 
@@ -197,7 +198,7 @@ The End-to-End demo demonstrates the entire ingestion, detection, alerting, and 
 - **Step 5 - Dashboard Update**: Lambda aggregates the results, writes the updated JSON files to the dashboard S3 bucket, and triggers a CloudFront invalidation.
 - **Step 6 - Alert Routing**: The Alert Routing Lambda is invoked, sending a Slack notification to the `squad-prediction-models` channel and an email notification to the Finance team via SNS/SES.
 - **Step 7 - Dry-run Containment**: The CDO containment engine triggers a dry-run tag update (`FinOpsWatch: ReviewRequired`) and saves the audit record containing the rollback steps to S3.
-- **Step 8 - Rollback Simulation**: The administrator clicks the "Revert" button on the CDO dashboard, triggering the rollback handler Lambda, which executes the rollback steps defined in the audit record to return the tags to their baseline state.
+- **Step 8 - Rollback Simulation**: The administrator clicks the "Rollback" button on the CDO dashboard, triggering the rollback endpoint (representing `POST /v1/audit/{audit_id}/rollback` semantics), which initiates tag restoration in the member account and updates the error budget burn telemetry.
 
 ---
 

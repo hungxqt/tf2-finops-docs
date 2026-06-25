@@ -4,7 +4,6 @@
      Status: Ongoing log W11-W12
      Format: 1 ADR per major decision. Append-only - do not delete old ADRs. -->
 
-> [!IMPORTANT]
 > **Safety Boundary**: All architectural decisions and system design patterns must uphold the absolute safety boundaries: **NEVER terminate prod, delete data, or modify IAM**.
 
 
@@ -60,7 +59,7 @@
 - **Status**: Accepted
 - **Date**: 2026-06-24
 - **Context**: Clear division of labor is needed between the CDO team (platform and pipeline operators) and the AIOps team (AI engine developers) to prevent duplicate efforts, establish ownership, and define operational SLAs.
-- **Decision**: Establish a strict contract-based integration. CDO owns cost data ingestion, scheduled workflows, alerting, containment enforcement, and the hosting platform infrastructure (Private API Gateway, Lambda container functions, networking) for the AI Engine. AIOps owns the AI Engine logic, container image software, model parameters, confidence scoring, and backtesting metrics.
+- **Decision**: Establish a strict contract-based integration. CDO owns cost data ingestion, scheduled workflows, alerting, containment enforcement, and the hosting platform infrastructure (Lambda container functions, ECR digest deployment, execution roles, reserved concurrency, SQS/DLQ, DynamoDB/S3 stores, networking, and SLOs) for the AI Engine. AIOps owns the AI Engine logic, container image software, model parameters, confidence scoring, and backtesting metrics.
 - **Consequence**:
   - Pro: Independent release cycles and isolation of responsibilities. Clear ownership for incident triage.
   - Pro: Standardized contract prevents breaking changes when the AI model is updated.
@@ -75,8 +74,8 @@
 
 - **Status**: Accepted
 - **Date**: 2026-06-24
-- **Context**: The platform requires both detailed resource-level cost metrics (which are highly structured) and real-time/near-real-time cost data queries to catch anomaly patterns.
-- **Decision**: Combine AWS Data Exports (CUR 2.0) delivered to S3 with direct queries to the AWS Cost Explorer API. CUR is used for historical deep dives, partition analysis, and dashboard trends, while Cost Explorer API serves as the primary near-real-time querying mechanism for daily runs. To prevent exceeding the strict **5 requests/second** Cost Explorer rate limit, CDO caches query results in DynamoDB; the AI Engine consumes this cached cost data for its 7-day and 30-day baseline requirements instead of querying the Cost Explorer API directly.
+- **Context**: The platform requires both detailed resource-level cost metrics (which are highly structured) and daily cost data queries to catch anomaly patterns.
+- **Decision**: Combine AWS Data Exports (CUR 2.0) delivered to S3 with direct queries to the AWS Cost Explorer API. CUR is used for historical deep dives, partition analysis, and dashboard trends, while Cost Explorer API serves as the primary daily querying mechanism for scheduled runs. To prevent exceeding the strict **5 requests/second** Cost Explorer rate limit, CDO caches query results in DynamoDB; the AI Engine consumes this cached cost data for its 7-day and 30-day baseline requirements instead of querying the Cost Explorer API directly.
 - **Consequence**:
   - Pro: CUR provides granular resource-level records for audit and dashboard visibility.
   - Pro: Cost Explorer API provides low-latency data for the last 24-hour period, bypassing CUR export delays.
@@ -120,7 +119,7 @@
 
 ---
 
-## ADR-007 - ECS Fargate for AI Engine hosting
+## ADR-007 - ECS Fargate for AI Engine hosting over serverless functions
 
 - **Status**: Superseded by ADR-010
 - **Date**: 2026-06-24
@@ -136,7 +135,7 @@
 
 ---
 
-## ADR-008 - Fargate always-on vs Fargate Spot capacity providers separation
+## ADR-008 - Always-on plus Spot Fargate task separation
 
 - **Status**: Superseded by ADR-010
 - **Date**: 2026-06-24
@@ -177,13 +176,14 @@
 - **Status**: Accepted
 - **Date**: 2026-06-24
 - **Context**: The AI Engine provided by the AIOps team is packaged as a containerized python application requiring CPU/memory flexibility, isolated execution, and network security. The previous decision to use ECS Fargate (ADR-007) and Fargate Spot capacity providers (ADR-008) introduced shared fixed platform costs (idle compute, load balancing) and operational complexity (checkpointing, Spot interruptions).
-- **Decision**: Deploy and host the AI Engine container workloads on AWS Lambda container image hosting. Deployed by pinning immutable ECR image digests.
+- **Decision**: Deploy and host a dedicated, per-CDO instance of the AI Engine container workloads on AWS Lambda using container images, rather than sharing a single host ONCE across the Task Force. This CDO hosts its own endpoint/platform utilizing Lambda Container images built from the ECR repository provided by the AIOps team. The deployment utilizes ECR image digest pinning (pinning specific image SHA digests in Terraform) to guarantee execution immutability. CDO implements SQS buffering for reliable asynchronous execution and configures Lambda reserved concurrency limits (capped to a safe execution ceiling) to prevent scaling spikes from throttling other resources, maintain private network boundaries, and control the operational blast radius.
 - **Consequence**:
-  - Pro: True serverless pay-per-request pricing, eliminating ECS Fargate always-on idle compute costs.
-  - Pro: Simpler scaling and high availability handled natively by AWS.
-  - Pro: No need for Spot interruption checkpointing/retry complexity. SQS buffers async requests gracefully.
-  - Trade-off: Introduces potential cold start latency for container images (mitigated by Provisioned Concurrency if latency thresholds are breached in production).
-  - Trade-off: Model artifacts and dependencies must fit within the Lambda container image limit (10 GB). Heavy offline model training and retraining remain outside this runtime scope.
+  - Pro: Pay-per-request billing model reduces shared platform idle cost to zero compared to ECS Fargate.
+  - Pro: High availability and automatic scaling are handled natively by AWS.
+  - Pro: SQS queue buffering handles invocation spikes without losing execution payloads.
+  - Pro: ECR digest pinning ensures code changes require an explicit Terraform change-set, preventing drift.
+  - Trade-off: Potential container cold start latency (mitigated by Provisioned Concurrency if production latency metrics breach threshold).
+  - Trade-off: Container size must stay within the 10 GB Lambda limit; model retraining must be executed offline.
 - **Alternatives considered**:
   - ECS Fargate always-on + Spot: Rejected due to high idle compute cost and complex checkpoint/retry requirements.
   - Standard AWS Lambda zip packages: Rejected because the AI model libraries (e.g. pandas, scikit-learn, PyTorch) exceed the 250MB unzipped Lambda deployment package size limit.
@@ -215,15 +215,32 @@
 
 - **Status**: Accepted
 - **Date**: 2026-06-24
-- **Context**: The current CDO flow is a scheduled batch workflow driven by EventBridge Scheduler and Step Functions. The AI API contract requires /v1/detect and /v1/detect/result/{audit_id} behavior, but the architecture does not need a separate Private REST API Gateway when Step Functions is the only orchestrating caller.
-- **Decision**: Private REST API Gateway is not required for the default CDO scheduled workflow. The default path should use direct AWS service integration through Lambda and SQS: Step Functions -> AI Engine Request Lambda -> SQS -> AI Engine Worker Lambda -> DynamoDB/S3 results -> Step Functions result check. Private API Gateway becomes an optional future/shared-client pattern, not the baseline architecture.
+- **Context**: The current CDO flow is a scheduled batch workflow driven by EventBridge Scheduler and Step Functions. The AI API contract v1.1 requires `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` logical contract semantics, but the architecture does not need a separate Private REST API Gateway when Step Functions is the only orchestrating caller.
+- **Decision**: Avoid deploying a physical Private REST API Gateway for the default scheduled batch workflow, since Step Functions acts as the sole orchestrating caller. Instead, the contract's `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, and `/v1/verify` interfaces are implemented purely as logical contract semantics. Under the hood, Step Functions invokes the AI Engine Request Lambda directly for `/v1/detect`, which validates the payload and queues it in SQS, returning a fast execution token. The AI Engine Worker Lambda processes the queue asynchronously, storing findings in DynamoDB and S3. The Step Functions workflow polls `/v1/status/{correlation_id}` until completed, then invokes `/v1/decide` to generate the remediation plan, executes any approved containment actions, and invokes `/v1/verify` to validate the outcome. The rollback endpoint `/v1/audit/{audit_id}/rollback` is called for manual reversions. Private API Gateway is rejected in the baseline CDO platform to reduce unnecessary overhead, remaining only as an optional design choice for future multi-client deployments.
 - **Consequence**:
-  - Pro: Removes unnecessary API Gateway, VPC endpoint, stage deployment, usage plan, and resource policy complexity.
-  - Pro: Keeps the workflow fully serverless and easier to operate for the 24h batch cadence.
-  - Pro: Preserves the AIOps Docker image boundary through Lambda container image deployment.
-  - Trade-off: No reusable HTTP /v1/* endpoint exists by default for other internal clients.
-  - Trade-off: API-style throttling, request validation, and stage controls must be implemented through Lambda, SQS, IAM, and contract tests.
+  - Pro: Eliminates infrastructure provisioning costs and maintenance overhead of API Gateway stages, usage plans, custom resource policies, and dedicated VPC Endpoints.
+  - Pro: Keeps the scheduled 24h batch workflow fully serverless, direct, and secure.
+  - Pro: Preserves the logical contract and image boundaries of the AIOps AI Engine container.
+  - Trade-off: Other internal systems cannot query the AI Engine via HTTP REST requests by default.
+  - Trade-off: Throttling, request validation, and environment routing are moved to the Lambda application layer and AWS IAM permissions.
 - **Alternatives considered**:
   - Keep Private REST API Gateway: rejected for the default path because it adds infrastructure without clear value when Step Functions is the only caller.
   - Public API Gateway: rejected because the AI Engine must remain private and internal.
   - Internal ALB: rejected because it is heavier than needed for Lambda container hosting and scheduled batch invocation.
+
+---
+
+## ADR-013 - S3 + CloudFront dashboard over QuickSight for MVP
+
+- **Status**: Accepted
+- **Date**: 2026-06-25
+- **Context**: The platform requires a user interface for Finance stakeholders to monitor spend trends, view cost anomalies, and review containment actions. The architecture needs to determine whether to use a managed BI service (Amazon QuickSight) or a custom static website hosted on Amazon S3 and distributed via Amazon CloudFront for the Minimum Viable Product (MVP).
+- **Decision**: Use a private Amazon S3 static dashboard delivered through Amazon CloudFront, authenticated with Amazon Cognito (Hosted UI with Authorization Code Flow + PKCE) and protected with S3 Origin Access Control (OAC) and Lambda@Edge viewer-request token validation. Amazon QuickSight remains a potential future BI option but is not selected for the MVP baseline.
+- **Consequence**:
+  - Pro: Lower recurring infrastructure cost by avoiding QuickSight Enterprise baseline charges.
+  - Pro: Eliminates per-reader BI seat license fees, allowing unlimited scaling of finance dashboard users at zero licensing cost.
+  - Pro: Integrates seamlessly with precomputed JSON cost summaries generated by the daily CDO pipeline, requiring zero SQL execution for dashboard users.
+  - Pro: Enables tight control over action visibility, Extend/Rollback buttons, and console interactions via custom frontend logic, which is complex or restricted in native BI tools.
+  - Trade-off: Less native BI functionality, ad-hoc data exploration, or user-driven custom chart generation compared to QuickSight. Advanced business unit requirements may later justify integrating QuickSight Enterprise.
+- **Alternatives considered**:
+  - Amazon QuickSight (Enterprise edition): Rejected as the MVP default due to per-user seat fees, higher baseline configuration costs, and the complexity of embedding custom interactive rollback action triggers within standard dashboards.

@@ -10,7 +10,7 @@
 
 CDO platform áp dụng nguyên tắc cô lập chặt chẽ bên trong một VPC chuyên biệt. Tất cả các tài nguyên compute đều chạy trong các private subnets không có route đi ra internet gateway. Mọi luồng giao tiếp với AWS API đều được định tuyến nội bộ qua AWS VPC Endpoints.
 
-Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Bộ điều phối Step Functions gọi trực tiếp hàm AI Engine Request Lambda. Mô hình hàng đợi bất đồng bộ sử dụng SQS/DLQ tách biệt khối lượng công việc suy luận nặng khỏi việc xác thực yêu cầu. Request Lambda xử lý các yêu cầu phát hiện đầu vào, đẩy chúng vào hàng đợi SQS và trả về trạng thái ngay lập tức. Lưu ý rằng `/v1/detect` và `/v1/detect/result/{audit_id}` đại diện cho ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai, vì không có Private API Gateway nào được triển khai. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
+Thiết kế bảo mật giả định hai ranh giới tin cậy chính: ranh giới tài khoản quản trị CDO và ranh giới tài khoản thành viên. Dữ liệu chi phí, payload quyết định của AI, payload cảnh báo và bản ghi kiểm toán containment đều nằm trong đường dẫn mạng AWS do CDO kiểm soát. Bộ điều phối Step Functions gọi trực tiếp hàm AI Engine Request Lambda. Mô hình hàng đợi bất đồng bộ sử dụng SQS/DLQ tách biệt khối lượng công việc suy luận nặng khỏi việc xác thực yêu cầu. Request Lambda xử lý các yêu cầu phát hiện đầu vào, đẩy chúng vào hàng đợi SQS và trả về trạng thái ngay lập tức. Lưu ý rằng `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback` đại diện cho ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai, vì không có Private API Gateway nào được triển khai. AI Engine không nhận thông tin xác thực trực tiếp để thực hiện hành động containment trên tài khoản thành viên.
 
 ```mermaid
 graph TD
@@ -125,8 +125,18 @@ Kiểm soát truy cập cho Bảng điều khiển Tài chính tĩnh S3 + CloudF
 - **Xác thực Token bằng Lambda@Edge**: Hàm Lambda@Edge viewer-request của CloudFront chặn mọi yêu cầu, phân tách JWT cookie, kiểm tra chữ ký đối với endpoint JWKS của Cognito và xác thực các claim (hết hạn, audience, issuer). Token không hợp lệ hoặc hết hạn sẽ kích hoạt tự động redirect về trang đăng nhập Hosted UI.
 - **Chính sách truy cập theo nhóm (Group-Based Access Policies)**:
   - `finops-finance-readonly`: Thành viên được ủy quyền xem trực quan xu hướng chi tiêu, tóm tắt bất thường và các bản ghi lịch sử kiểm toán. Giao diện UI chặn hiển thị các lệnh CLI, rollback script thô hoặc các nút kích hoạt thực thi containment.
-  - `finops-engineering-operator`: Thành viên được ủy quyền truy cập chi tiết kỹ thuật, xem các lệnh thực thi `rollback_script_encapsulated` thô, và kích hoạt các hành động programmatic được phê duyệt để gia hạn (đại diện cho ngữ nghĩa `/v1/action/extend`) và rollback (đại diện cho ngữ nghĩa `/v1/action/rollback`).
+  - `finops-engineering-operator`: Thành viên được ủy quyền truy cập chi tiết kỹ thuật, xem kế hoạch thực thi thô và kích hoạt các hành động xác thực khắc phục lập trình (đại diện cho ngữ nghĩa `/v1/verify`) và rollback thủ công (đại diện cho ngữ nghĩa `/v1/audit/{audit_id}/rollback`).
   - `finops-cdo-admin`: Thành viên được cấp quyền quản lý chính sách truy cập, điều chỉnh phân bổ người dùng vào nhóm và cấu hình các cờ kiểm soát nền tảng toàn cục.
+
+### 2.5 Khóa bảo mật ngân sách lỗi (Error Budget Security Lock - LOCKED_MODE)
+
+Để ngăn chặn các hành động tự động containment bị lỗi dây chuyền và bảo vệ tính sẵn sàng của tài nguyên, hệ thống áp dụng cơ chế Khóa bảo mật ngân sách lỗi tự động:
+1. **Điều kiện kích hoạt**: Nếu tỷ lệ rollback (hoàn tác thủ công do phát hiện False Positive) vượt quá **1% trong cửa sổ 30 ngày liên tục**, AI Engine sẽ tự động chuyển Tenant sang trạng thái `LOCKED_MODE`.
+2. **Hành vi**:
+   - Mọi yêu cầu gửi tới `/v1/decide` sẽ tự động trả về `dry_run_mode: true` và AI Engine từ chối cung cấp payload can thiệp thật.
+   - Tất cả các tiêu đề phản hồi (response headers) sẽ bao gồm các trường `X-Containment-Status: LOCKED` và `X-Lock-Reason: error_budget_exceeded_1pct`.
+   - Nền tảng CDO bắt buộc chuyển mọi hoạt động containment downstream sang chế độ dry-run (chỉ cảnh báo), bỏ qua mọi nỗ lực ghi đè thủ công.
+3. **Khôi phục**: Việc mở khóa trạng thái `LOCKED_MODE` yêu cầu xem xét và phê duyệt thủ công từ Trưởng nhóm AI (AI Team Lead), người phải đặt lại các tham số ngân sách lỗi một cách rõ ràng.
 
 ## 3. Secrets Management
 
@@ -136,26 +146,45 @@ Các secret sau đây được lưu trữ trong AWS Secrets Manager:
 
 | Secret | Nơi lưu trữ | Chu kỳ xoay vòng | Được truy cập bởi |
 |---|---|---|---|
-| `finops/ai-engine/api-key` | AWS Secrets Manager (mã hóa bằng KMS CMK) | Tự động mỗi 30 ngày | AI Engine Request Lambda (qua SDK khi khởi động lạnh) |
+| `finops/ai-engine/api-key` (Hết hiệu lực) | Hết hiệu lực | N/A | Được thay thế bởi thông tin xác thực AWS IAM SigV4 |
 | `finops/dashboard/db-creds` | AWS Secrets Manager | Tự động mỗi 60 ngày | Athena crawler / QuickSight dataset engine trong tương lai |
 | `finops/alerting/slack-webhook` | AWS Secrets Manager | Thủ công mỗi 90 ngày | `LambdaAlertRouting` |
-| `finops/ai-engine/contract-signing-key` | AWS Secrets Manager | Tự động mỗi 90 ngày | Hàm Lambda xác thực của Step Functions và AI Engine Request Lambda |
+| `finops/ai-engine/contract-signing-key` (Hết hiệu lực) | Hết hiệu lực | N/A | Được thay thế bởi cơ chế kiểm tra toàn vẹn yêu cầu (`X-Payload-SHA256`) |
 | `finops/containment/external-id-seed` | AWS Secrets Manager | Xoay vòng thủ công khi xảy ra sự cố | Quy trình cung cấp vai trò containment |
 
-### 3.2 Inject Pattern
+### 3.2 Inject Pattern & Integrity Verification
 
-Chúng tôi sử dụng SDK AWS Secrets Manager để lấy các secret trong các hàm Lambda khi runtime, thay vì truyền chúng dưới dạng các biến môi trường plaintext. Secrets được phân giải trong quá trình function cold-start, cache trong ngữ cảnh thực thi toàn cục của hàm, và được kiểm tra hợp lệ theo các chính sách TTL cache (ví dụ: 5 phút) để tránh gọi API trực tiếp quá nhiều ở các yêu cầu tiếp theo.
+Vì hệ thống sử dụng AWS IAM SigV4 để xác thực giữa các dịch vụ thay vì static API keys, các hàm Request và Worker Lambda không lấy static API keys từ Secrets Manager. Thay vào đó, AI Engine Request Lambda sẽ xác thực độ toàn vẹn yêu cầu và độ lệch thời gian (clock skew drift tối đa 300s) trực tiếp từ các cross-cutting headers.
 
-Ví dụ, hàm container Lambda truy xuất API key của nó một cách động bằng SDK AWS:
+Ví dụ, hàm container Lambda xác thực yêu cầu đi vào bằng đoạn mã logic Python sau:
+
 ```python
-import boto3
-import os
+import time
+import hashlib
+from datetime import datetime
 
-def get_api_key():
-    secret_name = os.environ["API_KEY_SECRET_ARN"]
-    client = boto3.client("secretsmanager")
-    response = client.get_secret_value(SecretId=secret_name)
-    return response["SecretString"]
+def validate_request_integrity(event):
+    headers = event.get("headers", {})
+    body = event.get("body", "")
+    
+    # 1. Verify Clock Skew (max 300s)
+    req_timestamp_str = headers.get("X-Request-Timestamp")
+    if not req_timestamp_str:
+        return {"statusCode": 400, "body": "Missing X-Request-Timestamp"}
+        
+    req_time = datetime.fromisoformat(req_timestamp_str.replace("Z", "+00:00"))
+    now = datetime.now(req_time.tzinfo)
+    drift = abs((now - req_time).total_seconds())
+    if drift > 300:
+        return {"statusCode": 400, "body": "ERR_REPLAY_DETECTED: Clock skew > 300 seconds"}
+        
+    # 2. Verify Payload Hash
+    payload_hash = headers.get("X-Payload-SHA256")
+    calculated_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if payload_hash != calculated_hash:
+        return {"statusCode": 400, "body": "ERR_IDEMPOTENCY_MISMATCH: Hash mismatch"}
+        
+    return {"statusCode": 200}
 ```
 
 Đường dẫn inject sử dụng truy xuất an toàn khi runtime. Các hàm Lambda đọc trực tiếp secrets thông qua Secrets Manager SDK vì chúng là các tác vụ container ngắn hạn. Terraform tạo các secret container và quyền IAM, nhưng nó không lưu trữ giá trị bí mật trong `.tfvars`, Terraform state, hay các cấu hình build.
@@ -242,7 +271,7 @@ Mọi hành động kiểm soát do CDO platform thực hiện đều được g
 }
 ```
 
-Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại DynamoDB và S3, với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Telemetry gửi tới AI Engine để phát hiện bất thường là dữ liệu chi phí CUR-only và tuyệt đối không bao gồm các tín hiệu hiệu năng CloudWatch. Hệ thống log và metrics của CloudWatch chỉ phục vụ cho việc giám sát vận hành của CDO và cảnh báo SRE. Mọi hoạt động xác thực bảng điều khiển (đăng nhập thành công, đăng xuất, làm mới phiên hết hạn), lỗi xác thực (đăng nhập thất bại, chữ ký token không hợp lệ, vi phạm cửa sổ replay) và các nỗ lực truy cập nhóm không được ủy quyền (như người dùng Finance readonly cố gắng gọi một hành động của operator) đều được ghi nhật ký ngay lập tức vào CloudWatch Logs và truyền về S3 để lưu giữ lịch sử kiểm toán.
+Bản ghi kiểm toán được ghi lại trước khi thực hiện bất kỳ hoạt động apply nào và được cập nhật sau hoạt động đó với trạng thái cuối cùng. Mọi bản ghi hành động containment đều được liên kết mã hóa với bản ghi trước đó trong một chuỗi append-only lưu trữ tại DynamoDB và S3, với mã băm kiểm tra toàn vẹn được tính toán là `sha256(current_payload + previous_hash)` nhằm đảm bảo khả năng chống giả mạo (tamper-evident). Hoạt động dry-run vẫn tạo ra các bản ghi kiểm toán vì Finance cần xem nền tảng sẽ làm gì và tại sao hành động đó vẫn an toàn. Bộ dữ liệu huấn luyện mô hình AI không được CDO ghi nhật ký; CDO chỉ ghi nhật ký metadata cuộc gọi, các trường quyết định được trả về và các tham chiếu bằng chứng vận hành cần thiết cho việc cảnh báo và containment. Dữ liệu đo lường hiệu năng gửi tới AI Engine để phát hiện bất thường là dạng lai (hybrid), bao gồm các tệp xuất S3 CUR, dữ liệu API Cost Explorer và các chỉ số hiệu năng từ CloudWatch (`resource_utilization_metrics` như CPU, memory, network, disk, database connections, và GPU metrics). Nếu các chỉ số CloudWatch không khả dụng, hệ thống tự động chuyển sang chế độ CUR-only, giảm nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và bắt buộc thực hiện các hành động containment ở chế độ dry-run/alert-only. Các tệp log và metrics của CloudWatch cũng được sử dụng cho việc giám sát sức khỏe vận hành của CDO platform và cảnh báo SRE. Mọi hoạt động xác thực bảng điều khiển (đăng nhập thành công, đăng xuất, làm mới phiên hết hạn), lỗi xác thực (đăng nhập thất bại, chữ ký token không hợp lệ, vi phạm cửa sổ replay) và các nỗ lực truy cập nhóm không được ủy quyền (như người dùng Finance readonly cố gắng gọi một hành động của operator) đều được ghi nhật ký ngay lập tức vào CloudWatch Logs và truyền về S3 để lưu giữ lịch sử kiểm toán.
 
 ### 5.2 Storage + Retention
 

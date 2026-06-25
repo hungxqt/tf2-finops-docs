@@ -1,527 +1,1245 @@
-# AI API Contract - Task Force 2 (FinOps Watch)
+# AI API Contract — Task Force 2 (FinOps Watch)
 
-<!-- Owner: Nhóm AI 2
-     Signed by: AI Lead + CDO Leads × 2 (CDO-01, CDO-02) + Reviewer panel
+<!-- Owner: Nhóm AI — TF2 FinOps Watch
+     Signed by: AI Lead + CDO Lead (CDO-01) + CDO Lead (CDO-02) + Reviewer Panel
      Date signed: 2026-06-25 (W11 T5)
-     🔒 FREEZE - no change without formal change request -->
-
-## 1. Mục đích
-
-Tài liệu này định nghĩa **AI API Contract** giữa **Nhóm AI** (đóng vai trò cung cấp trí tuệ nhân tạo phát hiện bất thường & phân tích nguyên nhân) và **Nhóm CDO** (đóng vai trò vận hành nền tảng dữ liệu, thu thập log & thực thi). 
-
-Hệ thống hoạt động theo cơ chế **Batch Job chu kỳ 24 giờ**. CDO Platform chịu trách nhiệm đóng gói dữ liệu và gửi tới AI Engine qua API endpoint `/v1/detect` chạy bất đồng bộ (Async) để tối ưu hóa hiệu năng và tránh nghẽn mạng.
-
-Để giải quyết giới hạn kích thước Payload của AWS API Gateway (tối đa 10MB) và ALB khi truyền log CUR lớn, AI Engine hỗ trợ **Cơ chế nạp lai (Hybrid Ingestion Input)**: Cho phép CDO truyền mảng dữ liệu thô nếu dung lượng nhỏ, HOẶC truyền một con trỏ S3 URL chứa file log vi mô nếu dung lượng lớn. 
-
-Hệ thống cũng hỗ trợ **Cờ chạy cưỡng chế (`is_ad_hoc`)** để bỏ qua khóa trùng lặp 24h khi cần quét khẩn cấp. Kết quả phân tích được lưu vào DynamoDB và CDO có thể truy xuất qua endpoint kết quả.
+     Version: v1.1.0
+     🔒 FREEZE — Không thay đổi nếu không có Formal Change Request được cả hai bên ký -->
 
 ---
 
-## 2. Versioning & Evolution
+## Mục lục
 
-- **Current Version**: `v1.0` (nằm trong đường dẫn `/v1/`)
-- **Breaking Changes**: Bất kỳ thay đổi cấu trúc dữ liệu bắt buộc (Breaking changes) sẽ yêu cầu nâng phiên bản lên `/v2/`. Cả hai phiên bản phải được hỗ trợ song song tối thiểu **30 ngày** để đảm bảo khả năng tương thích ngược.
-- **Non-breaking Changes**: Việc thêm các trường tùy chọn hoặc bổ sung endpoint mới được coi là minor bump, không thay đổi đường dẫn `/v1/`.
-- **Change Request Process**: Đề xuất thay đổi phải được đưa ra thảo luận trong cuộc họp Task Force nội bộ, có sự đồng thuận của cả AI Lead và CDO Leads trước khi cập nhật tài liệu này.
+1. [Mục đích & Phạm vi](#1-mục-đích--phạm-vi)
+2. [Luồng tích hợp tổng thể](#2-luồng-tích-hợp-tổng-thể)
+3. [Quy tắc chung & Bảo mật](#3-quy-tắc-chung--bảo-mật)
+4. [Cross-Cutting Headers](#4-cross-cutting-headers)
+5. [Đặc tả API Endpoints](#5-đặc-tả-api-endpoints)
+   - 5.1 `POST /v1/detect` — Phát hiện Bất thường (Bất đồng bộ)
+   - 5.2 `POST /v1/decide` — Lập Kế hoạch Can thiệp
+   - 5.3 `POST /v1/verify` — Xác thực Kết quả
+   - 5.4 `GET /health` — Health Check
+   - 5.5 `GET /v1/status/{id}` — Kiểm tra Trạng thái Tiến trình (Detect & Remediation)
+   - 5.6 `POST /v1/audit/{audit_id}/rollback` — Kích hoạt Rollback
+6. [Anomaly Types — Enum Reference](#6-anomaly-types--enum-reference)
+7. [Containment Actions — Enum Reference](#7-containment-actions--enum-reference)
+8. [SLO & Xử lý Lỗi](#8-slo--xử-lý-lỗi)
+9. [Sequence Diagram — Luồng Hoàn Chỉnh](#9-sequence-diagram--luồng-hoàn-chỉnh)
+10. [Tài liệu liên quan](#10-tài-liệu-liên-quan)
 
 ---
 
-## 3. Security, Authentication & Rate Limiting
+## 1. Mục đích & Phạm vi
 
-- **Inter-service Authentication**: Sử dụng cơ chế **AWS IAM SigV4** để xác thực các yêu cầu gọi chéo giữa các service nội bộ của CDO và AI Engine (không sử dụng API key tĩnh).
-- **Cross-account Access**: Sử dụng cơ chế **STS assume-role** kèm theo Session Tag `tenant_id` để phân tách và bảo vệ dữ liệu người thuê.
-- **Network Isolation**: AI Engine được đóng gói container chạy hoàn toàn trong **Private Subnet** phía sau **Internal Application Load Balancer (ALB)**, chỉ cho phép kết nối nội bộ từ các CDO VPC của Task Force (cấm mở cổng public ra Internet).
-- **Rate Limiting**: 
-  - Đóng cấu hình hạn mức gọi API tối đa trên mỗi Tenant thông qua API Gateway Usage Plan.
-  - Phản hồi mã lỗi `429 Too Many Requests` kèm theo header `Retry-After: <seconds>` nếu vượt quá hạn mức.
+Tài liệu này định nghĩa **toàn bộ Giao diện lập trình ứng dụng (API)** mà **Nhóm AI expose** cho **Nhóm CDO consume** trong hệ thống TF2 FinOps Watch.
+
+Cam kết kỹ thuật này đảm bảo chu trình phát hiện → lập kế hoạch → can thiệp → xác thực hoạt động nhất quán, an toàn và có thể kiểm toán. 
+
+> [!NOTE]
+> **Thiết kế Bất đồng bộ (Async Detection)**: Vì tiến trình phân tích dữ liệu CUR/CE lớn kết hợp gọi LLM AWS Bedrock có thể kéo dài (30-45 giây), API `/v1/detect` được thiết kế xử lý bất đồng bộ (trả về trạng thái `processing` ngay lập tức). CDO sẽ polling endpoint `/v1/status/{correlation_id}` để lấy kết quả nhằm tránh timeout 504 của Gateway.
+
+```
+CUR/CE Data (CDO Pull)
+        │
+        ▼
+POST /v1/detect ──────────────────► Trả về trạng thái "processing" + correlation_id
+        │
+        ▼ (CDO Polling cho đến khi DONE)
+GET /v1/status/{correlation_id} ──► Nhận kết quả phát hiện anomalies_list
+        │
+        │ (nếu anomalies_detected = true)
+        ▼
+POST /v1/decide ──────────────────► RCA + Action Plan + AWS CLI payload + Rollback payload
+        │
+        │ CDO thực thi action (dry-run hoặc thật)
+        ▼
+POST /v1/verify ──────────────────► Đánh giá hiệu quả → DONE / RETRY / ROLLBACK / ESCALATE
+```
+
+**Phạm vi:**
+- Phát hiện 5 loại bất thường chi phí: `runaway_usage`, `idle_resource`, `untagged_spend`, `sudden_spike`, `gradual_drift`
+- Containment an toàn: chỉ trên môi trường `dev`, `staging`, `sandbox`, `ml-research`
+- Hard Boundary: **KHÔNG BAO GIỜ** terminate production, xóa data, chỉnh IAM
+
+---
+
+## 2. Luồng tích hợp tổng thể
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        CDO Platform                                 │
+│                                                                     │
+│  EventBridge Cron                                                   │
+│       │ (24h batch)                                                 │
+│       ▼                                                             │
+│  [Pull CUR/CE Data] ──► POST /v1/detect ──────────────────────────►│──┐
+│                                                                     │  │
+│  ◄─────────────────────── DetectResponse (status: "processing") ───│◄─┘
+│       │                                                             │
+│  ┌───►│ (CDO Polling liên tục)                                      │
+│  │    ▼                                                             │
+│  └─── GET /v1/status/{correlation_id} ─────────────────────────────►│──┐
+│                                                                     │  │
+│  ◄─────────────────────── StatusResponse (anomalies_list) ─────────│◄─┘
+│       │                                                             │
+│       │ (if anomalies_detected = true)                              │
+│       ▼                                                             │
+│  POST /v1/decide ─────────────────────────────────────────────────►│──┐
+│                                                                     │  │
+│  ◄─────────────────── DecideResponse (action_plan + payloads) ─────│◄─┘
+│       │                                                             │
+│       │ (Execute action — dry-run or real)                          │
+│       ▼                                                             │
+│  [CDO Executes AWS CLI] ──► POST /v1/verify ──────────────────────►│──┐
+│                                                                     │  │
+│  ◄─────── VerifyResponse (next_action: DONE/RETRY/ROLLBACK/ESC) ───│◄─┘
+│                                                                     │
+│  [Write Audit Trail to DynamoDB] ◄── all steps logged              │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                          AI Engine (Fargate/Lambda)
+                          Private Subnet — Internal ALB
+```
+
+---
+
+## 3. Quy tắc chung & Bảo mật
+
+| Thuộc tính | Quy định |
+|---|---|
+| **Base Path** | `/v1/` |
+| **Protocol** | HTTPS (TLS 1.2+) only |
+| **Xác thực** | **AWS IAM SigV4** — không dùng static API key |
+| **Cross-account** | STS `assume-role` kèm Session Tag `tenant_id` |
+| **Network** | AI Engine chạy trong **Private Subnet**, sau **Internal ALB** — cấm public internet |
+| **Content-Type** | `application/json` cho tất cả request/response |
+| **Idempotency** | Header `X-Idempotency-Key` bắt buộc cho `/v1/detect`, `/v1/decide`, `/v1/verify` |
+| **Rate Limit** | Tối đa **100 requests/phút** per tenant |
+| **Integrity** | `X-Payload-SHA256` (SHA256 của request body) bắt buộc |
+| **Clock Skew** | Request bị reject nếu `X-Request-Timestamp` lệch > 300 giây so với server |
+| **Multi-tenant** | Phân tách dữ liệu hoàn toàn qua `X-Tenant-Id` |
+
+### 3.1 Quy tắc Idempotency chi tiết
+
+`X-Idempotency-Key` lưu DynamoDB với TTL 24 giờ. Xử lý theo 3 trường hợp:
+
+| Trạng thái Key | Payload | Hành vi |
+|---|---|---|
+| Chưa tồn tại | Bất kỳ | Xử lý bình thường |
+| **Đang xử lý** (`IN_PROGRESS`) | Bất kỳ | `409 Conflict` + tiến trình hiện tại |
+| **Đã hoàn thành** + payload **khớp** SHA256 | Khớp | `200 OK` + kết quả đã cache |
+| **Đã hoàn thành** + payload **khác** SHA256 | Không khớp | `400 ERR_IDEMPOTENCY_MISMATCH` |
+
+### 3.2 Error Budget Lock
+
+Nếu tỷ lệ rollback vượt **1% trong cửa sổ 30 ngày**, AI Engine tự động chuyển Tenant sang `LOCKED_MODE`:
+- Mọi `/v1/decide` → chỉ trả về `dry_run_mode: true`, không có action thật
+- CDO nhận `X-Containment-Status: LOCKED` trong response header
+- Unlock yêu cầu thủ công từ AI Team Lead
 
 ---
 
 ## 4. Cross-Cutting Headers
 
-Mọi API request gửi từ CDO Platform tới AI Engine (ngoại trừ endpoint `/health` ẩn danh phục vụ ALB) bắt buộc phải đính kèm các Header tiêu chuẩn sau:
+Áp dụng cho **mọi request** (ngoại trừ `/health`):
 
-| Header | Type | Required | Description |
+| Header | Type | Bắt buộc | Mô tả |
 |---|---|---|---|
-| `Content-Type` | String | ✓ | Định dạng dữ liệu truyền tải, cố định: `application/json`. |
-| `Accept` | String | ✓ | Định dạng mong muốn nhận về, cố định: `application/json`. |
-| `X-Tenant-Id` | UUID v4 | ✓ | Định danh duy nhất cho từng Tenant (Cô lập dữ liệu logic và kiểm soát phân quyền tác vụ). |
-| `Authorization` | Signature | ✓ | Chữ ký xác thực AWS IAM SigV4. |
-| `X-Idempotency-Key` | String | ✓ | Composite Key định dạng `tenant_id:YYYY-MM-DD`. Ngăn chặn việc thực thi trùng lặp trong cùng một chu kỳ 24 giờ (bị bỏ qua nếu `is_ad_hoc` đặt là `true`). |
-| `X-Correlation-Id` | UUID | optional | Khóa theo dõi vết luồng nghiệp vụ E2E qua các microservice (tự sinh nếu thiếu). |
-
-> [!IMPORTANT]
-> **Quy tắc Idempotency & Trùng khóa nâng cao**:
-> - `X-Idempotency-Key` được lưu trữ trên DynamoDB với thời gian TTL tự động hủy sau 24 giờ.
-> - **Nếu tiến trình đang chạy (processing):** Trả về `409 Conflict` kèm thông tin tiến trình cũ đang xử lý.
-> - **Nếu tiến trình đã hoàn thành (completed / failed):**
->   - *Trường hợp Payload khớp hoàn toàn:* Trả về mã `200 OK` kèm kết quả đã lưu trong DynamoDB tương ứng với `audit_id` của lần chạy đầu tiên.
->   - *Trường hợp Payload khác biệt (Hash Mismatch):* Hệ thống trả về lỗi **`400 Bad Request`** kèm mã lỗi nội bộ **`ERR_IDEMPOTENCY_MISMATCH`** (Cảnh báo việc gửi dữ liệu khác nhau trên cùng một khóa).
+| `Content-Type` | string | ✓ | Cố định: `application/json` |
+| `Accept` | string | ✓ | Cố định: `application/json` |
+| `X-Tenant-Id` | string (UUID v4) | ✓ | Định danh Tenant — cô lập dữ liệu + phân quyền |
+| `Authorization` | string | ✓ | AWS IAM SigV4 Signature |
+| `X-Idempotency-Key` | string | ✓ | Format: `{tenant_id}:{uuid_v4}` — chống double-process |
+| `X-Payload-SHA256` | string | ✓ | SHA256 hex của request body — verify integrity |
+| `X-Request-Timestamp` | string (RFC3339 UTC) | ✓ | Thời điểm CDO tạo request. Reject nếu skew > 300s |
+| `X-Correlation-Id` | string (UUID v4) | optional | Trace ID E2E. AI Engine tự sinh nếu thiếu |
+| `X-Dry-Run-Mode` | string | ✓ | `"true"` hoặc `"false"` — phải nhất quán với body |
 
 ---
 
-## 5. Endpoints Specification
+## 5. Đặc tả API Endpoints
 
-### 5.1 Endpoint 1: `POST /v1/detect`
+### 5.1 POST /v1/detect — Phát hiện Bất thường Chi phí (Bất đồng bộ)
 
-**Mục đích**: CDO Platform gọi API này để gửi dữ liệu chi phí vĩ mô & log CUR vi mô (hoặc con trỏ S3 tới file CUR) trong chu kỳ 24 giờ. Tiến trình xử lý chạy bất đồng bộ (Async) ở background.
+Nhận dữ liệu telemetry CUR + Cost Explorer + CloudWatch, ghi nhận yêu cầu và bắt đầu tiến trình phân tích bất đồng bộ.
 
-#### Request Body
-Hỗ trợ cơ chế **Hybrid Ingestion** và **Cờ cưỡng chế** trong cùng một cấu trúc payload:
+#### A. Request Headers
+Theo [Cross-Cutting Headers §4](#4-cross-cutting-headers) + `X-Dry-Run-Mode` bắt buộc.
 
-1.  `data_source_type` (Enum: `RAW_JSON` | `S3_POINTER`).
-2.  `is_ad_hoc` (Boolean: Cờ chạy cưỡng chế khẩn cấp, bỏ qua Idempotency Key nếu đặt là `true`, mặc định: `false`).
-3.  `aws_cost_explorer_daily` (Mảng chứa 6 cột dữ liệu vĩ mô, luôn luôn bắt buộc).
-4.  `aws_cur_line_items` (Bắt buộc nếu `data_source_type` là `RAW_JSON`. Nhận mảng dữ liệu CUR vi mô trực tiếp nếu payload dưới 10MB).
-5.  `s3_bucket_uri` (Bắt buộc nếu `data_source_type` là `S3_POINTER`. Nhận đường dẫn S3 chứa file log CUR nén nếu dung lượng lớn).
+#### B. Request Body
 
-##### Data Schema
+* **Mô tả trường dữ liệu yêu cầu (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `data_source_type` | string (Enum) | ✓ | Kiểu nạp dữ liệu: `RAW_JSON` (gửi data trực tiếp ≤10MB) hoặc `S3_POINTER` (gửi URI S3) |
+| `is_ad_hoc` | boolean | optional | `true` = quét khẩn cấp ngoài lịch, bỏ qua idempotency. Mặc định: `false` |
+| `telemetry_delay_event` | boolean | optional | `true` = CUR chưa finalized, CDO fallback sang CE. AI Engine sẽ hạ confidence. Mặc định: `false` |
+| `aws_cost_explorer_daily` | array (of objects) | ✓ | Dữ liệu tổng hợp hàng ngày từ CE API — luôn bắt buộc. Chi tiết schema theo telemetry-contract.md §6 |
+| `aws_cur_line_items` | array (of objects) | conditional | Dữ liệu CUR resource-level — bắt buộc khi `data_source_type = RAW_JSON`. Schema theo telemetry-contract.md §7 |
+| `s3_bucket_uri` | string | conditional | URI S3 file CUR nén — bắt buộc khi `data_source_type = S3_POINTER` |
+| `resource_utilization_metrics` | array (of objects) | optional | Dữ liệu hiệu năng vật lý CloudWatch (cpu_percent, database_connections...). Chi tiết cấu trúc xem tại telemetry-contract.md §8.1 |
+
+* **Lược đồ Schema Yêu cầu**:
 ```json
 {
-  "data_source_type": "string (Required - Kiểu nạp dữ liệu: RAW_JSON | S3_POINTER)",
-  "is_ad_hoc": "boolean (Optional - Bỏ qua khóa idempotency nếu true, mặc định: false)",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DetectRequest",
+  "type": "object",
+  "properties": {
+    "data_source_type": {
+      "type": "string",
+      "enum": ["RAW_JSON", "S3_POINTER"],
+      "description": "Kiểu nạp dữ liệu CUR"
+    },
+    "is_ad_hoc": {
+      "type": "boolean",
+      "default": false
+    },
+    "telemetry_delay_event": {
+      "type": "boolean",
+      "default": false,
+      "description": "true nếu CUR chưa cập nhật đầy đủ — AI Engine giảm confidence, chỉ alert-only"
+    },
+    "aws_cost_explorer_daily": {
+      "type": "array",
+      "description": "Dữ liệu CE API — vĩ mô, daily grain. Schema theo telemetry-contract.md §6",
+      "items": {
+        "type": "object",
+        "properties": {
+          "date":                   { "type": "string", "format": "date" },
+          "linked_account_id":      { "type": "string", "pattern": "^[0-9]{12}$" },
+          "linked_account_name":    { "type": "string" },
+          "service_code":           { "type": "string", "description": "e.g. AmazonEC2, AmazonRDS" },
+          "service":                { "type": "string", "description": "Tên hiển thị CE" },
+          "region":                 { "type": "string", "description": "e.g. ap-southeast-1" },
+          "unblended_cost":         { "type": "number", "minimum": 0 },
+          "cost_ratio_to_7d_avg":   { "type": "number", "minimum": 0 },
+          "day_of_week":            { "type": "integer", "minimum": 0, "maximum": 6 },
+          "is_weekend":             { "type": "boolean" },
+          "is_estimated":           { "type": "boolean" }
+        },
+        "required": ["date", "linked_account_id", "service_code", "service", "region", "unblended_cost", "cost_ratio_to_7d_avg", "day_of_week", "is_weekend", "is_estimated"]
+      }
+    },
+    "aws_cur_line_items": {
+      "type": "array",
+      "description": "Dữ liệu CUR resource-level — vi mô. Schema theo telemetry-contract.md §7",
+      "items": {
+        "type": "object",
+        "properties": {
+          "bill_billing_period_start_date":    { "type": "string", "format": "date-time" },
+          "line_item_usage_start_date":        { "type": "string", "format": "date-time" },
+          "line_item_usage_end_date":          { "type": "string", "format": "date-time" },
+          "line_item_usage_account_id":        { "type": "string", "pattern": "^[0-9]{12}$" },
+          "line_item_usage_account_name":      { "type": "string" },
+          "line_item_product_code":            { "type": "string" },
+          "line_item_usage_type":              { "type": "string" },
+          "line_item_operation":               { "type": "string" },
+          "line_item_resource_id":             { "type": "string" },
+          "line_item_usage_amount":            { "type": "number", "minimum": 0 },
+          "pricing_unit":                      { "type": "string" },
+          "line_item_unblended_rate":          { "type": "number", "minimum": 0 },
+          "line_item_unblended_cost":          { "type": "number", "minimum": 0 },
+          "usage_density_24h":                 { "type": "number", "minimum": 0, "maximum": 1 },
+          "resource_tags_user_environment":    { "type": "string", "enum": ["prod", "prod-core", "prod-payments", "staging", "dev", "sandbox", "ml-research", "data-analytics"] },
+          "resource_tags_user_team":           { "type": ["string", "null"] },
+          "resource_tags_user_owner":          { "type": ["string", "null"] },
+          "resource_tags_user_cost_center":    { "type": ["string", "null"] }
+        },
+        "required": [
+          "line_item_usage_start_date", "line_item_usage_account_id",
+          "line_item_product_code", "line_item_usage_type",
+          "line_item_resource_id", "line_item_usage_amount",
+          "pricing_unit", "line_item_unblended_cost",
+          "usage_density_24h", "resource_tags_user_environment"
+        ]
+      }
+    },
+    "s3_bucket_uri": {
+      "type": "string",
+      "pattern": "^s3://[a-z0-9\\-]+/.+\\.json\\.gz$",
+      "description": "URI S3 file CUR nén — bắt buộc khi S3_POINTER"
+    },
+    "resource_utilization_metrics": {
+      "type": "array",
+      "description": "Dữ liệu hiệu năng vật lý CloudWatch. Schema theo telemetry-contract.md §8.1",
+      "items": {
+        "type": "object",
+        "properties": {
+          "resource_id":           { "type": "string" },
+          "cpu_percent":           { "type": "number", "minimum": 0, "maximum": 100 },
+          "memory_mib":            { "type": "number", "minimum": 0 },
+          "network_in_bytes":      { "type": "number", "minimum": 0 },
+          "network_out_bytes":     { "type": "number", "minimum": 0 },
+          "disk_io_ops":           { "type": "number", "minimum": 0 },
+          "database_connections":  { "type": ["integer", "null"], "minimum": 0 },
+          "gpu_utilization":       { "type": ["number", "null"], "minimum": 0, "maximum": 100 },
+          "idle_hours_continuous": { "type": ["integer", "null"], "minimum": 0 }
+        },
+        "required": ["resource_id", "cpu_percent", "network_in_bytes", "network_out_bytes"]
+      }
+    }
+  },
+  "required": ["data_source_type", "aws_cost_explorer_daily"],
+  "if": { "properties": { "data_source_type": { "const": "RAW_JSON" } } },
+  "then": { "required": ["data_source_type", "aws_cost_explorer_daily", "aws_cur_line_items"] },
+  "else": { "required": ["data_source_type", "aws_cost_explorer_daily", "s3_bucket_uri"] },
+  "additionalProperties": false
+}
+```
+
+* **Payload Yêu cầu Mẫu**:
+```json
+{
+  "data_source_type": "RAW_JSON",
+  "is_ad_hoc": false,
+  "telemetry_delay_event": false,
   "aws_cost_explorer_daily": [
     {
-      "date": "string (Required - Định dạng YYYY-MM-DD)",
-      "linked_account_id": "long (Required - ID tài khoản thành viên AWS)",
-      "linked_account_name": "string (Required - Tên môi trường tài khoản, VD: prod-core)",
-      "service": "string (Required - Tên thương mại dịch vụ AWS)",
-      "service_code": "string (Required - Mã định danh dịch vụ, VD: AmazonRDS)",
-      "region": "string (Required - Vùng triển khai, VD: us-east-1)",
-      "unblended_cost": "float (Required - Số tiền phát sinh thô)",
-      "is_estimated": "boolean (Required - Cờ trạng thái ước tính số liệu của AWS)"
+      "date": "2026-06-23",
+      "linked_account_id": "200000000012",
+      "linked_account_name": "squad-ml-research",
+      "service_code": "AmazonEC2",
+      "service": "Amazon Elastic Compute Cloud - Compute",
+      "region": "ap-southeast-1",
+      "unblended_cost": 427.50,
+      "cost_ratio_to_7d_avg": 18.2,
+      "day_of_week": 1,
+      "is_weekend": false,
+      "is_estimated": false
     }
   ],
-  "s3_bucket_uri": "string (Required nếu S3_POINTER - Đường dẫn S3 trỏ tới tệp log CUR thô nén .json.gz)",
   "aws_cur_line_items": [
     {
-      "bill_billing_period_start_date": "string (Required)",
-      "bill_payer_account_id": "long (Required)",
-      "line_item_usage_account_id": "long (Required)",
-      "line_item_usage_account_name": "string (Required)",
-      "line_item_line_item_type": "string (Required)",
-      "line_item_usage_start_date": "string (Required)",
-      "line_item_usage_end_date": "string (Required)",
-      "line_item_product_code": "string (Required)",
-      "line_item_usage_type": "string (Required)",
-      "line_item_operation": "string (Required)",
-      "line_item_resource_id": "string (Nullable - ARN/ID thiết bị vật lý thật)",
-      "line_item_usage_amount": "float (Required)",
-      "pricing_unit": "string (Required)",
-      "line_item_unblended_rate": "float (Required)",
-      "line_item_unblended_cost": "float (Required)",
-      "line_item_currency_code": "string (Required)",
-      "product_product_name": "string (Required)",
-      "product_region_code": "string (Required)",
-      "product_instance_type": "string (Nullable)",
-      "resource_tags_user_team": "string (Nullable)",
-      "resource_tags_user_environment": "string (Required - Tag môi trường: prod-core, prod-payments, staging, dev, sandbox, ml-research, data-analytics)"
-      "resource_tags_user_cost_center": "string (Nullable)",
-      "resource_tags_user_owner": "string (Nullable)"
+      "bill_billing_period_start_date": "2026-06-01T00:00:00Z",
+      "line_item_usage_start_date": "2026-06-23T00:00:00Z",
+      "line_item_usage_end_date": "2026-06-24T00:00:00Z",
+      "line_item_usage_account_id": "200000000012",
+      "line_item_usage_account_name": "squad-ml-research",
+      "line_item_product_code": "AmazonEC2",
+      "line_item_usage_type": "BoxUsage:g4dn.xlarge",
+      "line_item_operation": "RunInstances",
+      "line_item_resource_id": "i-0abcd1234efgh5678",
+      "line_item_usage_amount": 24.0,
+      "pricing_unit": "Hrs",
+      "line_item_unblended_rate": 17.81,
+      "line_item_unblended_cost": 427.50,
+      "usage_density_24h": 1.0,
+      "resource_tags_user_environment": "ml-research",
+      "resource_tags_user_team": "squad-ml-core",
+      "resource_tags_user_owner": "dev@company.com",
+      "resource_tags_user_cost_center": "CC-9001"
+    }
+  ],
+  "resource_utilization_metrics": [
+    {
+      "resource_id": "i-0abcd1234efgh5678",
+      "cpu_percent": 95.0,
+      "memory_mib": 16000.0,
+      "network_in_bytes": 1048576,
+      "network_out_bytes": 2048576,
+      "disk_io_ops": 120,
+      "database_connections": null,
+      "gpu_utilization": 90.0,
+      "idle_hours_continuous": 0
     }
   ]
 }
 ```
 
-##### Request Example (Sử dụng S3 Pointer + Chạy khẩn cấp Ad-hoc)
-```json
-{
-  "data_source_type": "S3_POINTER",
-  "is_ad_hoc": true,
-  "aws_cost_explorer_daily": [
-    {
-      "date": "2026-03-20",
-      "linked_account_id": 200000000012,
-      "linked_account_name": "staging",
-      "service": "Amazon Relational Database Service",
-      "service_code": "AmazonRDS",
-      "region": "us-east-1",
-      "unblended_cost": 87.46,
-      "is_estimated": false
-    }
-  ],
-  "s3_bucket_uri": "s3://company-cdo-telemetry/cur/2026-06-25-raw-compressed.json.gz"
-}
-```
+#### C. Response Body
 
-#### Response Body (`202 Accepted`)
-```json
-{
-  "audit_id": "UUID (Mã định danh duy nhất cho phiên kiểm toán chi phí)",
-  "status": "processing",
-  "retry_after_seconds": 30,
-  "message": "string (Thông điệp phản hồi từ hệ thống)",
-  "created_at": "RFC3339 UTC Timestamp"
-}
-```
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
 
-##### Response Example
-```json
-{
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "status": "processing",
-  "retry_after_seconds": 30,
-  "message": "Ingestion successful. Please poll for results after the designated time.",
-  "created_at": "2026-06-25T10:00:00Z"
-}
-```
----
-
-### 5.2 Endpoint 2: `GET /v1/detect/result/{audit_id}`
-
-**Mục đích**: CDO Platform gọi API này để truy xuất kết quả phân tích bất thường chi phí từ AI Engine dựa trên `audit_id`. Dữ liệu được đọc trực tiếp từ DynamoDB (P99 Latency < 10ms).
-
-#### Request Headers
-Yêu cầu đính kèm `X-Tenant-Id` và `Authorization` (Enforce multi-tenant: Chỉ trả về thông tin nếu `audit_id` thuộc về đúng `X-Tenant-Id` tương ứng, ngược lại trả về `403 Forbidden`).
-
-#### Request Query Parameters
-
-| Parameter | Type | Required | Description |
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
 |---|---|---|---|
-| `limit` | Integer | optional | Số bản ghi tối đa trả về trên một trang (mặc định: 50, tối đa: 100). |
-| `next_token` | String | optional | Token phân trang nhận được từ phản hồi trước để truy xuất trang tiếp theo. |
+| `success` | boolean | ✓ | Request nạp dữ liệu hợp lệ |
+| `status` | string (Enum) | ✓ | Trạng thái tiếp nhận tiến trình. Giá trị: `processing` |
+| `correlation_id` | string (UUID v4) | ✓ | Trace ID sinh ra cho phiên phân tích. Dùng để polling status và tracking |
+| `message` | string | ✓ | Thông điệp thông báo trạng thái tiếp nhận |
 
-#### Response Body (`200 OK`)
-Phản hồi khi trạng thái là `completed` sẽ trả về **mảng danh sách các điểm bất thường (`anomalies_list`)** kèm theo **cơ chế phân trang (`pagination`)** để xử lý trường hợp phát hiện nhiều tài nguyên bất thường cùng lúc. Mỗi bản ghi bất thường chứa đầy đủ metadata, số liệu tài chính và chỉ dẫn kỹ thuật kèm **Audit Trail Context** để đảm bảo lưu vết tuân thủ $\ge 90$ ngày.
-
+* **Lược đồ Schema Phản hồi**:
 ```json
 {
-  "audit_id": "UUID",
-  "status": "string (completed | processing | failed)",
-  "error_message": "string (Chỉ xuất hiện khi status là failed, ví dụ: ERR_LLM_TIMEOUT | ERR_DATABASE_CONN)",
-  "message": "string (Chỉ xuất hiện khi status là processing để cập nhật trạng thái)",
-  "total_anomalies_found": "int (Tổng số bất thường phát hiện được trong chu kỳ)",
-  "anomalies_list": [
-    {
-      "anomaly_metadata": {
-        "anomaly_id": "string (Mã định danh bất thường, định dạng ANM-YYYY-MMDD[A-Z])",
-        "timestamp": "RFC3339 UTC Timestamp",
-        "resource_id": "string (ID vật lý hoặc ARN của thiết bị bất thường)",
-        "environment": "string (Môi trường phát sinh: prod, staging, dev, sandbox, ml-research, data-analytics)",
-        "confidence_score": "float (Độ tin cậy thuật toán từ 0.0 đến 1.0)",
-        "ai_model_used": "string (Mô hình AI thực hiện suy luận)"
-      },
-      "finance_dashboard_data": {
-        "target_recipient": "Finance Team & CFO Dashboard",
-        "metrics": {
-          "unblended_cost_24h_usd": "float (Chi phí 24 giờ qua)",
-          "cost_ratio_to_7d_avg": "float (Tỷ số tăng so với baseline trung bình 7 ngày)",
-          "projected_monthly_waste_usd": "float (Lượng tiền lãng phí dự kiến trong 30 ngày tiếp theo nếu không can thiệp)"
-        },
-        "allocation": {
-          "responsible_team": "string (Squad chịu trách nhiệm)",
-          "cost_center_code": "string (Mã trung tâm chi phí)"
-        },
-        "executive_summary": "string (Bản tóm tắt bằng ngôn ngữ tài chính tự nhiên)"
-      },
-      "engineering_dashboard_data": {
-        "target_recipient": "Engineering Console & Slack Alert",
-        "technical_context": {
-          "aws_service": "string (Mã dịch vụ)",
-          "usage_type": "string (Usage type)",
-          "pricing_unit": "string",
-          "usage_amount_24h": "float",
-          "usage_density_24h": "float"
-        },
-        "root_cause_analysis": {
-          "primary_driver_feature": "string (Thuộc tính chính dẫn tới phát hiện bất thường)",
-          "technical_reason": "string (Phân tích kỹ thuật chi tiết lỗi)",
-          "missing_mandatory_tags": "array of strings (Danh sách các thẻ tag bắt buộc bị thiếu)"
-        },
-        "mitigation_action": {
-          "strategy": "string (Chiến lược can thiệp tương ứng với môi trường)",
-          "immediate_action": "string (Lệnh can thiệp tức thì: tag-for-review | time-gated-countdown | auto-shutdown | quota-cap)",
-          "applied_payload": {
-            "action_type": "string (Kiểu tác động: inject_aws_tag | stop_instance | stop_sagemaker_notebook | restrict_quota)",
-            "tag_key": "string (optional - Khóa tag bổ sung)",
-            "tag_value": "string (optional - Giá trị tag bổ sung)",
-            "aws_cli_command": "string (Lệnh AWS CLI tương ứng để can thiệp thực tế)"
-          },
-          "enforcement_countdown": {
-            "time_lock_seconds": "int (Thời gian đếm ngược đối với Staging, mặc định 14400)",
-            "fallback_action": "string (Hành động cưỡng chế sau đếm ngược, VD: schedule-shutdown | stop-db-instance)"
-          }
-        },
-        "audit_trail_context": {
-          "action_triggered_by": "string (Phương thức kích hoạt: system_auto_containment | human_operator)",
-          "pre_action_state": "string (Trạng thái tài nguyên trước can thiệp: running | active)",
-          "post_action_state": "string (Trạng thái tài nguyên sau can thiệp: stopped | tagged | restricted)",
-          "execution_iam_role": "string (Mã vai trò IAM thực thi tác động vật lý thật)",
-          "rollback_script_encapsulated": "string (Câu lệnh AWS CLI đảo ngược/khôi phục lại trạng thái cũ)"
-        }
-      }
-    }
-  ],
-  "pagination": {
-    "next_token": "string (Nullable - Token cho trang tiếp theo, null nếu hết dữ liệu)",
-    "limit": "int (Số bản ghi tối đa trên một trang, mặc định: 50)"
-  }
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DetectResponse",
+  "type": "object",
+  "properties": {
+    "success": { "type": "boolean" },
+    "status": { "type": "string", "enum": ["processing"] },
+    "correlation_id": { "type": "string", "format": "uuid" },
+    "message": { "type": "string" }
+  },
+  "required": ["success", "status", "correlation_id", "message"],
+  "additionalProperties": false
 }
 ```
 
-##### Request Example
-`GET /v1/detect/result/8f3b610c-18a4-4e2b-9801-bde901844b20?limit=1&next_token=page2-token-example`
-
-##### Response Example (Trạng thái completed - Môi trường Staging)
+* **Payload Response Mẫu**:
 ```json
 {
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "status": "completed",
-  "total_anomalies_found": 1,
-  "anomalies_list": [
-    {
-      "anomaly_metadata": {
-        "anomaly_id": "ANM-2026-0623A",
-        "timestamp": "2026-06-23T17:05:46Z",
-        "resource_id": "arn:aws:rds:us-east-1:200000000012:db:db-staging-orphan-01",
-        "environment": "staging",
-        "confidence_score": 0.94,
-        "ai_model_used": "amazon.nova-pro-v1:0"
-      },
-      "finance_dashboard_data": {
-        "target_recipient": "Finance Team & CFO Dashboard",
-        "metrics": {
-          "unblended_cost_24h_usd": 27.84,
-          "cost_ratio_to_7d_avg": 12.4,
-          "projected_monthly_waste_usd": 835.20
-        },
-        "allocation": {
-          "responsible_team": "data-eng",
-          "cost_center_code": "CC-2002"
-        },
-        "executive_summary": "Hệ thống phát hiện một cơ sở dữ liệu AmazonRDS trên môi trường Staging đang lãng phí ngân sách doanh nghiệp, tiêu tốn $27.84/ngày. Tài nguyên này hiện không mang lại giá trị vận hành thực tế và đang làm chi phí của đội data-eng vượt 12.4 lần so với baseline tuần trước."
-      },
-      "engineering_dashboard_data": {
-        "target_recipient": "Engineering Console & Slack Alert",
-        "technical_context": {
-          "aws_service": "AmazonRDS",
-          "usage_type": "db.r5.2xlarge:ProvisionedStorage",
-          "pricing_unit": "Hrs",
-          "usage_amount_24h": 24.0,
-          "usage_density_24h": 1.0
-        },
-        "root_cause_analysis": {
-          "primary_driver_feature": "usage_density_24h",
-          "technical_reason": "Cơ sở dữ liệu RDS instance loại db.r5.2xlarge bị bỏ hoang sau đợt kiểm thử di trú dữ liệu của đội data-eng. Máy chủ duy trì trạng thái vận hành hết công suất liên tục 24/24 (usage_density = 1.0) nhưng ghi nhận số lượng kết nối (Active Connections) tiệm cận bằng 0 trong suốt 10 tuần qua.",
-          "missing_mandatory_tags": [
-            "resource_tags_user_owner"
-          ]
-        },
-        "mitigation_action": {
-          "strategy": "Time-gated Containment (Staging Rules)",
-          "immediate_action": "tag-for-review",
-          "applied_payload": {
-            "action_type": "inject_aws_tag",
-            "tag_key": "FinOps_Alert",
-            "tag_value": "Staging_Review_Required",
-            "aws_cli_command": "aws rds add-tags-to-resource --resource-name arn:aws:rds:us-east-1:200000000012:db:db-staging-orphan-01 --tags Key=FinOps_Alert,Value=Staging_Review_Required"
-          },
-          "enforcement_countdown": {
-            "time_lock_seconds": 14400,
-            "fallback_action": "schedule-shutdown"
-          }
-        },
-        "audit_trail_context": {
-          "action_triggered_by": "system_auto_containment",
-          "pre_action_state": "running",
-          "post_action_state": "tagged",
-          "execution_iam_role": "arn:aws:iam::200000000012:role/FinOpsEngineExecutionRole",
-          "rollback_script_encapsulated": "aws rds remove-tags-from-resource --resource-name arn:aws:rds:us-east-1:200000000012:db:db-staging-orphan-01 --tag-keys FinOps_Alert"
-        }
-      }
-    }
-  ],
-  "pagination": {
-    "next_token": null,
-    "limit": 50
-  }
-}
-```
-
-##### Response Example (Trạng thái processing - Đang xử lý)
-```json
-{
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
+  "success": true,
   "status": "processing",
-  "message": "AI Engine is still processing cost anomaly detection."
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "message": "Dữ liệu telemetry đã được tiếp nhận thành công. Tiến trình phân tích bất thường đang được thực thi bất đồng bộ."
 }
 ```
 
 ---
 
-### 5.3 Endpoint 3: `POST /v1/action/extend`
+### 5.2 POST /v1/decide — Lập Kế hoạch Can thiệp
 
-**Mục đích**: CDO Platform gọi API này khi kỹ sư nhấn nút "Gia hạn" (Extend/Snooze) cho tài nguyên đang bị cảnh báo đếm ngược ở môi trường Staging (countdown 4 giờ), giúp hoãn hành động tắt máy.
+Nhận thông tin bất thường từ `/v1/status/{correlation_id}` sau khi phát hiện hoàn tất, thực hiện Root Cause Analysis (RCA), và trả về kế hoạch hành động kèm AWS CLI payload + rollback command + dữ liệu dashboard tách riêng cho Finance và Engineering.
 
-#### Request Headers
-Yêu cầu đính kèm `X-Tenant-Id` và `Authorization` để xác thực quyền sở hữu phiên.
+#### A. Request Headers
+Theo [Cross-Cutting Headers §4](#4-cross-cutting-headers). `X-Correlation-Id` **bắt buộc** — phải khớp với `correlation_id` từ `/v1/detect`.
 
-#### Request Body
+#### B. Request Body
+
+* **Mô tả trường dữ liệu yêu cầu (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `correlation_id` | string (UUID v4) | ✓ | Trace ID từ `/v1/detect` — bắt buộc phải khớp |
+| `idempotency_key` | string (UUID v4) | ✓ | Khóa chống trùng lặp |
+| `dry_run_mode` | boolean | ✓ | `true` = chỉ sinh log/audit, không thực thi thật |
+| `anomaly_context` | object | ✓ | Ngữ cảnh bất thường cần lập kế hoạch |
+| `anomaly_context.anomaly_id` | string | ✓ | ID bất thường từ `anomalies_list[].anomaly_id` |
+| `anomaly_context.anomaly_type` | string (Enum) | ✓ | Loại bất thường — xem §6 |
+| `anomaly_context.resource_id` | string | ✓ | ARN tài nguyên |
+| `anomaly_context.environment` | string | ✓ | Môi trường tài nguyên |
+| `anomaly_context.unblended_cost_24h_usd` | number | ✓ | Chi phí 24h |
+| `anomaly_context.cost_ratio_to_7d_avg` | number | ✓ | Hệ số tăng |
+| `anomaly_context.responsible_team` | string\|null | ✓ | Squad chịu trách nhiệm |
+| `anomaly_context.cost_center_code` | string\|null | optional | Mã trung tâm chi phí |
+
+* **Lược đồ Schema Yêu cầu**:
 ```json
 {
-  "audit_id": "UUID (Required - ID phiên kiểm toán phát hiện bất thường)",
-  "extend_seconds": "int (Required - Số giây muốn kéo dài thêm, ví dụ: 14400 cho 4 giờ)",
-  "reason": "string (Required - Lý do gia hạn từ kỹ sư)"
-}
-```
-
-##### Request Example
-```json
-{
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "extend_seconds": 14400,
-  "reason": "Running long-term load testing on Staging environment until tonight"
-}
-```
-
-#### Response Body (`200 OK`)
-```json
-{
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "status": "extended",
-  "new_expiration_time": "RFC3339 UTC Timestamp (Thời điểm hết hạn mới)",
-  "message": "Countdown extended successfully."
-}
-```
-
-##### Response Example
-```json
-{
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "status": "extended",
-  "new_expiration_time": "2026-06-25T18:00:00Z",
-  "message": "Staging containment countdown extended by 4 hours."
-}
-```
-
----
-
-### 5.4 Endpoint 4: `POST /v1/action/rollback`
-
-**Mục đích**: CDO Platform gọi API này khi kỹ sư chọn "Khôi phục" (Rollback/Restore) một tài nguyên từ dashboard. API kiểm tra xác thực người dùng, trả về lệnh phục hồi vật lý tương ứng lưu trong DynamoDB và đánh dấu hoàn tác trong Audit Log.
-
-#### Request Headers
-Yêu cầu đính kèm `X-Tenant-Id` và `Authorization` để xác thực quyền khôi phục.
-
-#### Request Body
-```json
-{
-  "audit_id": "UUID (Required - ID phiên kiểm toán muốn phục hồi)",
-  "requested_by_user": "string (Required - Email của kỹ sư thực hiện khôi phục để lưu audit log)",
-  "justification_on_rollback": "string (Required - Giải trình lý do phục hồi tài nguyên để kiểm toán)"
-}
-```
-
-##### Request Example
-```json
-{
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "requested_by_user": "bao.nguyen@company.com",
-  "justification_on_rollback": "Need to resume training job for Project SecureDocs AI, approved by Team Lead"
-}
-```
-
-#### Response Body (`200 OK`)
-Trả về payload phục hồi và lệnh AWS CLI tương ứng để CDO Platform thực thi.
-
-```json
-{
-  "audit_id": "UUID",
-  "status": "rollback_initiated",
-  "rollback_payload": {
-    "action_type": "string (Kiểu phục hồi: start_instance | restore_quota | remove_aws_tag)",
-    "aws_cli_rollback_command": "string (Lệnh AWS CLI tương ứng để phục hồi tài nguyên thật)",
-    "original_resource_id": "string (ID tài nguyên bị tác động)"
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DecideRequest",
+  "type": "object",
+  "properties": {
+    "correlation_id":  { "type": "string", "format": "uuid" },
+    "idempotency_key": { "type": "string", "format": "uuid" },
+    "dry_run_mode":    { "type": "boolean" },
+    "anomaly_context": {
+      "type": "object",
+      "properties": {
+        "anomaly_id":               { "type": "string" },
+        "anomaly_type":             { "type": "string", "enum": ["runaway_usage", "idle_resource", "untagged_spend", "sudden_spike", "gradual_drift"] },
+        "resource_id":              { "type": "string" },
+        "environment":              { "type": "string", "enum": ["prod", "prod-core", "prod-payments", "staging", "dev", "sandbox", "ml-research", "data-analytics"] },
+        "unblended_cost_24h_usd":   { "type": "number", "minimum": 0 },
+        "cost_ratio_to_7d_avg":     { "type": "number", "minimum": 0 },
+        "responsible_team":         { "type": ["string", "null"] },
+        "cost_center_code":         { "type": ["string", "null"] }
+      },
+      "required": ["anomaly_id", "anomaly_type", "resource_id", "environment", "unblended_cost_24h_usd", "cost_ratio_to_7d_avg", "responsible_team"]
+    }
   },
-  "message": "string"
+  "required": ["correlation_id", "idempotency_key", "dry_run_mode", "anomaly_context"],
+  "additionalProperties": false
 }
 ```
 
-##### Response Example (Khôi phục một RDS instance đã bị tắt trên Staging)
+* **Payload Request Mẫu**:
 ```json
 {
-  "audit_id": "8f3b610c-18a4-4e2b-9801-bde901844b20",
-  "status": "rollback_initiated",
-  "rollback_payload": {
-    "action_type": "start_instance",
-    "aws_cli_rollback_command": "aws rds start-db-instance --db-instance-identifier db-staging-orphan-01",
-    "original_resource_id": "arn:aws:rds:us-east-1:200000000012:db:db-staging-orphan-01"
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "idempotency_key": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "dry_run_mode": true,
+  "anomaly_context": {
+    "anomaly_id": "ANM-2026-0623A",
+    "anomaly_type": "runaway_usage",
+    "resource_id": "i-0abcd1234efgh5678",
+    "environment": "ml-research",
+    "unblended_cost_24h_usd": 427.50,
+    "cost_ratio_to_7d_avg": 18.2,
+    "responsible_team": "squad-ml-core",
+    "cost_center_code": "CC-9001"
+  }
+}
+```
+
+#### C. Response Body
+
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `matched_runbook` | string | ✓ | Tên Runbook khớp từ thư viện |
+| `action_plan` | array (of objects) | ✓ | Kế hoạch hành động tuần tự |
+| `action_plan[].step` | integer | ✓ | Thứ tự bước (bắt đầu từ 1) |
+| `action_plan[].action` | string (Enum) | ✓ | Loại hành động — xem §7 |
+| `action_plan[].target` | string | ✓ | ARN tài nguyên |
+| `action_plan[].params` | object | optional | Tham số bổ sung |
+| `applied_payload` | object | ✓ | Lệnh AWS CLI thực thi can thiệp |
+| `applied_payload.action_type` | string (Enum) | ✓ | `inject_aws_tag`, `stop_instance`, `stop_sagemaker_notebook`, `restrict_quota` |
+| `applied_payload.aws_cli_command` | string | ✓ | Lệnh CLI đầy đủ, CDO thực thi trực tiếp |
+| `rollback_payload` | object | ✓ | Lệnh AWS CLI rollback trạng thái cũ |
+| `rollback_payload.action_type` | string (Enum) | ✓ | `remove_aws_tag`, `start_instance`, `start_sagemaker_notebook`, `restore_quota` |
+| `rollback_payload.aws_cli_rollback_command` | string | ✓ | Lệnh rollback đầy đủ |
+| `rollback_payload.original_resource_id` | string | ✓ | ARN gốc để verify rollback đúng mục tiêu |
+| `finance_dashboard_data` | object | ✓ | Dữ liệu cho Finance Dashboard & CFO (không có technical detail) |
+| `engineering_dashboard_data` | object | ✓ | Dữ liệu cho Engineering Console & Slack alert |
+| `correlation_id` | string (UUID v4) | ✓ | Trace ID — dùng lại cho `/v1/verify` |
+| `dry_run_mode` | boolean | ✓ | Echo lại giá trị từ request |
+
+* **Lược đồ Schema Phản hồi**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DecideResponse",
+  "type": "object",
+  "properties": {
+    "matched_runbook": { "type": "string" },
+    "action_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "step":   { "type": "integer", "minimum": 1 },
+          "action": { "type": "string", "enum": ["tag-for-review", "time-gated-countdown", "auto-shutdown", "quota-cap"] },
+          "target": { "type": "string" },
+          "params": { "type": "object" }
+        },
+        "required": ["step", "action", "target"]
+      }
+    },
+    "applied_payload": {
+      "type": "object",
+      "properties": {
+        "action_type":     { "type": "string", "enum": ["inject_aws_tag", "stop_instance", "stop_sagemaker_notebook", "restrict_quota"] },
+        "aws_cli_command": { "type": "string" }
+      },
+      "required": ["action_type", "aws_cli_command"]
+    },
+    "rollback_payload": {
+      "type": "object",
+      "properties": {
+        "action_type":                { "type": "string", "enum": ["remove_aws_tag", "start_instance", "start_sagemaker_notebook", "restore_quota"] },
+        "aws_cli_rollback_command":   { "type": "string" },
+        "original_resource_id":       { "type": "string" }
+      },
+      "required": ["action_type", "aws_cli_rollback_command", "original_resource_id"]
+    },
+    "finance_dashboard_data": {
+      "type": "object",
+      "properties": {
+        "target_recipient":   { "type": "string" },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "unblended_cost_24h_usd":       { "type": "number" },
+            "cost_ratio_to_7d_avg":         { "type": "number" },
+            "projected_monthly_waste_usd":  { "type": "number" }
+          },
+          "required": ["unblended_cost_24h_usd", "cost_ratio_to_7d_avg", "projected_monthly_waste_usd"]
+        },
+        "allocation": {
+          "type": "object",
+          "properties": {
+            "responsible_team": { "type": "string" },
+            "cost_center_code": { "type": "string" }
+          },
+          "required": ["responsible_team", "cost_center_code"]
+        },
+        "executive_summary": { "type": "string" }
+      },
+      "required": ["target_recipient", "metrics", "allocation", "executive_summary"]
+    },
+    "engineering_dashboard_data": {
+      "type": "object",
+      "properties": {
+        "target_recipient": { "type": "string" },
+        "technical_context": {
+          "type": "object",
+          "properties": {
+            "aws_service":        { "type": "string" },
+            "usage_type":         { "type": "string" },
+            "pricing_unit":       { "type": "string" },
+            "usage_amount_24h":   { "type": "number" },
+            "usage_density_24h":  { "type": "number" }
+          },
+          "required": ["aws_service", "usage_type", "pricing_unit", "usage_amount_24h", "usage_density_24h"]
+        },
+        "root_cause_analysis": {
+          "type": "object",
+          "properties": {
+            "primary_driver_feature":   { "type": "string" },
+            "technical_reason":         { "type": "string" },
+            "missing_mandatory_tags":   { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["primary_driver_feature", "technical_reason"]
+        }
+      },
+      "required": ["target_recipient", "technical_context", "root_cause_analysis"]
+    },
+    "correlation_id": { "type": "string", "format": "uuid" },
+    "dry_run_mode":   { "type": "boolean" }
   },
-  "message": "Rollback CLI command generated. CDO execution worker authorized to restore resource."
+  "required": ["matched_runbook", "action_plan", "applied_payload", "rollback_payload", "finance_dashboard_data", "engineering_dashboard_data", "correlation_id", "dry_run_mode"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Response Mẫu**:
+```json
+{
+  "matched_runbook": "RunawayMLClusterContainmentRunbook",
+  "action_plan": [
+    {
+      "step": 1,
+      "action": "tag-for-review",
+      "target": "i-0abcd1234efgh5678",
+      "params": {}
+    },
+    {
+      "step": 2,
+      "action": "time-gated-countdown",
+      "target": "i-0abcd1234efgh5678",
+      "params": {
+        "time_lock_seconds": 14400,
+        "fallback_action": "auto-shutdown"
+      }
+    }
+  ],
+  "applied_payload": {
+    "action_type": "inject_aws_tag",
+    "aws_cli_command": "aws ec2 create-tags --resources i-0abcd1234efgh5678 --tags Key=finops:review,Value=pending Key=finops:anomaly-id,Value=ANM-2026-0623A --region ap-southeast-1"
+  },
+  "rollback_payload": {
+    "action_type": "remove_aws_tag",
+    "aws_cli_rollback_command": "aws ec2 delete-tags --resources i-0abcd1234efgh5678 --tags Key=finops:review Key=finops:anomaly-id --region ap-southeast-1",
+    "original_resource_id": "i-0abcd1234efgh5678"
+  },
+  "finance_dashboard_data": {
+    "target_recipient": "Finance Team & CFO Dashboard",
+    "metrics": {
+      "unblended_cost_24h_usd": 427.50,
+      "cost_ratio_to_7d_avg": 18.2,
+      "projected_monthly_waste_usd": 12825.00
+    },
+    "allocation": {
+      "responsible_team": "squad-ml-core",
+      "cost_center_code": "CC-9001"
+    },
+    "executive_summary": "GPU instance i-0abcd1234efgh5678 thuộc squad-ml-core đã chạy liên tục 24/7 trong 3 ngày qua mà không có hoạt động sản xuất, gây lãng phí $427.50/ngày. Nếu không can thiệp, chi phí lãng phí ước tính tháng này là $12,825. Hành động gắn thẻ cảnh báo đã được khởi động (dry-run)."
+  },
+  "engineering_dashboard_data": {
+    "target_recipient": "Engineering Console & Slack #finops-alert-engineering",
+    "technical_context": {
+      "aws_service": "AmazonEC2",
+      "usage_type": "BoxUsage:g4dn.xlarge",
+      "pricing_unit": "Hrs",
+      "usage_amount_24h": 24.0,
+      "usage_density_24h": 1.0
+    },
+    "root_cause_analysis": {
+      "primary_driver_feature": "usage_density_24h",
+      "technical_reason": "EC2 g4dn.xlarge instance chạy 100% thời gian trong 24h (usage_density_24h=1.0). Không có training job nào được schedule trong 3 ngày qua. Nghi ngờ dev quên tắt instance sau khi training hoàn tất.",
+      "missing_mandatory_tags": []
+    }
+  },
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "dry_run_mode": true
 }
 ```
 
 ---
 
-### 5.5 Endpoint 5: `GET /health` (Alb Port 8080 Health Check)
+### 5.3 POST /v1/verify — Xác thực Kết quả Can thiệp
 
-**Mục đích**: AWS Application Load Balancer (ALB) và ECS Fargate gọi định kỳ (chu kỳ 30s) để kiểm tra tính sẵn sàng của Container. 
+CDO gửi báo cáo thực thi + dữ liệu telemetry post-action. AI Engine đánh giá hiệu quả và chỉ dẫn bước tiếp theo.
 
-*Không yêu cầu xác thực chéo (Không bắt buộc SigV4/X-Tenant-Id).*
+#### A. Request Headers
+Theo [Cross-Cutting Headers §4](#4-cross-cutting-headers). `X-Correlation-Id` **bắt buộc**.
 
-#### Response Body (`200 OK`)
+#### B. Request Body
+
+* **Mô tả trường dữ liệu yêu cầu (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `correlation_id` | string (UUID v4) | ✓ | Trace ID — phải khớp xuyên suốt 3 bước |
+| `idempotency_key` | string (UUID v4) | ✓ | Khóa chống trùng lặp |
+| `dry_run_mode` | boolean | ✓ | Phải nhất quán với bước `/v1/decide` |
+| `action_executed` | object | ✓ | Chi tiết hành động CDO đã thực thi |
+| `action_executed.action` | string (Enum) | ✓ | Loại hành động đã chạy — xem §7 |
+| `action_executed.target` | string | ✓ | ARN tài nguyên bị tác động |
+| `action_executed.status` | string (Enum) | ✓ | `COMPLETED` hoặc `FAILED` |
+| `action_executed.execution_time_seconds` | integer | optional | Thời gian thực thi tính bằng giây |
+| `post_telemetry_window` | object | ✓ | Telemetry sau can thiệp — cùng cấu trúc với detect request |
+
+* **Lược đồ Schema Yêu cầu**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VerifyRequest",
+  "type": "object",
+  "properties": {
+    "correlation_id":  { "type": "string", "format": "uuid" },
+    "idempotency_key": { "type": "string", "format": "uuid" },
+    "dry_run_mode":    { "type": "boolean" },
+    "action_executed": {
+      "type": "object",
+      "properties": {
+        "action":                   { "type": "string", "enum": ["tag-for-review", "time-gated-countdown", "auto-shutdown", "quota-cap"] },
+        "target":                   { "type": "string" },
+        "status":                   { "type": "string", "enum": ["COMPLETED", "FAILED"] },
+        "execution_time_seconds":   { "type": "integer", "minimum": 0 }
+      },
+      "required": ["action", "target", "status"]
+    },
+    "post_telemetry_window": {
+      "type": "object",
+      "description": "Telemetry sau can thiệp — cùng cấu trúc với detect request",
+      "properties": {
+        "data_source_type":         { "type": "string", "enum": ["RAW_JSON", "S3_POINTER"] },
+        "aws_cost_explorer_daily":  { "type": "array" },
+        "aws_cur_line_items":       { "type": "array" },
+        "s3_bucket_uri":            { "type": "string" }
+      },
+      "required": ["data_source_type", "aws_cost_explorer_daily"]
+    }
+  },
+  "required": ["correlation_id", "idempotency_key", "dry_run_mode", "action_executed", "post_telemetry_window"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Request Mẫu**:
+```json
+{
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "idempotency_key": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+  "dry_run_mode": true,
+  "action_executed": {
+    "action": "tag-for-review",
+    "target": "i-0abcd1234efgh5678",
+    "status": "COMPLETED",
+    "execution_time_seconds": 3
+  },
+  "post_telemetry_window": {
+    "data_source_type": "RAW_JSON",
+    "aws_cost_explorer_daily": [
+      {
+        "date": "2026-06-24",
+        "linked_account_id": "200000000012",
+        "linked_account_name": "squad-ml-research",
+        "service_code": "AmazonEC2",
+        "service": "Amazon Elastic Compute Cloud - Compute",
+        "region": "ap-southeast-1",
+        "unblended_cost": 0.00,
+        "cost_ratio_to_7d_avg": 0.0,
+        "day_of_week": 2,
+        "is_weekend": false,
+        "is_estimated": false
+      }
+    ],
+    "aws_cur_line_items": []
+  }
+}
+```
+
+#### C. Response Body
+
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `success` | boolean | ✓ | Chỉ số chi phí đã quay về baseline |
+| `regression_detected` | boolean | ✓ | Phát hiện sự cố/chi phí tăng đột biến do side effect của action |
+| `next_action` | string (Enum) | ✓ | Chỉ dẫn tiếp theo cho CDO Platform: `DONE`, `RETRY`, `ROLLBACK`, `ESCALATE` |
+| `escalation_bundle` | object | conditional | Gói thông tin ngữ cảnh để CDO log/alert khi cần escalate (bắt buộc khi `next_action = ESCALATE`) |
+| `escalation_bundle.reason` | string | ✓ | Lý do chi tiết tự chữa lành thất bại |
+| `escalation_bundle.logs` | array (of strings) | optional | Log thô của hệ thống AI |
+| `escalation_bundle.metrics` | object | optional | Snapshot metrics lúc gặp lỗi |
+
+* **Lược đồ Schema Phản hồi**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VerifyResponse",
+  "type": "object",
+  "properties": {
+    "success": { "type": "boolean" },
+    "regression_detected": { "type": "boolean" },
+    "next_action": { 
+      "type": "string", 
+      "enum": ["DONE", "RETRY", "ROLLBACK", "ESCALATE"] 
+    },
+    "escalation_bundle": {
+      "type": "object",
+      "properties": {
+        "reason": { "type": "string" },
+        "logs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "unblended_cost_24h_usd": { "type": "number" },
+            "cost_ratio_to_7d_avg": { "type": "number" },
+            "usage_density_24h": { "type": "number" }
+          },
+          "required": ["unblended_cost_24h_usd", "cost_ratio_to_7d_avg", "usage_density_24h"]
+        }
+      },
+      "required": ["reason"]
+    }
+  },
+  "required": ["success", "regression_detected", "next_action"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Response Mẫu (DONE)**:
+```json
+{
+  "success": true,
+  "regression_detected": false,
+  "next_action": "DONE"
+}
+```
+
+* **Payload Response Mẫu (ESCALATE)**:
+```json
+{
+  "success": false,
+  "regression_detected": true,
+  "next_action": "ESCALATE",
+  "escalation_bundle": {
+    "reason": "Sau khi gắn tag, instance vẫn tiếp tục chạy và cost không giảm. Không có owner phản hồi sau 4 giờ countdown. Yêu cầu kỹ sư on-call quyết định shutdown thủ công.",
+    "logs": [
+      "2026-06-23T22:05:00Z [WARN] tag-for-review applied but cost_ratio_to_7d_avg still 18.2",
+      "2026-06-23T22:05:00Z [WARN] No owner response within countdown window"
+    ],
+    "metrics": {
+      "unblended_cost_24h_usd": 427.50,
+      "cost_ratio_to_7d_avg": 18.2,
+      "usage_density_24h": 1.0
+    }
+  }
+}
+```
+
+---
+
+### 5.4 GET /health — Health Check
+
+ALB và ECS Fargate gọi định kỳ mỗi 30 giây để xác định độ tin cậy của container. **Không yêu cầu xác thực.**
+
+#### A. Response Body
+
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `status` | string | ✓ | Trạng thái tổng quan: `healthy`, `degraded`, `unhealthy` |
+| `timestamp` | string (RFC3339 UTC) | ✓ | Thời điểm server chạy health check |
+| `services` | object | ✓ | Trạng thái chi tiết các dependencies |
+| `services.dynamodb` | string (Enum) | ✓ | `connected` hoặc `disconnected` |
+| `services.bedrock_api` | string (Enum) | ✓ | `accessible` hoặc `inaccessible` |
+| `services.s3_cur_bucket` | string (Enum) | ✓ | `reachable` hoặc `unreachable` |
+
+* **Lược đồ Schema Phản hồi**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HealthResponse",
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "enum": ["healthy", "degraded", "unhealthy"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "services": {
+      "type": "object",
+      "properties": {
+        "dynamodb": { "type": "string", "enum": ["connected", "disconnected"] },
+        "bedrock_api": { "type": "string", "enum": ["accessible", "inaccessible"] },
+        "s3_cur_bucket": { "type": "string", "enum": ["reachable", "unreachable"] }
+      },
+      "required": ["dynamodb", "bedrock_api", "s3_cur_bucket"]
+    }
+  },
+  "required": ["status", "timestamp", "services"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Response Mẫu**:
 ```json
 {
   "status": "healthy",
   "timestamp": "2026-06-25T10:00:00Z",
   "services": {
     "dynamodb": "connected",
-    "bedrock_api": "accessible"
+    "bedrock_api": "accessible",
+    "s3_cur_bucket": "reachable"
   }
 }
 ```
 
 ---
 
-## 6. Service Level Objectives (SLO)
+### 5.5 GET /v1/status/{id} — Kiểm tra Trạng thái Tiến trình (Detect & Remediation)
 
-| Metric | Target | How to measure |
+CDO sử dụng endpoint này để thăm dò (poll) kết quả xử lý của 2 loại tiến trình khác nhau tùy thuộc vào định dạng của `{id}` truyền vào:
+1. **Trường hợp A (Thăm dò kết quả detection)**: Khi `{id}` là `correlation_id` (UUID v4).
+2. **Trường hợp B (Thăm dò tiến trình tự chữa lành)**: Khi `{id}` là `audit_id` / `anomaly_id` (định dạng: `ANM-YYYY-MMDD[A-Z]`).
+
+#### A. Response Body (Trường hợp A — `{id}` là `correlation_id` UUID v4)
+
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `status` | string (Enum) | ✓ | Trạng thái detection: `PROCESSING` (đang chạy), `COMPLETED` (đã xong), `FAILED` (lỗi) |
+| `anomalies_detected` | boolean | optional | Có phát hiện bất thường hay không (chỉ trả về khi status = `COMPLETED`) |
+| `anomalies_list` | array (of objects) | optional | Danh sách bất thường phát hiện (chỉ trả về khi status = `COMPLETED`) |
+| `correlation_id` | string (UUID v4) | ✓ | Trả lại correlation_id đã truyền |
+| `error_message` | string | optional | Chi tiết lỗi hệ thống (chỉ trả về khi status = `FAILED`) |
+
+* **Lược đồ Schema Phản hồi (Trường hợp A)**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DetectionStatusResponse",
+  "type": "object",
+  "properties": {
+    "status": { "type": "string", "enum": ["PROCESSING", "COMPLETED", "FAILED"] },
+    "anomalies_detected": { "type": "boolean" },
+    "anomalies_list": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "anomaly_id":              { "type": "string", "pattern": "^ANM-[0-9]{4}-[0-9]{4}[A-Z]$" },
+          "anomaly_type":            { "type": "string", "enum": ["runaway_usage", "idle_resource", "untagged_spend", "sudden_spike", "gradual_drift"] },
+          "severity":                { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "confidence_score":        { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+          "resource_id":             { "type": "string" },
+          "environment":             { "type": "string" },
+          "responsible_team":        { "type": ["string", "null"] },
+          "unblended_cost_24h_usd":  { "type": "number", "minimum": 0 },
+          "cost_ratio_to_7d_avg":    { "type": "number", "minimum": 0 },
+          "ai_model_used":           { "type": "string" },
+          "alert_routing": {
+            "type": "object",
+            "properties": {
+              "finance":     { "type": "boolean" },
+              "engineering": { "type": "boolean" }
+            },
+            "required": ["finance", "engineering"]
+          }
+        },
+        "required": ["anomaly_id", "anomaly_type", "severity", "confidence_score", "resource_id", "environment", "responsible_team", "unblended_cost_24h_usd", "cost_ratio_to_7d_avg", "ai_model_used", "alert_routing"]
+      }
+    },
+    "correlation_id": { "type": "string", "format": "uuid" },
+    "error_message": { "type": "string" }
+  },
+  "required": ["status", "correlation_id"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Response Mẫu — Đang xử lý (PROCESSING)**:
+```json
+{
+  "status": "PROCESSING",
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+}
+```
+
+* **Payload Response Mẫu — Hoàn thành (COMPLETED)**:
+```json
+{
+  "status": "COMPLETED",
+  "anomalies_detected": true,
+  "anomalies_list": [
+    {
+      "anomaly_id": "ANM-2026-0623A",
+      "anomaly_type": "runaway_usage",
+      "severity": "HIGH",
+      "confidence_score": 0.94,
+      "resource_id": "i-0abcd1234efgh5678",
+      "environment": "ml-research",
+      "responsible_team": "squad-ml-core",
+      "unblended_cost_24h_usd": 427.50,
+      "cost_ratio_to_7d_avg": 18.2,
+      "ai_model_used": "amazon.nova-pro-v1:0",
+      "alert_routing": {
+        "finance": true,
+        "engineering": true
+      }
+    }
+  ],
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+}
+```
+
+#### B. Response Body (Trường hợp B — `{id}` là `anomaly_id` / `audit_id`)
+
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `audit_id` | string | ✓ | Định danh phiên kiểm toán sự cố (`ANM-YYYY-MMDD[A-Z]`) |
+| `status` | string (Enum) | ✓ | Trạng thái: `PENDING_APPROVAL`, `IN_PROGRESS`, `SUCCESS`, `ROLLED_BACK`, `ESCALATED` |
+| `containment_locked` | boolean | ✓ | `true` nếu tenant hiện tại đang bị khóa tự động can thiệp (chỉ cho phép dry-run) |
+| `error_budget_remaining_pct` | number | ✓ | Tỷ lệ error budget còn lại của tenant (0.0 → 100.0) |
+| `actions_log` | array (of objects) | ✓ | Nhật ký lịch sử các bước đã thực hiện cho incident này |
+| `actions_log[].timestamp` | string (RFC3339) | ✓ | Thời điểm thực hiện |
+| `actions_log[].action` | string (Enum) | ✓ | Tác vụ: `tag-for-review`, `time-gated-countdown`, `auto-shutdown`, `quota-cap` |
+| `actions_log[].status` | string | ✓ | Kết quả bước (ví dụ: `COMPLETED`, `DRY_RUN_COMPLETED`, `FAILED`) |
+| `actions_log[].actor` | string | ✓ | Tác nhân thực thi |
+
+* **Lược đồ Schema Phản hồi (Trường hợp B)**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RemediationStatusResponse",
+  "type": "object",
+  "properties": {
+    "audit_id": { "type": "string", "pattern": "^ANM-[0-9]{4}-[0-9]{4}[A-Z]$" },
+    "status": {
+      "type": "string",
+      "enum": ["PENDING_APPROVAL", "IN_PROGRESS", "SUCCESS", "ROLLED_BACK", "ESCALATED"]
+    },
+    "containment_locked": { "type": "boolean" },
+    "error_budget_remaining_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+    "actions_log": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "action": { "type": "string", "enum": ["tag-for-review", "time-gated-countdown", "auto-shutdown", "quota-cap"] },
+          "status": { "type": "string" },
+          "actor": { "type": "string" }
+        },
+        "required": ["timestamp", "action", "status", "actor"]
+      }
+    }
+  },
+  "required": ["audit_id", "status", "containment_locked", "error_budget_remaining_pct", "actions_log"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Response Mẫu**:
+```json
+{
+  "audit_id": "ANM-2026-0623A",
+  "status": "PENDING_APPROVAL",
+  "containment_locked": false,
+  "error_budget_remaining_pct": 97.3,
+  "actions_log": [
+    {
+      "timestamp": "2026-06-23T17:05:46Z",
+      "action": "tag-for-review",
+      "status": "DRY_RUN_COMPLETED",
+      "actor": "finops-ai-engine-role"
+    }
+  ]
+}
+```
+
+* **Response Header khi bị lock**:
+```
+X-Containment-Status: LOCKED
+X-Lock-Reason: error_budget_exceeded_1pct
+X-Lock-Since: 2026-06-20T08:00:00Z
+```
+
+---
+
+### 5.6 POST /v1/audit/{audit_id}/rollback — Kích hoạt Rollback thủ công
+
+Sử dụng bởi kỹ sư/vận hành viên khi phát hiện False Positive để hoàn tác hành động can thiệp đã xảy ra, đồng thời trigger cập nhật error budget tracking.
+
+#### A. Request Body
+
+* **Mô tả trường dữ liệu yêu cầu (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `reason` | string | ✓ | Lý do thực hiện rollback (ví dụ: False Positive) |
+| `rolled_back_by` | string | ✓ | Email định danh kỹ sư kích hoạt rollback |
+
+* **Lược đồ Schema Yêu cầu**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RollbackRequest",
+  "type": "object",
+  "properties": {
+    "reason": { "type": "string" },
+    "rolled_back_by": { "type": "string", "format": "email" }
+  },
+  "required": ["reason", "rolled_back_by"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Request Mẫu**:
+```json
+{
+  "reason": "False positive — instance này đang dùng cho experiment được approve",
+  "rolled_back_by": "engineer@company.com"
+}
+```
+
+#### B. Response Body
+
+* **Mô tả trường dữ liệu phản hồi (Fields Description)**:
+
+| Trường (Field) | Kiểu dữ liệu (Type) | Bắt buộc (Required) | Mô tả (Description) |
+|---|---|---|---|
+| `rollback_initiated` | boolean | ✓ | Xác nhận lệnh rollback hạ tầng đã được kích hoạt thành công |
+| `false_positive_count_updated` | boolean | ✓ | Xác nhận đã cập nhật đếm số ca FP cho mô hình AI |
+| `new_error_budget_burned_pct` | number | ✓ | Tỷ lệ hao hụt của Error Budget hiện tại sau hành động này |
+| `containment_locked` | boolean | ✓ | Chế độ lock tự động hoạt động có bị kích hoạt hay không |
+| `message` | string | ✓ | Chi tiết thông báo từ hệ thống |
+
+* **Lược đồ Schema Phản hồi**:
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RollbackResponse",
+  "type": "object",
+  "properties": {
+    "rollback_initiated": { "type": "boolean" },
+    "false_positive_count_updated": { "type": "boolean" },
+    "new_error_budget_burned_pct": { "type": "number", "minimum": 0 },
+    "containment_locked": { "type": "boolean" },
+    "message": { "type": "string" }
+  },
+  "required": ["rollback_initiated", "false_positive_count_updated", "new_error_budget_burned_pct", "containment_locked", "message"],
+  "additionalProperties": false
+}
+```
+
+* **Payload Response Mẫu**:
+```json
+{
+  "rollback_initiated": true,
+  "false_positive_count_updated": true,
+  "new_error_budget_burned_pct": 1.5,
+  "containment_locked": true,
+  "message": "Error budget vượt 1%. Tenant chuyển sang LOCKED_MODE — mọi containment action sẽ là dry-run."
+}
+```
+
+---
+
+## 6. Anomaly Types — Enum Reference
+
+| Enum Value | Tên | Mô tả | Signal chính | Severity mặc định |
+|---|---|---|---|---|
+| `runaway_usage` | Runaway Usage | Tài nguyên tính toán chạy 24/7, không giảm tải. Điển hình: GPU training cluster quên tắt | `usage_density_24h ≥ 0.95` kéo dài > 1 ngày | HIGH |
+| `idle_resource` | Idle Resource | Tài nguyên được provision nhưng sử dụng thực tế gần như 0 | `usage_density_24h ≤ 0.05` kéo dài > 3 ngày | MEDIUM |
+| `untagged_spend` | Untagged Spend | Chi phí lớn từ tài nguyên không có tag `team` | `resource_tags_user_team = null` + `unblended_cost > threshold` | MEDIUM |
+| `sudden_spike` | Sudden Spike | Chi phí tăng đột biến dạng bậc thang trong thời gian ngắn | `cost_ratio_to_7d_avg > 3.0` trong 1 ngày | HIGH |
+| `gradual_drift` | Gradual Drift | Chi phí tăng từ từ qua nhiều tuần do auto-scaling lỗi | Trend slope > 5%/tuần trong 4 tuần | LOW |
+
+---
+
+## 7. Containment Actions — Enum Reference
+
+| Enum Value | Mô tả | Môi trường được phép | Hard Boundary |
+|---|---|---|---|
+| `tag-for-review` | Gắn tag `finops:review=pending` lên resource | Tất cả | Không có — luôn an toàn |
+| `time-gated-countdown` | Gắn tag + thông báo owner, countdown 4h trước khi auto-shutdown | dev, staging, sandbox, ml-research | Không được dùng trên prod |
+| `auto-shutdown` | Stop EC2/RDS/SageMaker instance | **Chỉ** dev, sandbox, ml-research | **CỨNG**: Không được dùng trên prod/prod-core/prod-payments |
+| `quota-cap` | Giảm Service Quota để ngăn spawn thêm resource | dev, sandbox | Chỉ dev/sandbox |
+
+> ⛔ **Hard Boundary nhắc lại:** `auto-shutdown` và `quota-cap` có điều kiện `resource_tags_user_environment NOT IN ('prod', 'prod-core', 'prod-payments')` được enforce ở cả AI Engine **và** IAM Permission Boundary của CDO (xem deployment-contract.md §4.3).
+
+---
+
+## 8. SLO & Xử lý Lỗi
+
+### 8.1 Service Level Objectives
+
+| Metric | Target | Đo bằng |
 |---|---|---|
-| **Ingestion Latency (P99)** | < 50 ms | Phản hồi `202 Accepted` ngay sau khi ghi nhận request hợp lệ từ CDO. |
-| **Result Query Latency (P99)** | < 10 ms | Thời gian đọc bản ghi kết quả phân tích từ DynamoDB Store. |
-| **LLM Inference SLA** | < 30 giây | Thời gian gọi Amazon Bedrock (Nova LLM) & viết kết quả vào DB. |
-| **System Availability** | 99.5% | Tính sẵn sàng của API Gateway & Load Balancer. |
-| **Error Rate** | < 0.5% | Tỷ lệ các phản hồi lỗi hệ thống (5xx) trên tổng số request. |
+| **P99 Latency** `/v1/detect` | < 300 ms | CloudWatch `p99(Duration)` |
+| **P99 Latency** `/v1/decide` | < 500 ms | CloudWatch `p99(Duration)` |
+| **P99 Latency** `/v1/verify` | < 500 ms | CloudWatch `p99(Duration)` |
+| **Availability** | 99.5% | ALB `HealthyHostCount > 0` per 5 phút |
+| **Error Rate (5xx)** | < 0.5% | `5xxErrorRate` trên tổng request |
+| **LLM Inference** (Bedrock) | < 30 giây | AI Engine hard timeout 45s |
+| **Detection Precision** | ≥ 80% | Backtest 3 tháng |
+| **False Positive Rate** | ≤ 10% | Backtest 3 tháng |
+
+### 8.2 Error Handling
+
+| HTTP Code | Internal Code | Kịch bản | Hành động CDO |
+|---|---|---|---|
+| `400` | `ERR_INVALID_SCHEMA` | Body sai schema, thiếu field bắt buộc | Kiểm tra log, fix client — **KHÔNG** retry |
+| `400` | `ERR_IDEMPOTENCY_MISMATCH` | Trùng `X-Idempotency-Key` nhưng body khác | Fix logic tạo key — **KHÔNG** retry |
+| `400` | `ERR_REPLAY_DETECTED` | Request có timestamp lệch > 300s (Replay Attack) | CDO đồng bộ NTP server và retry |
+| `401` | `ERR_AUTH_FAILED` | SigV4 sai hoặc token hết hạn | Làm mới credentials, retry 1 lần |
+| `403` | `ERR_CROSS_TENANT_DENIED` | `anomaly_id` không thuộc `X-Tenant-Id` | Cảnh báo bảo mật, chặn luồng ngay |
+| `404` | `ERR_ANOMALY_NOT_FOUND` | `anomaly_id` không tồn tại | Kiểm tra đầu vào — KHÔNG retry |
+| `409` | `ERR_DUP_IDEMPOTENCY` | Key đang xử lý (IN_PROGRESS) | Polling `GET /v1/status/{id}` |
+| `422` | `ERR_CONTAINMENT_NOT_SUPPORTED` | Anomaly type không hỗ trợ auto-contain | Alert SRE kiểm tra thủ công |
+| `429` | `ERR_RATE_LIMITED` | Vượt 100 req/phút per tenant | Exponential backoff: 1s→2s→4s→8s→16s |
+| `500` | `ERR_LLM_TIMEOUT` | Bedrock > 45s hard timeout | AI tự hủy, ghi `FAILED`. CDO chuyển Fallback Rule-Based |
+| `503` | `ERR_SERVICE_DOWN` | AI Engine sập hoặc Bedrock throttle >60% | Kích hoạt Fallback tĩnh nội bộ CDO |
 
 ---
 
-## 7. Error Handling
+## 9. Sequence Diagram — Luồng Hoàn Chỉnh
 
-Hệ thống trả về các mã lỗi HTTP chuẩn, yêu cầu CDO xử lý theo kịch bản:
+```mermaid
+sequenceDiagram
+    participant EB as EventBridge Cron
+    participant CDO as CDO Platform
+    participant AI as AI Engine
+    participant DDB as DynamoDB Audit
+    participant SNS as SNS Alert
 
-| HTTP Code | Internal Code | Error Scenario | CDO Mitigation Action |
-|---|---|---|---|
-| **`400 Bad Request`** | `ERR_INVALID_SCHEMA` | Dữ liệu đầu vào sai Schema hoặc thiếu `X-Tenant-Id`. | Kiểm tra log, sửa mã nguồn client, **KHÔNG** gửi lại. |
-| **`400 Bad Request`** | `ERR_IDEMPOTENCY_MISMATCH` | Sử dụng lại `X-Idempotency-Key` nhưng gửi kèm Request Body khác (khác lượng cost, khác file S3). | CDO sửa logic tạo key, **KHÔNG** gửi lại. |
-| **`401 Unauthorized`**| `ERR_AUTH_FAILED` | Xác thực IAM SigV4 thất bại hoặc token hết hạn. | Làm mới thông tin xác thực và thử lại một lần. |
-| **`403 Forbidden`** | `ERR_CROSS_TENANT_DENIED` | Gọi API với `audit_id` hợp lệ nhưng không thuộc về `X-Tenant-Id` của Header. | Cảnh báo bảo mật hệ thống, chặn luồng xử lý. |
-| **`404 Not Found`** | `ERR_AUDIT_NOT_FOUND` | Gọi API với `audit_id` không tồn tại trên hệ thống. | Kiểm tra mã `audit_id` đầu vào, không gọi lại. |
-| **`409 Conflict`** | `ERR_DUP_IDEMPOTENCY` | Trùng khóa `X-Idempotency-Key` khi tiến trình đang chạy. | Polling chờ kết quả, không gửi request mới đè lên. Trả về mã lỗi HTTP 409 kèm theo header Retry-After: 30 để CDO Platform tự động cấu hình Worker ngủ (sleep) 30 giây trước khi thực hiện Polling lại kết quả|
-| **`422 Unprocessable Entity`** | `ERR_ROLLBACK_NOT_SUPPORTED` | Gọi Rollback cho tài nguyên không hỗ trợ hoàn tác (ví dụ: môi trường `prod` chỉ gắn tag, hoặc tài nguyên đã bị xóa vật lý). | Báo cáo SRE kiểm tra thủ công, không thử lại. |
-| **`422 Unprocessable Entity`** | `ERR_ALREADY_ROLLED_BACK` | Gọi Rollback cho tài nguyên đã được phục hồi trước đó. | Báo cáo SRE trạng thái hiện tại, tắt tiến trình. |
-| **`429 Too Many Requests`** | `ERR_RATE_LIMITED` | Vượt quá hạn mức gọi API quy định của Tenant. | Áp dụng thuật toán chờ đợi tăng dần (Exponential backoff). |
-| **`500 Internal Error`** | `ERR_LLM_TIMEOUT` | **Bedrock xử lý vượt quá 45 giây (Hard Timeout)**. | AI Engine tự hủy luồng suy luận, ghi nhận kết quả `failed` trong DB. CDO polling phát hiện mã này sẽ **lập tức chuyển sang đường dẫn Fallback (Rule-Based alert)** để cảnh báo SRE bằng quy tắc tĩnh. |
-| **`503 Unavailable`**| `ERR_SERVICE_DOWN` | Nền tảng AI bị sập hoặc Bedrock bị Throttling >60%. | Kích hoạt hệ thống cảnh báo tĩnh Fallback ngay lập tức. |
+    EB->>CDO: Trigger batch (24h cadence)
+    CDO->>CDO: Pull CUR từ S3 + CE API
+    CDO->>AI: POST /v1/detect (CUR + CE data)
+    AI-->>CDO: DetectResponse (status: "processing", correlation_id)
+    
+    loop Poll status
+        CDO->>AI: GET /v1/status/{correlation_id}
+        AI-->>CDO: StatusResponse (PROCESSING / COMPLETED)
+    end
 
-### 7.1. Bổ sung các Edge Cases & Phòng Vệ Hệ Thống
+    alt anomalies_detected = true
+        CDO->>AI: POST /v1/decide (anomaly_context)
+        AI->>AI: RCA + match runbook
+        AI-->>CDO: DecideResponse (action_plan + payloads)
+        CDO->>SNS: Gửi alert Finance channel + Engineering channel
+        CDO->>CDO: Execute action (dry-run nếu dry_run_mode=true)
+        CDO->>AI: POST /v1/verify (action_executed + post_telemetry)
+        AI->>AI: Evaluate post-action telemetry
 
-| HTTP Code | Internal Code | Error Scenario (Trường hợp xảy ra) | CDO Mitigation Action |
-|---|---|---|---|
-| **`400 Bad Request`** | `ERR_AD_HOC_BUDGET_EXCEEDED` | Vượt quá hạn mức 5 lần gọi quét khẩn cấp (`is_ad_hoc: true`) trong ngày của một Tenant. | Chuyển luồng sang chu kỳ Batch 24h tiêu chuẩn, cấm gọi ad-hoc. |
-| **`422 Unprocessable Entity`** | `ERR_RESOURCE_NOT_FOUND` | Gọi tác vụ Rollback/Extend nhưng tài nguyên vật lý đã bị xóa khỏi hạ tầng AWS. | Hủy bỏ lệnh đếm ngược, ghi nhận log Audit Trail trạng thái: `Resource_Deleted_External`. |
-| **`422 Unprocessable Entity`** | `ERR_STATE_CONFLICT` | Xung đột trạng thái can thiệp (Ví dụ: Kỹ sư thao tác đè lệnh lên nhau trên Dashboard). | Tải lại giao diện để cập nhật trạng thái mới nhất từ DynamoDB. |
-
-### 7.2. Quy tắc hạch toán dữ liệu tạm tính (Estimated Data Boundary)
-Khi cờ hạch toán dữ liệu vĩ mô hoặc vi mô nhận giá trị `"is_estimated": true`, AI Engine sẽ áp dụng cơ chế phòng vệ tự động:
-1. Hạ điểm tin cậy thuật toán (`confidence_score`) về mức mặc định `< 0.50`.
-2. Toàn bộ kịch bản xử lý bắt buộc phải gán nhãn `"immediate_action": "tag-for-review"` (Chế độ phòng vệ Alert-only). 
-3. Câu lệnh thực thi hạ tầng thật bắt buộc phải trả về chuỗi rỗng: `"aws_cli_command": ""`, triệt tiêu hoàn toàn khả năng can thiệp tự động nhầm lẫn khi dữ liệu chưa được AWS chốt sổ hóa đơn.
+        alt next_action = DONE
+            AI-->>CDO: {success: true, next_action: "DONE"}
+            CDO->>DDB: Write audit record (SUCCESS)
+        else next_action = ROLLBACK
+            AI-->>CDO: {success: false, next_action: "ROLLBACK"}
+            CDO->>CDO: Execute rollback_payload
+            CDO->>AI: POST /v1/verify (rollback telemetry)
+            CDO->>DDB: Write audit record (ROLLED_BACK)
+        else next_action = ESCALATE
+            AI-->>CDO: {success: false, next_action: "ESCALATE", escalation_bundle}
+            CDO->>SNS: Alert on-call engineer (P1)
+            CDO->>DDB: Write audit record (ESCALATED)
+        end
+    else anomalies_detected = false
+        CDO->>DDB: Write audit record (NO_ANOMALY)
+    end
+```
 
 ---
-
-## 8. Open Questions
-
-- [x] **Q1:** Có cần hỗ trợ cơ chế Webhook Callback từ AI Engine sang CDO Platform khi hoàn thành tiến trình Async không?
-  - *Giải quyết:* Không cần thiết cho chu kỳ Batch 24 giờ. CDO Platform sẽ chịu trách nhiệm lập lịch (EventBridge cron) kích hoạt và thực hiện thăm dò trạng thái (Polling) kết quả qua Endpoint 2 sau thời gian chờ dự kiến.
-- [x] **Q2:** CDO Platform cần làm gì khi nhận được câu lệnh AWS CLI can thiệp từ AI Engine?
-  - *Giải quyết:* CDO Platform cần đọc trường `mitigation_action.immediate_action`. Đối với các môi trường thấp (`dev`, `sandbox`, `ml-research`), nếu `confidence_score >= 0.80`, CDO tự động kích hoạt Worker thực thi trực tiếp câu lệnh CLI được cung cấp trong `applied_payload.aws_cli_command` trên hạ tầng AWS thật. Đối với môi trường cao (`prod`), chỉ ghi nhận tag và bắn Slack alert.

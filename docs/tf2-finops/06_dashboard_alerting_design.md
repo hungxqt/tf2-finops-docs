@@ -70,19 +70,18 @@ An interactive audit panel listing all automated and proposed policy actions:
 - **Active Containment Actions**: Table showing resource ID, account, squad owner, action type (e.g., Tagging, Sandbox Shutdown, Quota Cap), and execution timestamp.
 - **Execution Mode**: Explicitly labels actions as `dry-run` (simulated containment or suggestion only) or `apply` (automated policy enforcement on non-production).
 - **Audit Record Link**: A direct, clickable link to the immutable audit record stored as an S3 JSON object. Each link references the unique Correlation ID and Idempotency Key of the run.
-- **Contract-Backed Countdown & Status Fields**: The UI exposes key parameters retrieved directly from the DynamoDB run-state store, representing the logical `/v1/detect/result/{audit_id}` contract semantics:
-  - `audit_id`: Unique audit run identifier.
-  - `enforcement_countdown.time_lock_seconds`: Initial countdown duration (typically 14400 seconds / 4 hours on Staging).
-  - `fallback_action`: Automated policy enforced if countdown expires (e.g., `schedule-shutdown`).
-  - **Current Expiration Time**: Dynamic timestamp indicating when the action will execute.
-  - **Control Availability Flags**: Toggles showing whether Extend/Rollback is supported for the current resource state and environment.
-- **Extend/Snooze Behavior**: Enables engineers to delay the countdown by invoking the containment Lambda (representing `/v1/action/extend` semantics).
-  - *Request parameters*: `audit_id`, `extend_seconds`, and `reason` (justification for snooze).
-  - *Expected response/UI state*: Transition status to `extended` and updates the countdown to show the `new_expiration_time`.
-- **Rollback/Restore Behavior**: Allows engineers to revert a containment action by invoking the containment Lambda (representing `/v1/action/rollback` semantics), rendered as a **Revert** or **Restore** button.
-  - *Request parameters*: `audit_id`, `requested_by_user` (operator email), and `justification_on_rollback`.
-  - *Expected response/UI state*: Transition status to `rollback_initiated`, displaying the `rollback_payload.action_type` and the `original_resource_id`.
-- **Access Control Restriction**: Raw rollback commands and execution scripts (e.g., `rollback_script_encapsulated`) are strictly restricted and are only visible and executable to authorized CDO/Engineering operators under IAM permission isolation and Cognito groups. Finance users interact solely with high-level visual status fields and never see or execute CLI scripts.
+- **Contract-Backed Status & Incident Detail Fields**: The UI exposes key parameters retrieved directly from the DynamoDB run-state store, representing the logical API contract v1.1 semantics:
+  - `audit_id`: Unique audit run identifier (e.g., `ANM-YYYY-MMDD[A-Z]`).
+  - `status`: Incident state (e.g., `PENDING_APPROVAL`, `IN_PROGRESS`, `SUCCESS`, `ROLLED_BACK`, `ESCALATED`).
+  - `containment_locked`: Boolean flag indicating if automated containment is locked (`dry_run_mode: true` only) due to error budget breach.
+  - `error_budget_remaining_pct`: Remaining error budget percentage of the tenant (0% to 100%).
+  - **Actions Log**: Step-by-step history including timestamp, action type, status, and actor (e.g., `tag-for-review`, `auto-shutdown`, `quota-cap`).
+- **Error Budget Lock (LOCKED_MODE) Indicator**: A prominent dashboard banner showing `X-Containment-Status: LOCKED` if the rollback rate has exceeded 1% in 30 days. The banner displays the lock reason (`error_budget_exceeded_1pct`), lock timestamp, and disables any "Apply" toggles, forcing all decisions into dry-run mode.
+- **Verification Flow**: Authorized operators can trigger remediation verification by sending the execution report and post-action telemetry (via `/v1/verify` API call). The UI displays the returned `next_action` (such as `DONE`, `RETRY`, `ROLLBACK`, or `ESCALATE`).
+- **Rollback/Restore Behavior**: Allows engineers to trigger manual rollbacks (representing `/v1/audit/{audit_id}/rollback` semantics), rendered as a **Rollback** button.
+  - *Request parameters*: `reason` (justification for rollback) and `rolled_back_by` (operator email).
+  - *Expected response/UI state*: CONFIRMED state for rollback initialization, updating the error budget burned percentage (`new_error_budget_burned_pct`) and setting the incident status to `ROLLED_BACK`.
+- **Access Control Restriction**: Raw rollback commands and execution plans are strictly restricted and are only visible and executable to authorized CDO/Engineering operators under IAM permission isolation and Cognito groups. Finance users interact solely with high-level visual status fields and never see or execute CLI commands.
 
 ---
 
@@ -101,18 +100,22 @@ High-severity anomalies or events that exceed specific budget thresholds (e.g., 
 All detected anomalies are routed directly to the squads responsible for the target resources.
 - **Delivery Channel**: Slack Webhook (Dedicated squad channels) or Jira API (automatic ticket creation).
 - **Content Focus**: Technical resource ID (ARN), service type, environment (Dev/Sandbox/Prod), tag compliance status, and the proposed rollback path.
-- **Action Control**: Includes authenticated, short-lived Extend/Snooze and Rollback/Restore action options (direct programmatic invocation links executing against the Lambda compute layer representing `/v1/action/extend` and `/v1/action/rollback` semantics) where policy and environment settings allow.
+- **Action Control**: Includes authenticated, short-lived Verification and Rollback action links (executing against the API layer representing `/v1/verify` and `/v1/audit/{audit_id}/rollback` semantics) where policy and environment settings allow.
 - **Frequency**: Near real-time (within 30 minutes of pipeline completion).
 
-*Note on telemetry data*: The telemetry data processed for detection strictly excludes performance utilization metrics (CPU, Memory, connections). CloudWatch metrics are used solely for CDO platform operational health monitoring and dashboard rendering.
+*Note on telemetry data*: Telemetry processed for detection is hybrid, containing S3 CUR exports, Cost Explorer API metrics, and CloudWatch performance indicators (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment.
 
 ### 3.3 API contract error handling
 When operators trigger action controls, the dashboard and alerting systems handle the following contract errors:
-- **`ERR_ROLLBACK_NOT_SUPPORTED`** (error code): Occurs when attempting to rollback a resource that does not support undo operations (e.g., a production resource where containment was only tag/suggest). The UI disables the revert button and instructs the operator to contact SRE for manual review.
-- **`ERR_ALREADY_ROLLED_BACK`** (error code): Triggered if the rollback action was already executed. The UI updates the resource status to "Restored" and disables further clicks to prevent state mismatch.
-- **`ERR_RESOURCE_NOT_FOUND`** (error code): Occurs when the target resource has been deleted externally from AWS. The dashboard clears the countdown timer and displays "Resource Deleted Externally".
-- **`ERR_STATE_CONFLICT`** (error code): Triggered by concurrent operator actions on the same resource (e.g., double-clicking or two engineers attempting rollback simultaneously). The UI prompts a page reload to sync the latest DynamoDB state.
-- **`ERR_CROSS_TENANT_DENIED`** (auth error): Raised if the operator's tenant context does not match the anomaly owner. The UI blocks execution and logs a security incident alert.
+- **`ERR_INVALID_SCHEMA`**: Body does not conform to the schema or is missing required fields. The UI alerts the operator and logs the issue without retrying.
+- **`ERR_IDEMPOTENCY_MISMATCH`**: The request uses a duplicate `X-Idempotency-Key` but has a different request body.
+- **`ERR_REPLAY_DETECTED`**: The request timestamp drift exceeds 300s. The client syncs NTP time and retries.
+- **`ERR_CROSS_TENANT_DENIED`**: The tenant ID in `X-Tenant-Id` does not match the resource context. Access is immediately blocked and a security alert is generated.
+- **`ERR_ANOMALY_NOT_FOUND`**: The requested `anomaly_id` is missing in the database.
+- **`ERR_DUP_IDEMPOTENCY`**: The request key is currently being processed (`IN_PROGRESS`). The CDO platform polls `GET /v1/status/{id}` until complete.
+- **`ERR_CONTAINMENT_NOT_SUPPORTED`**: The anomaly type does not support automated containment. The UI directs the user to contact SRE.
+- **`ERR_RATE_LIMITED`**: Requests exceed 100 requests/minute. The client performs exponential backoff.
+- **`ERR_LLM_TIMEOUT` / `ERR_SERVICE_DOWN`**: The AI Engine is unavailable or timed out. CDO platform activates the fallback rule-based system.
 
 ### 3.4 Example alert payload
 The Alert Routing Lambda uses a structured JSON contract. The schema below represents a typical alert payload sent to notification channels:

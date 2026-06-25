@@ -30,7 +30,7 @@ CDO owns the operational hosting cost of the AIOps-provided AI Engine on Lambda 
 | **VPC endpoints** | Hourly endpoint charge + data processing where applicable | Private connections for ECR, S3, DynamoDB, Secrets Manager, Logs, KMS, STS, and Lambda | Shared fixed security cost. |
 | **Secrets Manager** | $0.40/secret/month + request charges | AI Engine credentials, webhooks, contract signing key, external IDs | Shared fixed plus request volume. |
 | **KMS** | $1.00/CMK/month + request charges | Data, audit, secrets, encryption keys | Shared fixed; consolidation requires Security approval. |
-| **Observability - CloudWatch & X-Ray** | Logs, metrics, trace analyzer, and dashboard charges | Lambda logs, Step Functions traces, queue metrics, and platform dashboards | Shared and variable; can become a top cost driver. |
+| **Observability - CloudWatch, Prometheus, OTel & X-Ray** | Logs, metrics, trace analyzer, ADOT/OTel collector, and dashboard charges | Lambda logs, Step Functions traces, queue metrics, performance metrics (CPU, Memory, database utilization), and platform dashboards | Shared and variable; ADOT and telemetry collection can become a top cost driver. |
 | **Provisioned Concurrency (Optional)** | $0.015/GB-second + $0.15/1M requests concurrency charges | Pre-warmed execution environments for AI Engine Request Lambda | Optional production optimization; `Evidence needed: required concurrency and warm-up hours`. |
 | **Dashboard - S3 + CloudFront** | S3 & CloudFront pricing | Finance stakeholder dashboard access | S3 storage and CloudFront HTTPS request/data transfer fees. |
 | **Amazon Cognito (Auth)** | Free tier up to 50,000 MAUs; then $0.0055/MAU | User directory and Hosted UI auth gateway for dashboard access | Shared platform cost; free for capstone scale. |
@@ -197,7 +197,7 @@ To prevent cost overruns during capstone and demo:
 - Budget utilization %
 - Hosted AI runtime cost separated from AIOps model-development cost
 
-*Note on performance metrics: Performance metrics (CPU, Memory, database connections, SQS backlogs) are gathered strictly for CDO platform operational health monitoring (CloudWatch Metrics, alarms, and X-Ray) and are never sent to the AI Engine for detection telemetry.*
+*Note on performance metrics: Performance metrics (CPU, Memory, database connections, SQS backlogs) are gathered by CloudWatch Metrics, Prometheus, OTel, and X-Ray, and are sent to the AI Engine as part of the hybrid detection telemetry schema. If these metrics are missing, the system falls back to CUR-only mode, halving model confidence and running in dry-run/alert-only mode.*
 
 ---
 

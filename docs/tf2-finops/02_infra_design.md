@@ -10,15 +10,16 @@
 
 ## 1. Architecture diagram
 
-The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with a single shared AIOps-provided AI Engine hosted once per Task Force using AWS Lambda container images. The serverless compute tier utilizes Lambda functions running within private subnets. The central Step Functions orchestrator invokes the AI Engine Request Lambda directly. An asynchronous queueing model using SQS/DLQ isolates heavy inference workloads from request validation. The Request Lambda processes incoming detection requests, publishes them to SQS, and returns status immediately. Note that `/v1/detect` and `/v1/detect/result/{audit_id}` represent logical contract semantics for model integration, not deployed REST/HTTP routes in this baseline batch workflow, as no Private API Gateway is deployed.
+The CDO platform is designed around a lakehouse-centric data plane for ingest and analysis, orchestrated by serverless workflows, and integrated with a shared AIOps-provided AI Engine hosted on AWS Lambda container images. The serverless compute tier utilizes Lambda functions running within private subnets. The central Step Functions orchestrator coordinates the execution flow by invoking the AI Engine Request Lambda directly. An asynchronous queueing model using SQS/DLQ isolates heavy inference workloads from request validation. The Request Lambda processes incoming detection requests, publishes them to SQS, and returns status immediately. Note that `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, and `/v1/audit/{audit_id}/rollback` represent logical contract semantics for model integration, not deployed REST/HTTP routes in this baseline batch workflow, as no Private API Gateway is deployed.
 
-The architecture is sized around recurring CDO platform responsibilities, not around the AIOps model-training dataset. CDO must reliably pull billing data from approved AWS sources, normalize it into a contract-ready shape, invoke the AIOps-owned AI Engine, and preserve the returned decision evidence. Any synthetic historical dataset used to train, enhance, or backtest the model remains AIOps-owned. Detection telemetry is strictly CUR-only (S3 CUR partition pulls and Cost Explorer API calls) and does NOT include CloudWatch utilization metrics (CPU, memory, database connections), which are used ONLY for platform operational observability (alerts, logging, metrics, dashboard).
+The architecture is sized around recurring CDO platform responsibilities, not around the AIOps model-training dataset. CDO must reliably pull cost and performance data from approved AWS sources, normalize it into a contract-ready shape, invoke the AIOps-owned AI Engine, and preserve the returned decision evidence. Any synthetic historical dataset used to train, enhance, or backtest the model remains AIOps-owned. Detection telemetry includes CUR data, Cost Explorer API queries, and CloudWatch performance metrics (`resource_utilization_metrics` such as CPU, memory, network, disk, database connections, and GPU metrics). If CloudWatch metrics are unavailable, the platform automatically falls back to CUR-only mode, halving the model confidence score (`confidence *= 0.5`) and forcing dry-run/alert-only containment.
 
 ```mermaid
 graph TB
     subgraph "AWS Member Accounts"
         MemberS3[CUR S3 Export Buckets]
         MemberCE[Cost Explorer API Endpoints]
+        MemberCW[CloudWatch Metrics Endpoints]
     end
 
     subgraph "CDO Management Account VPC (ap-southeast-1)"
@@ -71,6 +72,7 @@ graph TB
     %% Ingestion flows
     LambdaPull -->|Fetch Cost Data| MemberCE
     LambdaPull -->|Pull CUR Files| MemberS3
+    LambdaPull -->|Fetch Performance Metrics| MemberCW
     LambdaPull -->|Write raw cost| S3Raw
 
     %% Transformation flows
@@ -86,28 +88,20 @@ graph TB
     LambdaAlert -->|Route alert payload| Email
 
     %% AI Engine Integration
-    SF -->|1. Invoke Request Lambda| AILambdaReq
+    SF -->|1. POST /v1/detect| AILambdaReq
     AILambdaReq -->|2. Queue detection job| SQSQueue
     AILambdaReq -->|3. Return accepted status| SF
     SQSQueue -->|4. Trigger worker| AILambdaWorker
-    SQSQueue -.->|Error fallback| SQSDLQ
-    AILambdaWorker -->|5. Read features| S3Cur
+    SQSQueue -.->|Failed retries| DLQ
+    AILambdaWorker -->|5. Read cost & CloudWatch metrics| S3Cur
     AILambdaWorker -->|6. Write results| DDB
     AILambdaWorker -->|7. Write evidence payload| S3Cur
-    SF -->|8. Direct query run state / results| DDB
-    
-    %% Dashboard presentation
-    CloudFront -->|Redirect for login| Cognito
-    Cognito -->|Auth Code & Cookie| CloudFront
-    CloudFront -->|Forward request| LambdaEdge
-    LambdaEdge -->|Validate cookie JWT| CloudFront
-    CloudFront -->|Serve Static Files & JSON| FinanceUsers[Finance Users]
-    S3Dashboard -->|Deliver Assets via OAC| CloudFront
-    SF -->|Write precomputed JSON summaries| S3Dashboard
-    SF -->|Write run summaries| DDB
+    SF -->|8. GET /v1/status/{correlation_id} (Poll DynamoDB)| DDB
+    SF -->|9. POST /v1/decide| AILambdaWorker
+    SF -->|10. POST /v1/verify / Rollback| AILambdaWorker
 ```
 
-*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR and Cost Explorer data to S3, and catalogs it. The workflow invokes the AIOps-owned AI Engine Request Lambda, which queues the detection task to SQS and returns an accepted status. The Worker Lambda is triggered by SQS, executes detection, and writes results and evidence directly to DynamoDB and S3. The Step Functions polling task checks status/results in DynamoDB directly. Dashboard views and containment workflows pull clean state from S3 and DynamoDB.*
+*Caption: The CDO pipeline is triggered daily by EventBridge Scheduler. The Step Functions workflow coordinates ingestion from member accounts, writes raw CUR, Cost Explorer, and CloudWatch performance data to S3, and catalogs it. The workflow invokes the AIOps-owned AI Engine Request Lambda (`POST /v1/detect`), which queues the detection task to SQS. The Worker Lambda is triggered by SQS, executes detection, and writes results to DynamoDB. Step Functions polls status (`GET /v1/status/{id}`), requests decisions (`POST /v1/decide`), and verifies remediation actions (`POST /v1/verify`) directly.*
 
 ---
 
@@ -120,25 +114,27 @@ This diagram represents the high-level macro interactions between the central or
 ```mermaid
 graph TD
     subgraph "Member Accounts"
-        Members[AWS Resources & Cost Exports]
+        Members[AWS Resources, Cost Exports & CloudWatch Metrics]
     end
 
     subgraph "CDO Management Account"
-        SF[Step Functions Orchestrator] -->|1. Pull Data| Lakehouse[(S3 Lakehouse & Athena)]
-        Lakehouse -->|2. Ingested Cost Data| SF
-        SF -->|3. Invoke AI Inference Request| AILambdaReq[AI Engine Request Lambda]
+        SF[Step Functions Orchestrator] -->|1. Ingest Data| Lakehouse[(S3 Lakehouse & Athena)]
+        Lakehouse -->|2. Cost & Performance Data| SF
+        SF -->|3. POST /v1/detect| AILambdaReq[AI Engine Request Lambda]
         AILambdaReq -->|4. Queue Task| SQS[SQS Buffer]
         SQS -->|5. Execute Inference| AILambdaWorker[AI Engine Worker Lambda]
         AILambdaWorker -->|6. Store Results| DDB[(DynamoDB Run State / S3)]
-        SF -->|7. Poll Status & Results| DDB
-        SF -->|8. Contain & Alert| Actions[Alerting & Containment Engine]
+        SF -->|7. Poll GET /v1/status/{id}| DDB
+        SF -->|8. POST /v1/decide| AILambdaWorker
+        SF -->|9. Execute Containment Plan| Actions[Alerting & Containment Engine]
+        SF -->|10. POST /v1/verify| AILambdaWorker
     end
 
-    Actions -->|9. Apply Policy| Members
-    Actions -->|10. Publish| Dashboard[Finance Dashboard / Channels]
+    Actions -->|11. Apply Policy| Members
+    Actions -->|12. Publish| Dashboard[Finance Dashboard / Channels]
 ```
 
-*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting data to the Lakehouse, calling the Lambda-container-hosted AI Engine Request Lambda, polling DynamoDB for anomaly decisions, and invoking alerting and containment workflows based on the results.*
+*Caption: The central Step Functions Orchestrator drives the entire FinOps loop: extracting cost and CloudWatch telemetry to the Lakehouse, calling Request Lambda (`POST /v1/detect`), polling results via `GET /v1/status/{id}`, calling `POST /v1/decide` to get plans, triggering containment actions, and verifying outcomes via `POST /v1/verify`.*
 
 Operationally, Step Functions is the control boundary between deterministic CDO logic and probabilistic AI output. Every transition records a `run_id`, cost window, account scope, and contract version so that Finance can trace a dashboard anomaly back to the exact ingestion batch and AI decision. This design also prevents the AI Engine from directly touching member accounts; all alerting and containment actions are mediated by CDO policy workers.
 
@@ -151,6 +147,7 @@ graph TB
     subgraph "Member Accounts"
         CUR[CUR S3 Export Buckets]
         CE[Cost Explorer API]
+        CW[CloudWatch Metrics]
     end
 
     subgraph "CDO Ingestion & Lakehouse"
@@ -158,22 +155,23 @@ graph TB
         SF -->|1. Run Puller| Puller[Ingestion Lambda]
         Puller -->|Fetch API Cost| CE
         Puller -->|Copy CUR Files| CUR
+        Puller -->|Fetch Performance Metrics| CW
         Puller -->|2. Write Raw| RawS3[(S3 Raw Zone)]
         
         RawS3 -->|3. Partition & Convert| CuratedS3[(S3 Curated Zone)]
         Catalog[Glue Data Catalog] -->|4. Catalog Schemas| CuratedS3
         Athena[Athena Query Engine] -->|5. Run SQL Query| CuratedS3
         
-        SF -->|6. Consume cost queries| Athena
+        SF -->|6. Consume cost & performance queries| Athena
     end
     
     classDef external fill:#f9f,stroke:#333,stroke-width:2px;
-    class CUR,CE external;
+    class CUR,CE,CW external;
 ```
 
-*Caption: Step Functions invokes the Ingestion Lambda daily via EventBridge Scheduler. Raw cost data from Member Accounts is stored in the S3 Raw Zone, transitioned and cataloged into Parquet format in the S3 Curated Zone, and made queryable via Athena. The query results are passed back to the Step Functions orchestrator to feed the AI Engine.*
+*Caption: Step Functions invokes the Ingestion Lambda daily via EventBridge Scheduler. Raw cost data and CloudWatch utilization metrics are stored in the S3 Raw Zone, transitioned and cataloged into Parquet format in the S3 Curated Zone, and made queryable via Athena. The query results are passed back to the Step Functions orchestrator to feed the AI Engine.*
 
-The ingestion workflow normalizes the two operational billing shapes before invoking the AI Engine. CUR provides resource-level fields such as account ID, product code, resource ID, unblended cost, and resource tags. Cost Explorer provides aggregate fields such as linked account, service name, service code, region, unblended cost, and estimated/final status. The curated layer keeps both normalized service code and display-name fields so CDO can pass consistent payloads to AIOps and build dashboard views without taking ownership of model training data.
+The ingestion workflow normalizes the two operational billing shapes and CloudWatch performance metrics before invoking the AI Engine. CUR provides resource-level fields such as account ID, product code, resource ID, unblended cost, and resource tags. Cost Explorer provides aggregate fields such as linked account, service name, service code, region, unblended cost, and estimated/final status. CloudWatch provides resource utilization metrics (CPU, memory, net, disk, DB connections, and GPU metrics). The curated layer keeps normalized display name and service code fields so CDO can build dashboard views without taking ownership of model training data.
 
 ### 1.3 AI Engine Lambda Container Hosting Platform
 
@@ -214,14 +212,16 @@ graph TB
     end
 
     %% Flow
-    SF -->|1. Direct Invoke| Request
+    SF -->|1. POST /v1/detect| Request
     Request -->|2. Enqueue Job & Return Accepted| SQS
     SQS -->|3. Trigger Worker| Worker
     SQS -.->|Failed retries| DLQ
-    Worker -->|4. Read Features| CuratedS3
-    Worker -->|5. Write inference results| DDB
+    Worker -->|4. Read Cost & Performance Features| CuratedS3
+    Worker -->|5. Write inference results & state| DDB
     Worker -->|6. Write evidence payload| CuratedS3
-    SF -->|7. Direct Query Run State / Results| DDB
+    SF -->|7. Poll status / GET /v1/status/{id}| DDB
+    SF -->|8. POST /v1/decide| Worker
+    SF -->|9. POST /v1/verify| Worker
     
     Request -.->|Pull Image by Digest| ECR
     Worker -.->|Pull Image by Digest| ECR
@@ -229,9 +229,9 @@ graph TB
     Worker -.->|Access SDK| SM
 ```
 
-*Caption: The AI Engine detection request from the Step Functions orchestrator is sent via direct Lambda invocation to the AI Engine Request Lambda function. The Request Lambda validates the request, enqueues the job to an SQS Queue, and returns an accepted status with an audit ID. The Worker Lambda is triggered by SQS to perform batch scoring, read features from S3, and write results back to DynamoDB. API and execution secrets are retrieved using the AWS SDK from Secrets Manager.*
+*Caption: The AI Engine detection request from the Step Functions orchestrator is sent via direct Lambda invocation to the AI Engine Request Lambda function (`POST /v1/detect`). The Request Lambda validates the request, enqueues the job to an SQS Queue, and returns an accepted status with an audit ID. The Worker Lambda is triggered by SQS to perform batch scoring, read cost and CloudWatch utilization metrics from S3, and write results back to DynamoDB. The central Step Functions orchestrator polls status (`GET /v1/status/{id}`), requests decisions (`POST /v1/decide`), and verifies remediation actions (`POST /v1/verify`) directly.*
 
-The Lambda-based platform separates request validation from asynchronous batch execution using SQS queues. The AI Engine Request Lambda function handles rapid ingress validation (accepting detection requests, generating audit IDs, and enqueuing jobs). The AI Engine Worker Lambda function is triggered asynchronously by SQS to perform resource-intensive model inference, checkpointing feature progress to S3 and storing final results in DynamoDB. The central Step Functions orchestrator polls the DynamoDB table directly to verify execution status and retrieve the final results. This decoupling ensures rapid response to the orchestrator, isolates compute consumption via reserved concurrency limits, and uses native SQS/DLQ retries to handle transient failures gracefully without REST/HTTP proxy layers.
+The Lambda-based platform separates request validation from asynchronous batch execution using SQS queues. The AI Engine Request Lambda function handles rapid ingress validation (accepting detection requests, generating audit IDs, and enqueuing jobs). The AI Engine Worker Lambda function is triggered asynchronously by SQS to perform resource-intensive model inference, checkpointing feature progress to S3 and storing final results in DynamoDB. The central Step Functions orchestrator polls the DynamoDB table directly to verify execution status (`GET /v1/status/{id}`) and retrieve the final decisions (`POST /v1/decide`). This decoupling ensures rapid response to the orchestrator, isolates compute consumption via reserved concurrency limits, and uses native SQS/DLQ retries to handle transient failures gracefully without REST/HTTP proxy layers.
 
 ### 1.4 Alerting & Containment Engine
 
@@ -250,7 +250,7 @@ graph TB
 
     subgraph "CDO Management Account"
         SF -->|1. Route Alerts| AlertLambda[Alert Routing Lambda]
-        SF -->|2. Execute Policy| ContLambda[Containment Lambda]
+        SF -->|2. Execute Policy & verify| ContLambda[Containment Lambda]
         
         StateLambda[State Lambda] -->|Read/Write Run Lock| StateDB[(DynamoDB Run State)]
         SF -->|Query State| StateLambda
@@ -270,9 +270,61 @@ graph TB
     end
 ```
 
-*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write audit logs to DynamoDB, apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. An S3 + CloudFront static web dashboard reads precomputed DynamoDB/S3 JSON audit and spend summaries to present containment status directly to Finance stakeholders.*
+*Caption: The Step Functions workflow triggers separate alerting and containment Lambdas based on the AI Engine's decisions. Containment Lambdas read run state, write audit logs to DynamoDB, apply active containment (tag/shutdown) on Dev/Sandbox accounts, and execute dry-run actions (tag/suggest only) on Prod. An S3 + CloudFront static web dashboard reads precomputed DynamoDB/S3 JSON audit and spend summaries to present containment status directly to Finance stakeholders. CDO calls `POST /v1/verify` to complete the loop, and supports manual rollbacks via `POST /v1/audit/{audit_id}/rollback`.*
 
-The containment engine treats `execution_mode` as a mandatory policy input, not a runtime convenience. Production resources can only receive tag, suggest, or dry-run outcomes, while dev/sandbox resources may receive apply-mode actions only when policy and approval requirements are satisfied. Each proposed or executed action writes an audit record before attempting any member-account operation.
+The containment engine treats `execution_mode` as a mandatory policy input, not a runtime convenience. Production resources can only receive tag, suggest, or dry-run outcomes, while dev/sandbox resources may receive apply-mode actions only when policy and approval requirements are satisfied. Each proposed or executed action writes an audit record before attempting any member-account operation. Once completed, CDO invokes `POST /v1/verify` to report the telemetry outcome, or triggers manual rollbacks via `POST /v1/audit/{audit_id}/rollback` which initiates resource tagging restoration.
+
+### 1.5 Programmatic API Sequence Workflow
+
+The detailed programmatic sequence between the Step Functions orchestrator, Lakehouse, and the hosted AI Engine functions is represented below:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SF as Step Functions Orchestrator
+    participant Lake as S3 Lakehouse / Ingestion
+    participant Req as AI Engine Request Lambda
+    participant SQS as SQS Ingest Queue
+    participant Wrk as AI Engine Worker Lambda
+    participant DDB as DynamoDB / S3 Run State
+    participant Cont as Alert & Containment Engine
+
+    Note over SF, Lake: 1. CDO Ingests Cost & CloudWatch Telemetry
+    SF->>Lake: Execute Ingestion (CUR, CE, CloudWatch metrics)
+    Lake-->>SF: Raw & Curated data stored
+    
+    Note over SF, Req: 2. CDO Calls Async Detection
+    SF->>Req: POST /v1/detect (Ingested Telemetry + Headers)
+    Req->>SQS: Enqueue Job Task
+    Req-->>SF: 202 Accepted (correlation_id)
+    
+    Note over SQS, Wrk: 3. AI Worker Processes Inference
+    SQS->>Wrk: Trigger Execution
+    Wrk->>Lake: Read Features & CloudWatch Utilization Metrics
+    Wrk->>DDB: Write anomalies_list & execution status (completed/failed)
+    
+    Note over SF, DDB: 4. CDO Polls Status
+    loop Poll Status
+        SF->>DDB: GET /v1/status/{correlation_id} (or query DB)
+        DDB-->>SF: Status (processing / completed / failed)
+    end
+    
+    Note over SF, Wrk: 5. CDO Requests Intervention Plan
+    SF->>Wrk: POST /v1/decide (correlation_id)
+    Wrk-->>SF: Plan (dry_run_mode, CLI payload, rollback payload, X-Containment-Status)
+    
+    Note over SF, Cont: 6. CDO Executes Proposed Plan & Verifies
+    SF->>Cont: Execute proposed Dry-Run actions (Slack Alert / Resource Tagging)
+    Cont-->>SF: Execution outcome
+    SF->>Wrk: POST /v1/verify (remediation telemetry & audit metadata)
+    Wrk-->>SF: Verification Status (DONE / RETRY / ROLLBACK / ESCALATE)
+    
+    Note over Cont, Wrk: 7. Manual Rollback (Optional)
+    Cont->>Wrk: POST /v1/audit/{audit_id}/rollback (Restore State & Update Error Budget)
+    Wrk-->>Cont: Rollback initiated + new_error_budget_burned_pct
+```
+
+*Caption: The programmatic API sequence diagram outlines the asynchronous anomaly detection and remediation validation loop, showing status polling, plans generation, verification, and manual rollback handlers.*
 
 ---
 

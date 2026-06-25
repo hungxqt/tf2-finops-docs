@@ -10,9 +10,9 @@
 
 ## 1. Sơ đồ kiến trúc (Architecture diagram)
 
-Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) ở mặt phẳng dữ liệu để thu thập và phân tích chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với một AI Engine dùng chung do AIOps cung cấp được lưu trữ một lần cho mỗi Task Force bằng cách sử dụng các hình ảnh container AWS Lambda. Lớp tính toán serverless sử dụng các hàm Lambda chạy trong các subnet riêng tư. Bộ điều phối Step Functions trung tâm gọi trực tiếp AI Engine Request Lambda. Mô hình hàng đợi bất đồng bộ sử dụng SQS/DLQ tách biệt khối lượng công việc suy luận nặng khỏi việc xác thực yêu cầu. Request Lambda xử lý các yêu cầu phát hiện bất thường đầu vào, đẩy chúng vào hàng đợi SQS và trả về trạng thái ngay lập tức. Lưu ý rằng `/v1/detect` và `/v1/detect/result/{audit_id}` đại diện cho ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai trong luồng công việc chạy theo lô cơ bản này, vì không có Private API Gateway nào được triển khai.
+Nền tảng CDO được thiết kế xoay quanh hồ dữ liệu (lakehouse-centric) ở mặt phẳng dữ liệu để thu thập và phân tích chi phí, được điều phối bởi các luồng công việc serverless và tích hợp với một AI Engine dùng chung do AIOps cung cấp được lưu trữ riêng cho mỗi CDO (per-CDO) bằng cách sử dụng các hình ảnh container AWS Lambda. Lớp tính toán serverless sử dụng các hàm Lambda chạy trong các subnet riêng tư. Bộ điều phối Step Functions trung tâm gọi trực tiếp AI Engine Request Lambda. Mô hình hàng đợi bất đồng bộ sử dụng SQS/DLQ tách biệt khối lượng công việc suy luận nặng khỏi việc xác thực yêu cầu. Request Lambda xử lý các yêu cầu phát hiện bất thường đầu vào, đẩy chúng vào hàng đợi SQS và trả về trạng thái ngay lập tức. Lưu ý rằng `/v1/detect`, `/v1/status/{id}`, `/v1/decide`, `/v1/verify`, và `/v1/audit/{audit_id}/rollback` đại diện cho các ngữ nghĩa hợp đồng logic để tích hợp mô hình, chứ không phải các tuyến đường REST/HTTP được triển khai trong luồng công việc chạy theo lô cơ bản này, vì không có Private API Gateway nào được triển khai.
 
-Kiến trúc này được định cỡ xoay quanh các trách nhiệm lặp lại của nền tảng CDO, chứ không xoay quanh bộ dữ liệu huấn luyện mô hình của AIOps. CDO phải kéo dữ liệu thanh toán một cách đáng tin cậy từ các nguồn AWS được phê duyệt, chuẩn hóa nó thành dạng sẵn sàng cho hợp đồng, gọi AI Engine do AIOps sở hữu và lưu giữ bằng chứng quyết định được trả về. Mọi bộ dữ liệu lịch sử tổng hợp được sử dụng để huấn luyện, nâng cao hoặc backtest mô hình đều thuộc sở hữu của AIOps. Telemetry thu thập để gửi sang AI Engine phát hiện bất thường là dữ liệu chi phí CUR-only (quét phân vùng S3 CUR và API Cost Explorer) và loại bỏ hoàn toàn các metric hiệu năng CloudWatch (CPU, memory, database connections) vốn chỉ dành riêng cho việc giám sát vận hành của CDO (cảnh báo, logging, metrics, dashboard).
+Kiến trúc này được định cỡ xoay quanh các trách nhiệm lặp lại của nền tảng CDO, chứ không xoay quanh bộ dữ liệu huấn luyện mô hình của AIOps. CDO phải kéo dữ liệu thanh toán và hiệu suất một cách đáng tin cậy từ các nguồn AWS được phê duyệt, chuẩn hóa nó thành dạng sẵn sàng cho hợp đồng, gọi AI Engine do AIOps sở hữu và lưu giữ bằng chứng quyết định được trả về. Mọi bộ dữ liệu lịch sử tổng hợp được sử dụng để huấn luyện, nâng cao hoặc backtest mô hình đều thuộc sở hữu của AIOps. Telemetry phát hiện bao gồm dữ liệu CUR, các truy vấn API Cost Explorer, và các chỉ số hiệu suất CloudWatch (`resource_utilization_metrics` như CPU, bộ nhớ, mạng, đĩa, kết nối cơ sở dữ liệu, và chỉ số GPU). Nếu không có sẵn các chỉ số CloudWatch, nền tảng sẽ tự động kích hoạt chế độ dự phòng CUR-only, làm giảm một nửa điểm tin cậy của mô hình (`confidence *= 0.5`) và giới hạn các biện pháp can thiệp ở chế độ dry-run/cảnh báo thuần túy.
 
 ```mermaid
 graph TB
@@ -215,14 +215,16 @@ graph TB
     end
 
     %% Flow
-    SF -->|1. Direct Invoke| Request
+    SF -->|1. POST /v1/detect| Request
     Request -->|2. Enqueue Job & Return Accepted| SQS
     SQS -->|3. Trigger Worker| Worker
     SQS -.->|Failed retries| DLQ
-    Worker -->|4. Read Features| CuratedS3
-    Worker -->|5. Write inference results| DDB
+    Worker -->|4. Read Cost & Performance Features| CuratedS3
+    Worker -->|5. Write inference results & state| DDB
     Worker -->|6. Write evidence payload| CuratedS3
-    SF -->|7. Direct Query Run State / Results| DDB
+    SF -->|7. Poll status / GET /v1/status/{id}| DDB
+    SF -->|8. POST /v1/decide| Worker
+    SF -->|9. POST /v1/verify| Worker
     
     Request -.->|Pull Image by Digest| ECR
     Worker -.->|Pull Image by Digest| ECR
@@ -230,9 +232,9 @@ graph TB
     Worker -.->|Access SDK| SM
 ```
 
-*Chú thích: Yêu cầu phát hiện bất thường từ bộ điều phối Step Functions được gửi qua cuộc gọi Lambda trực tiếp đến hàm AI Engine Request Lambda. Hàm Request Lambda xác thực yêu cầu, xếp hàng đợi vào SQS Queue và trả về trạng thái accepted cùng audit_id. Hàm Worker Lambda được kích hoạt bởi SQS để thực hiện chạy batch scoring, đọc đặc trưng từ S3 và ghi kết quả trở lại DynamoDB. Bí mật API và thực thi được truy xuất bằng AWS SDK từ Secrets Manager.*
+*Chú thích: Yêu cầu phát hiện bất thường từ bộ điều phối Step Functions được gửi qua cuộc gọi Lambda trực tiếp đến hàm AI Engine Request Lambda (`POST /v1/detect`). Hàm Request Lambda xác thực yêu cầu, xếp hàng đợi vào SQS Queue và trả về trạng thái accepted cùng audit_id. Hàm Worker Lambda được kích hoạt bởi SQS để thực hiện chạy batch scoring, đọc dữ liệu chi phí và các chỉ số hiệu năng/utilization của CloudWatch từ S3 và ghi kết quả trở lại DynamoDB. Bộ điều phối Step Functions trung tâm truy vấn trạng thái (`GET /v1/status/{id}`), yêu cầu quyết định (`POST /v1/decide`) và xác minh hoạt động khắc phục (`POST /v1/verify`) trực tiếp.*
 
-Nền tảng dựa trên Lambda tách biệt việc xác thực yêu cầu thời gian chạy khỏi việc thực thi hàng loạt bất đồng bộ bằng hàng đợi SQS. Hàm AI Engine Request Lambda xử lý việc tiếp nhận nhanh chóng (chấp nhận các yêu cầu phát hiện, tạo mã audit_id và xếp hàng đợi). Hàm AI Engine Worker Lambda được kích hoạt bất đồng bộ bởi SQS để thực hiện suy luận mô hình đòi hỏi nhiều tài nguyên, lưu checkpoint tiến trình đặc trưng vào S3 và lưu trữ kết quả cuối cùng trong DynamoDB. Bộ điều phối Step Functions trung tâm truy vấn bảng DynamoDB trực tiếp để xác minh trạng thái thực thi và lấy kết quả cuối cùng. Việc phân tách này đảm bảo khả năng phản hồi của orchestrator, cô lập mức tiêu thụ tính toán qua các giới hạn Reserved Concurrency và sử dụng tính năng thử lại SQS/DLQ để xử lý các lỗi tạm thời một cách mượt mà mà không cần qua các lớp REST/HTTP proxy.
+Nền tảng dựa trên Lambda tách biệt việc xác thực yêu cầu thời gian chạy khỏi việc thực thi hàng loạt bất đồng bộ bằng hàng đợi SQS. Hàm AI Engine Request Lambda xử lý việc tiếp nhận nhanh chóng (chấp nhận các yêu cầu phát hiện, tạo mã audit_id và xếp hàng đợi). Hàm AI Engine Worker Lambda được kích hoạt bất đồng bộ bởi SQS để thực hiện suy luận mô hình đòi hỏi nhiều tài nguyên, lưu checkpoint tiến trình đặc trưng vào S3 và lưu trữ kết quả cuối cùng trong DynamoDB. Bộ điều phối Step Functions trung tâm truy vấn bảng DynamoDB trực tiếp để xác minh trạng thái thực thi (`GET /v1/status/{id}`) và lấy các quyết định cuối cùng (`POST /v1/decide`). Việc phân tách này đảm bảo khả năng phản hồi của orchestrator, cô lập mức tiêu thụ tính toán qua các giới hạn Reserved Concurrency và sử dụng tính năng thử lại SQS/DLQ để xử lý các lỗi tạm thời một cách mượt mà mà không cần qua các lớp REST/HTTP proxy.
 
 ### 1.4 Động cơ Cảnh báo & Containment (Alerting & Containment Engine)
 
@@ -251,7 +253,7 @@ graph TB
 
     subgraph "CDO Management Account"
         SF -->|1. Route Alerts| AlertLambda[Alert Routing Lambda]
-        SF -->|2. Execute Policy| ContLambda[Containment Lambda]
+        SF -->|2. Execute Policy & verify| ContLambda[Containment Lambda]
         
         StateLambda[State Lambda] -->|Read/Write Run Lock| StateDB[(DynamoDB Run State)]
         SF -->|Query State| StateLambda
@@ -271,9 +273,62 @@ graph TB
     end
 ```
 
-*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán vào DynamoDB, áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu DynamoDB/S3 JSON được tính toán trước để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính.*
+*Chú thích: Luồng Step Functions kích hoạt các hàm Lambda cảnh báo và containment riêng biệt dựa trên quyết định của AI Engine. Các Lambda containment đọc trạng thái chạy, ghi nhật ký kiểm toán vào DynamoDB, áp dụng containment chủ động (gắn nhãn/tắt máy) trên các tài khoản Dev/Sandbox và thực thi các hành động dry-run (gắn nhãn/đề xuất) trên Prod. Bảng điều khiển web tĩnh S3 + CloudFront đọc các bản tóm tắt kiểm toán và chi tiêu DynamoDB/S3 JSON được tính toán trước để hiển thị trạng thái containment trực tiếp cho các bên liên quan của bộ phận Tài chính. CDO gọi `POST /v1/verify` để hoàn thành vòng lặp và hỗ trợ rollback thủ công qua `POST /v1/audit/{audit_id}/rollback`.*
 
-Động cơ containment coi `execution_mode` là một đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên.
+Động cơ containment coi `execution_mode` là một đầu vào chính sách bắt buộc, không phải là một sự tiện lợi khi chạy. Các tài nguyên production chỉ có thể nhận các kết quả tag, gợi ý (suggest) hoặc dry-run, trong khi các tài nguyên dev/sandbox có thể nhận các hành động ở chế độ apply chỉ khi các yêu cầu về chính sách và phê duyệt được thỏa mãn. Mỗi hành động được đề xuất hoặc thực thi đều ghi lại một bản ghi kiểm toán trước khi thực hiện bất kỳ thao tác nào trên tài khoản thành viên. Sau khi hoàn thành, CDO gọi `POST /v1/verify` để báo cáo kết quả đo lường từ xa, hoặc kích hoạt rollback thủ công qua `POST /v1/audit/{audit_id}/rollback` để bắt đầu khôi phục lại thẻ (tag) của tài nguyên.
+
+### 1.5 Quy trình tuần tự API có lập trình (Programmatic API Sequence Workflow)
+
+Quy trình tuần tự có lập trình chi tiết giữa bộ điều phối Step Functions, Lakehouse và các hàm AI Engine được mô tả dưới đây:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SF as Step Functions Orchestrator
+    participant Lake as S3 Lakehouse / Ingestion
+    participant Req as AI Engine Request Lambda
+    participant SQS as SQS Ingest Queue
+    participant Wrk as AI Engine Worker Lambda
+    participant DDB as DynamoDB / S3 Run State
+    participant Cont as Alert & Containment Engine
+
+    Note over SF, Lake: 1. CDO Ingests Cost & CloudWatch Telemetry
+    SF->>Lake: Thu thập dữ liệu (CUR, CE, chỉ số CloudWatch)
+    Lake-->>SF: Dữ liệu thô & tinh lọc đã lưu trữ
+    
+    Note over SF, Req: 2. CDO Calls Async Detection
+    SF->>Req: POST /v1/detect (Dữ liệu Ingested Telemetry + Tiêu đề Headers)
+    Req->>SQS: Xếp hàng tác vụ (Enqueue Job Task)
+    Req-->>SF: 202 Accepted (correlation_id)
+    
+    Note over SQS, Wrk: 3. AI Worker Processes Inference
+    SQS->>Wrk: Kích hoạt thực thi (Trigger Execution)
+    Wrk->>Lake: Đọc đặc trưng & chỉ số sử dụng CloudWatch (CloudWatch Utilization)
+    Wrk->>DDB: Ghi anomalies_list & trạng thái thực thi (completed/failed)
+    
+    Note over SF, DDB: 4. CDO Polls Status
+    loop Vòng lặp truy vấn trạng thái (Poll Status)
+        SF->>DDB: GET /v1/status/{correlation_id} (hoặc truy vấn DB)
+        DDB-->>SF: Trạng thái (processing / completed / failed)
+    end
+    
+    Note over SF, Wrk: 5. CDO Requests Intervention Plan
+    SF->>Wrk: POST /v1/decide (correlation_id)
+    Wrk-->>SF: Kế hoạch (dry_run_mode, CLI payload, rollback payload, X-Containment-Status)
+    
+    Note over SF, Cont: 6. CDO Executes Proposed Plan & Verifies
+    SF->>Cont: Thực thi hành động Dry-Run (Cảnh báo Slack / Gắn nhãn tài nguyên)
+    Cont-->>SF: Kết quả thực thi
+    SF->>Wrk: POST /v1/verify (kết quả khắc phục & siêu dữ liệu kiểm toán)
+    Wrk-->>SF: Trạng thái xác minh (DONE / RETRY / ROLLBACK / ESCALATE)
+    
+    Note over Cont, Wrk: 7. Manual Rollback (Optional)
+    Cont->>Wrk: POST /v1/audit/{audit_id}/rollback (Khôi phục trạng thái & Cập nhật Error Budget)
+    Wrk-->>Cont: Đã kích hoạt rollback + new_error_budget_burned_pct
+```
+
+*Chú thích: Sơ đồ tuần tự API có lập trình phác thảo luồng phát hiện bất thường và xác thực khắc phục bất đồng bộ, cho thấy việc truy vấn trạng thái, tạo kế hoạch, xác minh và các hàm xử lý rollback thủ công.*
+
 
 ---
 
@@ -483,4 +538,4 @@ Bảng dưới đây trình bày các chế độ lỗi, cơ chế phát hiện 
 - [`03_security_design_vi.md`](03_security_design_vi.md) - Các vai trò IAM, Security Groups, các vai trò Lambda execution roles, và khóa mã hóa KMS.
 - [`04_deployment_design_vi.md`](04_deployment_design_vi.md) - Cấu hình Terraform IaC dạng mô-đun, các pipeline triển khai GitHub Actions (CI/CD).
 - [`05_cost_analysis_vi.md`](05_cost_analysis_vi.md) - Dự toán ngân sách vận hành pipeline và so sánh chu kỳ chạy.
-- [`08_adrs.md`](08_adrs.md) - Các quyết định kiến trúc liên quan đến chu kỳ chạy 24 giờ, các hình ảnh Lambda container và gọi trực tiếp Lambda/SQS.
+- [`08_adrs_vi.md`](08_adrs_vi.md) - Các quyết định kiến trúc liên quan đến chu kỳ chạy 24 giờ, các hình ảnh Lambda container và gọi trực tiếp Lambda/SQS.
