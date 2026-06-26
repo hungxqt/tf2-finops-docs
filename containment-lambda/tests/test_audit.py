@@ -35,6 +35,7 @@ def _make_audit_record() -> AuditRecord:
         actor="cdo-platform-containment-lambda",
         timestamp="2026-06-26T10:00:00Z",
         correlation_id="corr-test-001",
+        idempotency_key="tenant-uuid-001:2026-06-26:batch",
         anomaly_id="anom-test-001",
         run_id="run-test-001",
         resource_owner="squad-ml-core",

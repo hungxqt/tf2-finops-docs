@@ -150,6 +150,7 @@ class ContainmentExecutor:
             actor="cdo-platform-containment-lambda",
             timestamp=datetime.now(tz=timezone.utc).isoformat(),
             correlation_id=inp.correlation_id,
+            idempotency_key=inp.idempotency_key,
             anomaly_id=inp.anomaly_id,
             run_id=inp.run_id,
             resource_owner=inp.resource_owner,
@@ -201,7 +202,7 @@ class ContainmentExecutor:
 
         except Exception as exc:
             logger.error(
-                "action execution failed",
+                "action execution failed — failing closed per AGENTS.md requirement",
                 extra={
                     "anomaly_id": inp.anomaly_id,
                     "execution_mode": enforced_mode,
@@ -210,7 +211,7 @@ class ContainmentExecutor:
             )
             status = "failed"
             errors.append(str(exc))
-            action_result = {"error": str(exc)}
+            action_result = {"error": str(exc), "fail_closed": True}
 
         # --- Step 8: Ghi post-action audit ---
         update_post_action_audit(

@@ -117,6 +117,7 @@ class AuditRecord:
     actor: str                          # "cdo-platform-containment-lambda"
     timestamp: str                      # ISO 8601 UTC
     correlation_id: str
+    idempotency_key: str                # tenant_id:billing_period_date:batch_type
     anomaly_id: str
     run_id: str
     resource_owner: str
@@ -152,6 +153,7 @@ class AuditRecord:
             "actor": self.actor,
             "timestamp": self.timestamp,
             "correlation_id": self.correlation_id,
+            "idempotency_key": self.idempotency_key,
             "anomaly_id": self.anomaly_id,
             "run_id": self.run_id,
             "resource_owner": self.resource_owner,

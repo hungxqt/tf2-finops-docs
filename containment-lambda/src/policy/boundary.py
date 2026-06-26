@@ -1,12 +1,18 @@
 """
 boundary.py — Hard boundary enforcement.
 
-Hai lớp bảo vệ theo 03_security_design.md §2.1 và deployment-contract.md §CDO Containment:
-  1. prod/prod-core/prod-payments → NEVER apply, NEVER stop → force dry-run
+Ba lớp bảo vệ theo 03_security_design.md §2.1 và deployment-contract.md §CDO Containment:
+  1. prod/prod-core/prod-payments → NEVER apply, NEVER stop, NEVER delete data, NEVER modify IAM → force dry-run
   2. data_confidence = LOW (CUR delay) → force dry-run
+  3. containment_status = LOCKED (Error Budget exceeded) → force dry-run
 
 Đây là lớp QUAN TRỌNG NHẤT. Phải chạy TRƯỚC mọi logic khác.
 IAM policy là lớp thứ 2 ở infra level — code này là lớp thứ 1 ở application level.
+
+Hard boundaries tuyệt đối (KHÔNG BAO GIỜ vi phạm):
+  - NEVER terminate prod
+  - NEVER delete data
+  - NEVER modify IAM
 """
 from __future__ import annotations
 
@@ -87,6 +93,26 @@ def enforce_boundaries(inp: ContainmentInput) -> str:
                     "data_confidence": inp.data_confidence,
                     "original_mode": original_mode,
                     "enforced_mode": enforced_mode,
+                },
+            )
+
+    # --- Boundary 4: LOCKED_MODE (Error Budget exceeded) → force dry-run ---
+    # Theo deployment-contract.md §Error Budget Lock và ai-api-contract.md §3.3:
+    # prod: rollback rate > 1% trong 30 ngày → LOCKED
+    # staging: rollback rate > 10% → LOCKED
+    # CDO nhận X-Containment-Status: LOCKED từ AI Engine response (trong containment_status field)
+    if getattr(inp, "containment_status", "") == "LOCKED":
+        if enforced_mode not in {MODE_DRY_RUN}:
+            enforced_mode = MODE_DRY_RUN
+            logger.warning(
+                "LOCKED_MODE: error budget exceeded, execution_mode overridden to dry-run",
+                extra={
+                    "anomaly_id": inp.anomaly_id,
+                    "account_id": inp.account_id,
+                    "environment": inp.environment,
+                    "original_mode": original_mode,
+                    "enforced_mode": enforced_mode,
+                    "containment_status": inp.containment_status,
                 },
             )
 

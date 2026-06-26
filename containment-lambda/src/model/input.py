@@ -133,9 +133,13 @@ class ContainmentInput:
 
     # --- Optional fields ---
     tenant_id: str = ""
+    idempotency_key: str = ""       # Format: tenant_id:billing_period_date:batch_type — từ Step Functions
     evidence_uri: str = ""          # S3 URI của evidence từ AI Engine
     cost_window_start: str = ""
     cost_window_end: str = ""
+    # LOCKED_MODE: X-Containment-Status header từ AI Engine response
+    # Nếu LOCKED → force dry-run tại CDO level, override mọi execution_mode
+    containment_status: str = ""    # "" | "LOCKED"
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ContainmentInput":
@@ -162,7 +166,9 @@ class ContainmentInput:
             rollback_payload=Boto3Payload.from_dict(d["rollback_payload"]),
             audit_config=AuditWriterConfig.from_dict(d["audit_config"]),
             tenant_id=d.get("tenant_id", ""),
+            idempotency_key=d.get("idempotency_key", ""),
             evidence_uri=d.get("evidence_uri", ""),
             cost_window_start=d.get("cost_window_start", ""),
             cost_window_end=d.get("cost_window_end", ""),
+            containment_status=d.get("containment_status", ""),
         )

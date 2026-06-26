@@ -140,6 +140,20 @@ def _dispatch_boto3(
             boto3_request_id=resp["ResponseMetadata"]["RequestId"],
         )
 
+    elif service == "servicequotas" and method in ("get_service_quota", "request_service_quota_increase"):
+        # quota-cap action: dev, sandbox, data-analytics only
+        # Theo deployment-contract.md §CDO Containment
+        boto3_method_fn = getattr(client, method)
+        resp = boto3_method_fn(**params)
+        resource_id = params.get("ServiceCode", "unknown")
+        return ApplyResult(
+            resource_id=resource_id,
+            action_executed=f"servicequotas.{method}",
+            boto3_http_status=resp["ResponseMetadata"]["HTTPStatusCode"],
+            boto3_request_id=resp["ResponseMetadata"]["RequestId"],
+            execution_note="quota-cap action applied",
+        )
+
     else:
         # Generic fallback — gọi method bất kỳ nếu tên khớp
         # Dùng cho future actions mà chưa có handler riêng

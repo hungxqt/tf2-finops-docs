@@ -8,17 +8,18 @@ sau đó report kết quả lên AI Engine qua POST /v1/audit/{audit_id}/rollbac
 Theo deployment-contract.md §CDO Rollback Cache:
   - Read trigger: next_action = ROLLBACK hoặc manual engineer trigger
   - Execution: CDO boto3 client tự gọi, không qua AI Engine
-  - Post-execution: publish SQS finops-watch-rollback (audit completion only)
+  - Post-execution: publish SQS finops-watch-rollback (audit completion only — KHÔNG dùng để dispatch rollback)
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
 
-from src.model.input import ContainmentInput, Boto3Payload
+from src.model.input import Boto3Payload
 from src.model.output import RollbackResult
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ def execute_rollback_from_cache(
     rollback_cache_table: str,
     management_session: boto3.Session,
     member_session: boto3.Session,
+    sqs_rollback_queue_url: str = "",
+    audit_id: str = "",
 ) -> RollbackResult:
     """
     Đọc rollback payload từ DynamoDB cache và thực thi.
@@ -36,13 +39,16 @@ def execute_rollback_from_cache(
     Flow:
     1. Read finops-rollback-cache[anomaly_id]
     2. Execute boto3_equivalent command trong member account
-    3. Return result (caller sẽ report lên AI Engine)
+    3. Publish audit completion notification lên SQS finops-watch-rollback
+    4. Return result (caller sẽ report lên AI Engine)
 
     Args:
         anomaly_id: Key để tìm trong DynamoDB rollback cache
         rollback_cache_table: Tên DynamoDB table (finops-rollback-cache)
-        management_session: Session CDO management account (để đọc DynamoDB)
+        management_session: Session CDO management account (để đọc DynamoDB + publish SQS)
         member_session: Session member account (để thực thi rollback)
+        sqs_rollback_queue_url: URL SQS finops-watch-rollback (audit completion only)
+        audit_id: Audit ID để ghi vào SQS notification
 
     Returns:
         RollbackResult
@@ -86,7 +92,7 @@ def execute_rollback_from_cache(
             },
         )
 
-        return RollbackResult(
+        result = RollbackResult(
             anomaly_id=anomaly_id,
             rollback_service=boto3_payload.service,
             rollback_method=boto3_payload.method,
@@ -94,6 +100,22 @@ def execute_rollback_from_cache(
             boto3_request_id=request_id,
             rollback_note="rollback executed from DynamoDB cache, independent of AI Engine",
         )
+
+        # Step 3: Publish audit completion notification lên SQS (best-effort)
+        # Theo deployment-contract.md §Message Queues:
+        # finops-watch-rollback = AUDIT COMPLETION NOTIFICATION ONLY
+        # Payload khớp POST /v1/audit/{audit_id}/rollback request body
+        if sqs_rollback_queue_url:
+            _publish_rollback_completion(
+                session=management_session,
+                queue_url=sqs_rollback_queue_url,
+                anomaly_id=anomaly_id,
+                audit_id=audit_id,
+                rollback_status="success",
+                http_status=http_status,
+            )
+
+        return result
 
     except ClientError as exc:
         error_code = exc.response["Error"]["Code"]
@@ -131,3 +153,43 @@ def _read_rollback_cache(
         raise RuntimeError(
             f"ROLLBACK_CACHE_READ_FAILED anomaly_id={anomaly_id}: {exc}"
         ) from exc
+
+
+def _publish_rollback_completion(
+    session: boto3.Session,
+    queue_url: str,
+    anomaly_id: str,
+    audit_id: str,
+    rollback_status: str,
+    http_status: int,
+) -> None:
+    """
+    Publish rollback completion notification lên SQS finops-watch-rollback.
+
+    Đây là AUDIT COMPLETION ONLY — không dùng để dispatch rollback command.
+    Theo deployment-contract.md §Message Queues §CDO Rollback Cache.
+    """
+    from datetime import datetime, timezone
+    sqs = session.client("sqs")
+    payload = {
+        "audit_id": audit_id,
+        "anomaly_id": anomaly_id,
+        "rollback_status": rollback_status,
+        "rollback_executed_at": datetime.now(tz=timezone.utc).isoformat(),
+        "http_status": http_status,
+    }
+    try:
+        sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody=json.dumps(payload),
+        )
+        logger.info(
+            "rollback completion published to SQS",
+            extra={"anomaly_id": anomaly_id, "audit_id": audit_id},
+        )
+    except ClientError as exc:
+        # Best-effort — không block rollback result
+        logger.warning(
+            "failed to publish rollback completion to SQS (non-blocking)",
+            extra={"anomaly_id": anomaly_id, "error": str(exc)},
+        )
