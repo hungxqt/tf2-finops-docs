@@ -1,0 +1,48 @@
+{
+  "_comment": "Scenario 6: approval_status=denied — Lambda return ngay, không làm gì",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://06_denied_approval.json output.json",
+  "_expected": "status=denied, denied_action_record có nội dung, KHÔNG có audit record S3, KHÔNG AssumeRole",
+
+  "run_id": "run-20260626-006",
+  "anomaly_id": "anom-test-denied-001",
+  "correlation_id": "corr-denied-001-uuid",
+  "model_version": "v1.4.0",
+  "anomaly_type": "idle_resource",
+  "confidence": 0.80,
+  "severity": "medium",
+  "explanation": "RDS instance idle for 5 days. Containment denied by squad-db-infra owner.",
+  "data_confidence": "HIGH",
+
+  "resource_id": "arn:aws:rds:ap-southeast-1:200000000012:db:my-idle-db-01",
+  "resource_owner": "squad-db-infra",
+  "account_id": "200000000012",
+  "environment": "staging",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-staging",
+
+  "execution_mode": "apply",
+  "approval_status": "denied",
+  "recommended_containment_mode": "auto-shutdown",
+
+  "applied_payload": {
+    "service": "rds",
+    "method": "stop_db_instance",
+    "parameters": {
+      "DBInstanceIdentifier": "my-idle-db-01"
+    }
+  },
+  "rollback_payload": {
+    "service": "rds",
+    "method": "start_db_instance",
+    "parameters": {
+      "DBInstanceIdentifier": "my-idle-db-01"
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-200000000012-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-staging",
+    "rollback_cache_table": "finops-rollback-cache"
+  }
+}

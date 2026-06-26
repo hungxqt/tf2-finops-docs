@@ -3,3 +3,29 @@
 
 __pycache__
 verify_docs.py
+
+.agents
+.codex
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest cache
+.pytest_cache/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Build / dist
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db

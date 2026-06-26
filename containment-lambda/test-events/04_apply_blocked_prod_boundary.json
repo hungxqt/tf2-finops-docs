@@ -1,0 +1,49 @@
+{
+  "_comment": "Scenario 4: Apply trên prod — boundary CHẶN, tự động chuyển thành dry-run",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://04_apply_blocked_prod_boundary.json output.json",
+  "_expected": "status=dry-run, execution_mode_applied=dry-run (dù input là apply), KHÔNG có apply_result",
+  "_verify": "execution_mode_applied trong output phải là 'dry-run', KHÔNG phải 'apply'",
+
+  "run_id": "run-20260626-004",
+  "anomaly_id": "anom-test-prod-block-001",
+  "correlation_id": "corr-prod-block-001-uuid",
+  "model_version": "v1.4.0",
+  "anomaly_type": "runaway_usage",
+  "confidence": 0.97,
+  "severity": "critical",
+  "explanation": "Prod EC2 instance running unexpectedly high. Suggested shutdown but BLOCKED by prod boundary.",
+  "data_confidence": "HIGH",
+
+  "resource_id": "i-0prod-critical-999",
+  "resource_owner": "squad-payments",
+  "account_id": "100000000001",
+  "environment": "prod",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-prod",
+
+  "execution_mode": "apply",
+  "approval_status": "approved",
+  "recommended_containment_mode": "auto-shutdown",
+
+  "applied_payload": {
+    "service": "ec2",
+    "method": "stop_instances",
+    "parameters": {
+      "InstanceIds": ["i-0prod-critical-999"]
+    }
+  },
+  "rollback_payload": {
+    "service": "ec2",
+    "method": "start_instances",
+    "parameters": {
+      "InstanceIds": ["i-0prod-critical-999"]
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-100000000001-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-prod",
+    "rollback_cache_table": "finops-rollback-cache"
+  }
+}
