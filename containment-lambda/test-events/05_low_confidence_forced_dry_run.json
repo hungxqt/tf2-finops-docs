@@ -1,0 +1,49 @@
+{
+  "_comment": "Scenario 5: data_confidence=LOW (CUR delay) — apply bị chặn, force dry-run",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://05_low_confidence_forced_dry_run.json output.json",
+  "_expected": "status=dry-run, execution_mode_applied=dry-run dù input là apply",
+  "_why": "CUR data delay > 36h → AI trả LOW confidence → CDO không được act trên data chưa chắc chắn",
+
+  "run_id": "run-20260626-005",
+  "anomaly_id": "anom-test-low-conf-001",
+  "correlation_id": "corr-low-conf-001-uuid",
+  "model_version": "v1.4.0",
+  "anomaly_type": "sudden_spike",
+  "confidence": 0.75,
+  "severity": "high",
+  "explanation": "Cost spike detected but CUR data is delayed. CE fallback used. Confidence reduced to LOW.",
+  "data_confidence": "LOW",
+
+  "resource_id": "i-0sandbox-delayed-001",
+  "resource_owner": "squad-data-analytics",
+  "account_id": "200000000012",
+  "environment": "sandbox",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-sandbox",
+
+  "execution_mode": "apply",
+  "approval_status": "approved",
+  "recommended_containment_mode": "auto-shutdown",
+
+  "applied_payload": {
+    "service": "ec2",
+    "method": "stop_instances",
+    "parameters": {
+      "InstanceIds": ["i-0sandbox-delayed-001"]
+    }
+  },
+  "rollback_payload": {
+    "service": "ec2",
+    "method": "start_instances",
+    "parameters": {
+      "InstanceIds": ["i-0sandbox-delayed-001"]
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-200000000012-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-sandbox",
+    "rollback_cache_table": "finops-rollback-cache"
+  }
+}

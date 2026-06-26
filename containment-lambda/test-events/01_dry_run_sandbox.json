@@ -1,0 +1,53 @@
+{
+  "_comment": "Scenario 1: Dry-run trên sandbox — không gọi AWS, chỉ simulate",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://01_dry_run_sandbox.json output.json",
+  "_expected": "status=dry-run, dry_run_result có nội dung, audit record được ghi S3",
+
+  "run_id": "run-20260626-001",
+  "anomaly_id": "anom-test-dryrun-001",
+  "correlation_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "model_version": "v1.4.0",
+  "anomaly_type": "runaway_usage",
+  "confidence": 0.92,
+  "severity": "high",
+  "explanation": "EC2 p3.2xlarge running 24/7 for 18 days with no traffic correlation. GPU utilization 88% but no ALB requests detected.",
+  "data_confidence": "HIGH",
+
+  "resource_id": "i-0fbgpu00000004",
+  "resource_owner": "squad-ml-core",
+  "account_id": "200000000012",
+  "environment": "sandbox",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-sandbox",
+
+  "execution_mode": "dry-run",
+  "approval_status": "approved",
+  "recommended_containment_mode": "auto-shutdown",
+
+  "applied_payload": {
+    "service": "ec2",
+    "method": "stop_instances",
+    "parameters": {
+      "InstanceIds": ["i-0fbgpu00000004"]
+    }
+  },
+  "rollback_payload": {
+    "service": "ec2",
+    "method": "start_instances",
+    "parameters": {
+      "InstanceIds": ["i-0fbgpu00000004"]
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-200000000012-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-sandbox",
+    "rollback_cache_table": "finops-rollback-cache"
+  },
+
+  "tenant_id": "tenant-uuid-sandbox-001",
+  "evidence_uri": "s3://company-cdo-200000000012-telemetry/features/i-0fbgpu00000004/2026-06-26.json",
+  "cost_window_start": "2026-06-08",
+  "cost_window_end": "2026-06-26"
+}

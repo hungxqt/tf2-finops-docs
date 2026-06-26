@@ -1,0 +1,49 @@
+{
+  "_comment": "Scenario 2: Apply mode — thực sự stop EC2 instance trên sandbox",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://02_apply_stop_ec2_sandbox.json output.json",
+  "_expected": "status=completed, apply_result có boto3_http_status=200, instance chuyển sang stopped",
+  "_warning": "Scenario này GỌI AWS API THẬT — chỉ dùng trên sandbox account có instance thật",
+
+  "run_id": "run-20260626-002",
+  "anomaly_id": "anom-test-apply-ec2-001",
+  "correlation_id": "corr-apply-ec2-001-uuid",
+  "model_version": "v1.4.0",
+  "anomaly_type": "runaway_usage",
+  "confidence": 0.95,
+  "severity": "high",
+  "explanation": "Training cluster i-0fbgpu00000004 running 24/7, $400/day, no scheduled shutdown.",
+  "data_confidence": "HIGH",
+
+  "resource_id": "i-0fbgpu00000004",
+  "resource_owner": "squad-ml-core",
+  "account_id": "200000000012",
+  "environment": "sandbox",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-sandbox",
+
+  "execution_mode": "apply",
+  "approval_status": "approved",
+  "recommended_containment_mode": "auto-shutdown",
+
+  "applied_payload": {
+    "service": "ec2",
+    "method": "stop_instances",
+    "parameters": {
+      "InstanceIds": ["i-0fbgpu00000004"]
+    }
+  },
+  "rollback_payload": {
+    "service": "ec2",
+    "method": "start_instances",
+    "parameters": {
+      "InstanceIds": ["i-0fbgpu00000004"]
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-200000000012-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-sandbox",
+    "rollback_cache_table": "finops-rollback-cache"
+  }
+}

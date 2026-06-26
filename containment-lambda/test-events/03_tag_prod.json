@@ -1,0 +1,56 @@
+{
+  "_comment": "Scenario 3: Tag trên prod — được phép. Boundary KHÔNG chặn tag trên prod",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://03_tag_prod.json output.json",
+  "_expected": "status=completed, tagging_result có tags FinOpsWatch=ReviewRequired, execution_mode_applied=tag",
+
+  "run_id": "run-20260626-003",
+  "anomaly_id": "anom-test-tag-prod-001",
+  "correlation_id": "corr-tag-prod-001-uuid",
+  "model_version": "v1.4.0",
+  "anomaly_type": "untagged_spend",
+  "confidence": 0.88,
+  "severity": "medium",
+  "explanation": "Resource in prod-core has no team or owner tags. $2,400 unattributed spend last 30 days.",
+  "data_confidence": "HIGH",
+
+  "resource_id": "i-0prod123456789",
+  "resource_owner": "",
+  "account_id": "100000000001",
+  "environment": "prod-core",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-prod",
+
+  "execution_mode": "tag",
+  "approval_status": "approved",
+  "recommended_containment_mode": "tag-for-review",
+
+  "applied_payload": {
+    "service": "ec2",
+    "method": "create_tags",
+    "parameters": {
+      "Resources": ["i-0prod123456789"],
+      "Tags": [
+        {"Key": "FinOpsWatch", "Value": "ReviewRequired"},
+        {"Key": "FinOpsAnomalyId", "Value": "anom-test-tag-prod-001"}
+      ]
+    }
+  },
+  "rollback_payload": {
+    "service": "ec2",
+    "method": "delete_tags",
+    "parameters": {
+      "Resources": ["i-0prod123456789"],
+      "Tags": [
+        {"Key": "FinOpsWatch"},
+        {"Key": "FinOpsAnomalyId"}
+      ]
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-100000000001-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-prod",
+    "rollback_cache_table": "finops-rollback-cache"
+  }
+}

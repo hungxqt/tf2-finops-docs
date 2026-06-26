@@ -1,0 +1,50 @@
+{
+  "_comment": "Scenario 7: Suggest mode — untagged_spend routes tới Finance channel",
+  "_test_with": "aws lambda invoke --function-name containment-lambda --payload file://07_suggest_finance_route.json output.json",
+  "_expected": "status=suggested, suggestion_record.route_target=finance, approval_required=true (prod)",
+
+  "run_id": "run-20260626-007",
+  "anomaly_id": "anom-test-suggest-finance-001",
+  "correlation_id": "corr-suggest-finance-001",
+  "model_version": "v1.4.0",
+  "anomaly_type": "untagged_spend",
+  "confidence": 0.85,
+  "severity": "medium",
+  "explanation": "15 EC2 instances in prod-core have no owner or team tags. $8,500 unattributed spend in June.",
+  "data_confidence": "HIGH",
+
+  "resource_id": "i-0untagged-prod-batch",
+  "resource_owner": "",
+  "account_id": "100000000001",
+  "environment": "prod-core",
+  "containment_role_name": "FinOpsContainmentWorkerRole",
+  "external_id": "finops-external-id-prod",
+
+  "execution_mode": "suggest",
+  "approval_status": "approved",
+  "recommended_containment_mode": "tag-for-review",
+
+  "applied_payload": {
+    "service": "ec2",
+    "method": "create_tags",
+    "parameters": {
+      "Resources": ["i-0untagged-prod-batch"],
+      "Tags": [{"Key": "FinOpsWatch", "Value": "UntaggedSpend"}]
+    }
+  },
+  "rollback_payload": {
+    "service": "ec2",
+    "method": "delete_tags",
+    "parameters": {
+      "Resources": ["i-0untagged-prod-batch"],
+      "Tags": [{"Key": "FinOpsWatch"}]
+    }
+  },
+
+  "audit_config": {
+    "audit_bucket": "company-cdo-100000000001-telemetry",
+    "audit_prefix": "audit/",
+    "dashboard_table": "finops-dashboard-cache-prod",
+    "rollback_cache_table": "finops-rollback-cache"
+  }
+}
