@@ -822,7 +822,7 @@ Bảo vệ quan hệ nhân quả (causality) trong hệ thống phân tán. **v3
     "line_item_usage_start_date": {
       "type": "string",
       "format": "date-time",
-      "description": "Thời điểm AWS ghi nhận usage — chấp nhận delay đến 36h"
+      "description": "Thời điểm AWS ghi nhận usage (lấy giá trị max/mới nhất trong batch) — chấp nhận delay đến 36h"
     },
     "collector_timestamp": {
       "type": "string",
@@ -837,7 +837,7 @@ Bảo vệ quan hệ nhân quả (causality) trong hệ thống phân tán. **v3
     "data_age_hours": {
       "type": "number",
       "minimum": 0,
-      "description": "abs(ingestion - line_item_usage_start_date) in hours — informational"
+      "description": "abs(ingestion_timestamp - line_item_usage_start_date) in hours — informational"
     }
   },
   "required": ["request_timestamp"]
@@ -861,7 +861,7 @@ AI Engine tự đánh giá dữ liệu trước khi ra quyết định. **Nếu 
     "cloudwatch_status":       { "type": "string", "enum": ["HEALTHY", "DEGRADED", "MISSING"] },
     "cost_explorer_status":    { "type": "string", "enum": ["HEALTHY", "STALE"] },
     "completeness_score":      { "type": "number", "minimum": 0, "maximum": 1, "description": "Tỷ lệ trường bắt buộc có giá trị hợp lệ" },
-    "freshness_score":         { "type": "number", "minimum": 0, "maximum": 1, "description": "1.0 - (data_age_hours / 24)" },
+    "freshness_score":         { "type": "number", "minimum": 0, "maximum": 1, "description": "max(0.0, 1.0 - (data_age_hours / 24))" },
     "integrity_score":         { "type": "number", "minimum": 0, "maximum": 1, "description": "SHA256 checksum match rate" },
     "delay_score":             { "type": "number", "minimum": 0, "maximum": 1, "description": "Điểm phạt nếu CUR bị trễ > 12h" },
     "is_forced_dry_run":       { "type": "boolean", "description": "Internal flag — map sang API response data_confidence: LOW khi true" },
